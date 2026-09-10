@@ -87,7 +87,15 @@ local function handleJumpTap()if not flyToggleEnabled then return end local ct=o
 if diff<=DOUBLE_TAP_WINDOW then if isFlying then setFlying(false)elseif humanoid and(humanoid:GetState()==Enum.HumanoidStateType.Freefall or humanoid:GetState()==Enum.HumanoidStateType.Jumping)then setFlying(true)end lastJumpTapTime=0 else lastJumpTapTime=ct end end
 UserInputService.JumpRequest:Connect(function()if(os.clock()-lastJumpReqTime)>0.1 then handleJumpTap()end lastJumpReqTime=os.clock()end)
 RunService.Stepped:Connect(function()if getgenv().NoclipActive and character then for _,part in ipairs(character:GetDescendants())do if part:IsA("BasePart")and part.CanCollide then part.CanCollide=false end end end end)
-RunService.Heartbeat:Connect(function(dt)if runSpeedEnabled and rootPart and humanoid and not isFlying then local md=humanoid.MoveDirection if md.Magnitude>0 then rootPart.CFrame=rootPart.CFrame+(md*(runSpeedValue*dt))rootPart.AssemblyLinearVelocity=Vector3.new(0,rootPart.AssemblyLinearVelocity.Y,0)end end end)
+RunService.Heartbeat:Connect(function(deltaTime)
+	if runSpeedEnabled and rootPart and humanoid and not isFlying then
+		humanoid.WalkSpeed = runSpeedValue
+	elseif not runSpeedEnabled and humanoid then
+		if humanoid.WalkSpeed ~= defaultWalkSpeed then
+			humanoid.WalkSpeed = defaultWalkSpeed
+		end
+	end
+end)
 local function applyRapidFire(tool)for _,v in ipairs(tool:GetDescendants())do if v:IsA("NumberValue")or v:IsA("IntValue")then local n=v.Name:lower()
 if n:find("cooldown")or n:find("delay")or n:find("fire")or n:find("rate")or n:find("speed")or n:find("mine")or n:find("dig")or n:find("swing")or n:find("hit")or n:find("power")then
 if not originalToolValues[v]then originalToolValues[v]=v.Value end if n:find("power")or n:find("speed")then v.Value=originalToolValues[v]*5 else v.Value=0 end end end end end
