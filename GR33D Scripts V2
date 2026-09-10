@@ -557,11 +557,10 @@ end)
 
 RunService.Heartbeat:Connect(function(deltaTime)
 	if runSpeedEnabled and rootPart and humanoid and not isFlying then
-		local moveDir = humanoid.MoveDirection
-		if moveDir.Magnitude > 0 then
-			local displacement = moveDir * (runSpeedValue * deltaTime)
-			rootPart.CFrame = rootPart.CFrame + displacement
-			rootPart.AssemblyLinearVelocity = Vector3.new(0, rootPart.AssemblyLinearVelocity.Y, 0)
+		humanoid.WalkSpeed = runSpeedValue
+	elseif not runSpeedEnabled and humanoid then
+		if humanoid.WalkSpeed ~= defaultWalkSpeed then
+			humanoid.WalkSpeed = defaultWalkSpeed
 		end
 	end
 end)
