@@ -1,408 +1,190 @@
--- GR33D SCRIPTS V4.58 (Native WalkSpeed Fix & Full Modular Integration)
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-local CoreGui = game:GetService("CoreGui")
-
-local player = Players.LocalPlayer
-local PlaceId = game.PlaceId
-
-local protectedParent = (function()
-	local success, parent = pcall(function()
-		return CoreGui
-	end)
-	if success and parent then
-		return parent
-	end
-	return player:WaitForChild("PlayerGui")
-end())
-
-local character, humanoid, rootPart, camera = nil, nil, nil, workspace.CurrentCamera
-local attachment, linearVelocity = nil, nil
-local controls = nil
-
-pcall(function()
-	local playerModule = require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
-	controls = playerModule:GetControls()
-end)
-
-local flyToggleEnabled = false
-local isFlying = false
-local FLY_SPEED = 60
-
-local godModeEnabled = false
-local megaHealthEnabled = false
-local rapidHealingEnabled = false
-local noFallDamageEnabled = false
-local runSpeedEnabled = false
-local runSpeedValue = 50
-local defaultWalkSpeed = 16
-local jumpEnabled = false
-local jumpPowerValue = 50
-local defaultJumpPower = 50
-
-local hitboxEnabled = false
-local slimHitboxEnabled = false
-local antiMeleeEnabled = false
-local aimbotEnabled = false
-local thirdPersonCamEnabled = false
-local rapidFireEnabled = false
-
-local originalToolValues = {}
-local originalHitboxSizes = {}
-local originalRootSize = nil
-local pristineRootSize = nil
-local savedMapCFrame = nil
-local InitialSpawnCFrame = nil
-
-local eggEspEnabled = false
-local trackedEggTags = {}
-local promptExtenderEnabled = false
-local originalPromptValues = {}
-local antiAfkEnabled = false
-
-local isMinimized = false
-local cachedMonsters = {}
-
-local function setFlying(active)
-	isFlying = active
-	if not rootPart then return end
-	if active then
-		if linearVelocity then linearVelocity.MaxForce = 999999999 end
-		if humanoid then humanoid.PlatformStand = true end
-	else
-		if linearVelocity then linearVelocity.MaxForce = 0 end
-		if humanoid then humanoid.PlatformStand = false end
-	end
-end
-local function SafeTeleport(targetCFrame)
-	if not rootPart then return end
-	local startCFrame = rootPart.CFrame
-	local distance = (targetCFrame.Position - startCFrame.Position).Magnitude
-	local duration = math.clamp(distance / 250, 0.1, 0.8)
-
-	setFlying(false)
-	rootPart.Anchored = true
-
-	local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-	local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = targetCFrame})
-	
-	tween:Play()
-	tween.Completed:Wait()
-	
-	rootPart.Anchored = false
-	if humanoid then
-		humanoid.AssemblyLinearVelocity = Vector3.zero
-	end
-end
-
-local function parseStatValue(str)
-	if type(str) ~= "string" then return 0 end
-	str = str:upper():gsub(",", "")
-	local num = tonumber(str:match("[%d%.]+"))
-	if not num then return 0 end
-	if str:find("K") then num = num * 1000
-	elseif str:find("M") then num = num * 1000000
-	elseif str:find("B") then num = num * 1000000000
-	elseif str:find("T") then num = num * 1000000000000 end
-	return num
-end
-
-local function executeAutoGrabRoutine()
-	local targetVal = getgenv().TargetValue or 0
-	local targetLuck = getgenv().TargetLuck or 0
-	local targetSize = getgenv().TargetSize or 0
-	
-	for _, obj in ipairs(workspace:GetDescendants()) do
-		if obj:IsA("ProximityPrompt") then
-			local parentPart = obj.Parent
-			if parentPart and parentPart:IsA("BasePart") then
-				local dist = (parentPart.Position - rootPart.Position).Magnitude
-				if dist <= (obj.MaxActivationDistance + 15) then
-					local pass = true
-					if targetVal > 0 then
-						local vAttr = obj:GetAttribute("Value") or parentPart:GetAttribute("Value") or 0
-						if vAttr < targetVal then pass = false end
-					end
-					if pass and targetLuck > 0 then
-						local lAttr = obj:GetAttribute("Luck") or parentPart:GetAttribute("Luck") or 0
-						if lAttr < targetLuck then pass = false end
-					end
-					if pass and targetSize > 0 then
-						local sAttr = obj:GetAttribute("Size") or parentPart:GetAttribute("Size") or 0
-						if sAttr < targetSize then pass = false end
-					end
-					if pass then
-						fireproximityprompt(obj, 1)
-					end
-				end
-			end
-		end
-	end
-end
-
-RunService.Stepped:Connect(function()
-	if getgenv().NoclipActive and character then
-		for _, part in ipairs(character:GetDescendants()) do
-			if part:IsA("BasePart") and part.CanCollide then
-				part.CanCollide = false
-			end
-		end
-	end
-end)
-
-RunService.Heartbeat:Connect(function(deltaTime)
-	if runSpeedEnabled and rootPart and humanoid and not isFlying then
-		humanoid.WalkSpeed = runSpeedValue
-	elseif not runSpeedEnabled and humanoid then
-		if humanoid.WalkSpeed ~= defaultWalkSpeed then
-			humanoid.WalkSpeed = defaultWalkSpeed
-		end
-	end
-end)
-
-local function applyRapidFire(tool)
-	for _, v in ipairs(tool:GetDescendants()) do
-		if (v:IsA("NumberValue") or v:IsA("IntValue")) then
-			local n = v.Name:lower()
-			if n:find("cooldown") or n:find("delay") or n:find("fire") or n:find("rate") or n:find("speed") or n:find("mine") or n:find("dig") or n:find("swing") or n:find("hit") or n:find("power") then
-				if not originalToolValues[v] then
-					originalToolValues[v] = v.Value
-				end
-				if n:find("power") or n:find("speed") then
-					v.Value = originalToolValues[v] * 5
-				else
-					v.Value = 0
-				end
-			end
-		end
-	end
-end
-
-local function monitorTool(tool)
-	if tool:IsA("Tool") then
-		if rapidFireEnabled then
-			applyRapidFire(tool)
-		end
-		tool.DescendantAdded:Connect(function(v)
-			if rapidFireEnabled and (v:IsA("NumberValue") or v:IsA("IntValue")) then
-				applyRapidFire(tool)
-			end
-		end)
-	end
-end
-
-local function setupCharacter(char)
-	character = char
-	rootPart = char:WaitForChild("HumanoidRootPart")
-	humanoid = char:WaitForChild("Humanoid")
-	rootPart.Anchored = false
-	
-	if humanoid then
-		defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
-		defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
-	end
-
-	if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
-	if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
-	
-	attachment = Instance.new("Attachment")
-	attachment.Name = "FlightAttachment"
-	attachment.Parent = rootPart
-
-	linearVelocity = Instance.new("LinearVelocity")
-	linearVelocity.Name = "FlightVelocity"
-	linearVelocity.Attachment0 = attachment
-	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
-	linearVelocity.MaxForce = 0
-	linearVelocity.VectorVelocity = Vector3.zero
-	linearVelocity.Parent = rootPart
-	
-	char.ChildAdded:Connect(function(child)
-		monitorTool(child)
-	end)
-	for _, child in ipairs(char:GetChildren()) do
-		monitorTool(child)
-	end
-
-	humanoid.Jumping:Connect(function(isActive)
-		if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
-			local currentVel = rootPart.AssemblyLinearVelocity
-			rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
-		end
-	end)
-
-	task.defer(function()
-		if rootPart then 
-			pristineRootSize = Vector3.new(2, 2, 1)
-			originalRootSize = pristineRootSize
-		end
-		if megaHealthEnabled then humanoid.MaxHealth = 900000000 humanoid.Health = 900000000 end
-	end)
-
-	if not InitialSpawnCFrame then
-		task.delay(0.8, function()
-			if rootPart and not InitialSpawnCFrame then InitialSpawnCFrame = rootPart.CFrame end
-		end)
-	end
-	if flyToggleEnabled then setFlying(true) end
-end
-
+-- ==========================================
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V4.58 (TWEENED TP FIX)
+-- ==========================================
+pcall(function()local mt=getrawmetatable(game)setreadonly(mt,false)local oldNamecall,oldNewIndex=mt.__namecall,mt.__newindex
+mt.__namecall=newcclosure(function(self,...)local method=getnamecallmethod()if not checkcaller()and(method=="Kick"or method=="kick"or method=="SaveInstance")and self==game.Players.LocalPlayer then return end
+if not checkcaller()and(method=="FireServer"or method=="InvokeServer")then local remoteName=tostring(self):lower()if remoteName:find("anticheat")or remoteName:find("ban")or remoteName:find("report")or remoteName:find("teleport")or remoteName:find("detect")or remoteName:find("cheat")or remoteName:find("exploit")or remoteName:find("speed")or remoteName:find("fly")or remoteName:find("movement")or remoteName:find("pos")or remoteName:find("integrity")or remoteName:find("client")then return end end
+return oldNamecall(self,...)end)
+mt.__newindex=newcclosure(function(t,k,v)if not checkcaller()and typeof(t)=="Instance"and t:IsA("Humanoid")then local char=game.Players.LocalPlayer.Character
+if char and t:IsDescendantOf(char)then if k=="MaxHealth"and getgenv().MegaHealthActive and v<900000000 then return end
+if k=="Health"and(getgenv().MegaHealthActive or getgenv().GodModeActive)then return end end end
+return oldNewIndex(t,k,v)end)setreadonly(mt,true)end)
+local UserInputService,RunService,Players,Workspace,TeleportService,HttpService,VirtualUser,TweenService=game:GetService("UserInputService"),game:GetService("RunService"),game:GetService("Players"),game:GetService("Workspace"),game:GetService("TeleportService"),game:GetService("HttpService"),game:GetService("VirtualUser"),game:GetService("TweenService")
+local player=Players.LocalPlayer local protectedParent=player:WaitForChild("PlayerGui")
+if protectedParent:FindFirstChild("DevPanelGui")then protectedParent.DevPanelGui:Destroy()end
+local camera,PlaceId=Workspace.CurrentCamera,game.PlaceId local FLY_SPEED,runSpeedValue,jumpPowerValue,defaultJumpPower,defaultWalkSpeed,DOUBLE_TAP_WINDOW=50,50,50,50,16,0.35
+local cachedPrompts,cachedMonsters,originalPromptValues,originalToolValues={},{},{},{}
+getgenv().NoclipActive,getgenv().GodModeActive,getgenv().MegaHealthActive,getgenv().SlimHitboxActive=false,false,false,false
+getgenv().AutoGrabActive,getgenv().TargetValue,getgenv().TargetLuck,getgenv().TargetSize=false,0,0,0
+local flyToggleEnabled,isFlying,godModeEnabled,megaHealthEnabled,rapidHealingEnabled,noFallDamageEnabled,runSpeedEnabled,jumpEnabled,hitboxEnabled,slimHitboxEnabled,aimbotEnabled,thirdPersonCamEnabled,rapidFireEnabled,eggEspEnabled,promptExtenderEnabled,antiAfkEnabled,antiMeleeEnabled,isMinimized,autoGrabLoopRunning=false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false,false
+local lastJumpTapTime,lastJumpReqTime,InitialSpawnCFrame,savedMapCFrame=0,0,nil,nil
+local character,rootPart,humanoid,attachment,linearVelocity=nil,nil,nil,nil,nil
+local originalHitboxSizes,originalRootSize,pristineRootSize,trackedEggTags={},nil,Vector3.new(2,2,1),{}
+player.Idled:Connect(function()if antiAfkEnabled then pcall(function()VirtualUser:Button2Down(Vector2.new(0,0),camera.CFrame)task.wait(1)VirtualUser:Button2Up(Vector2.new(0,0),camera.CFrame)end)end end)
+local controls=nil pcall(function()local playerScripts=player:WaitForChild("PlayerScripts",5)if playerScripts then local pm=playerScripts:WaitForChild("PlayerModule",5)if pm then controls=require(pm):GetControls()end end end)
+local function parseStatValue(input)if type(input)=="number"then return input end if type(input)~="string"then return 0 end
+local upperInput=input:upper():gsub("%s+","")if upperInput==""or upperInput=="0"then return 0 end
+if upperInput:find("KG")or upperInput:find("TON")or upperInput:find("LUCK")or upperInput:find("%%")then return 0 end
+local numStr,suffix=upperInput:match("(%d+%.?%d*)([KMGT]?)")local num=tonumber(numStr)
+if not num then local cleaned=upperInput:gsub("[^0-9KMBT%.]","")num=tonumber(cleaned:match("[%d%.]+"))if not num then return 0 end
+if cleaned:find("T")then return num*1e12 elseif cleaned:find("B")then return num*1e9 elseif cleaned:find("M")then return num*1e6 elseif cleaned:find("K")then return num*1e3 end return num end
+local mult=1 if suffix=="T"or upperInput:find("TRILLION")then mult=1e12 elseif suffix=="B"or upperInput:find("BILLION")then mult=1e9 elseif suffix=="M"or upperInput:find("MILLION")then mult=1e6 elseif suffix=="K"or upperInput:find("THOUSAND")then mult=1e3 end return num*mult end
+local function parseWeightValue(input)if type(input)=="number"then return input end if type(input)~="string"then return 0 end
+local upperInput=input:upper()local cleaned=upperInput:gsub("[^0-9%.]","")local num=tonumber(cleaned:match("[%d%.]+"))if not num then return 0 end
+if upperInput:find("TON")then return num*1000 elseif upperInput:find("KG")then return num elseif upperInput:find("G")then return num/1000 end return num end
+local function isValidGrabPrompt(prompt)if not prompt or not prompt.Enabled then return false end local parentObj=prompt.Parent if not parentObj then return false end
+if parentObj:IsA("ScreenGui")or parentObj:IsA("BillboardGui")or parentObj:IsA("SurfaceGui")or parentObj:IsA("TextButton")or parentObj:IsA("ImageButton")then return false end
+local actionText,objectText=prompt.ActionText:lower(),prompt.ObjectText:lower()
+local blocked={"buy","purchase","view","shop","robux","configure","finish","mining","backpack","group","gift","verify","claim","full","reward","spin","upgrade","warmth","carry","open"}
+for _,kw in ipairs(blocked)do if actionText:find(kw)or objectText:find(kw)then return false end end
+local ancestor=prompt:FindFirstAncestorOfClass("Model")if ancestor then local nameLower=ancestor.Name:lower()for _,kw in ipairs(blocked)do if nameLower:find(kw)then return false end end end
+return true end
+task.spawn(function()while true do if getgenv().AutoGrabActive then local cache={}for _,obj in ipairs(Workspace:GetDescendants())do if obj:IsA("ProximityPrompt")and isValidGrabPrompt(obj)and not obj:IsDescendantOf(player.PlayerGui)and not obj:IsDescendantOf(game:GetService("CoreGui"))then table.insert(cache,obj)end end cachedPrompts=cache end task.wait(1)end end)
+task.spawn(function()while true do local list={}for _,obj in ipairs(Workspace:GetDescendants())do if obj:IsA("Model")and obj~=character and not Players:GetPlayerFromCharacter(obj)then local nl=obj.Name:lower()local friendly=nl:find("shop")or nl:find("npc")or nl:find("dummy")or nl:find("merchant")or nl:find("guide")or nl:find("bank")or nl:find("quest")
+if not friendly then local hum,hrp=obj:FindFirstChildOfClass("Humanoid"),obj:FindFirstChild("HumanoidRootPart")or obj:FindFirstChild("PrimaryPart")if hum and hrp and hum.Health>0 then table.insert(list,hrp)end end end end cachedMonsters=list task.wait(1)end end)
+task.spawn(function()while true do if promptExtenderEnabled then for _,obj in ipairs(Workspace:GetDescendants())do if obj:IsA("ProximityPrompt")then if not originalPromptValues[obj]then originalPromptValues[obj]={MaxActivationDistance=obj.MaxActivationDistance,RequiresLineOfSight=obj.RequiresLineOfSight,HoldDuration=obj.HoldDuration}end obj.MaxActivationDistance=35 obj.RequiresLineOfSight=false obj.HoldDuration=0 end end end task.wait(1)end end)
+task.spawn(function()while true do if eggEspEnabled then for _,obj in ipairs(Workspace:GetDescendants())do if obj:IsA("Model")and obj.Name:lower():find("egg")and not trackedEggTags[obj]then local tp=obj:FindFirstChild("HumanoidRootPart")or obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
+if tp then local bb=Instance.new("BillboardGui")bb.Name="EggESP"bb.Adornee=tp bb.Size=UDim2.new(0,100,0,30)bb.StudsOffset=Vector3.new(0,2,0)bb.AlwaysOnTop=true
+local lbl=Instance.new("TextLabel",bb)lbl.Size=UDim2.new(1,0,1,0)lbl.BackgroundTransparency=1 lbl.Text=obj.Name lbl.TextColor3=Color3.fromRGB(255,215,0)lbl.Font=Enum.Font.GothamBold lbl.TextSize=12 bb.Parent=obj trackedEggTags[obj]=bb end end end else if next(trackedEggTags)then for _,tag in pairs(trackedEggTags)do if tag then tag:Destroy()end end trackedEggTags={}end end task.wait(2)end end)
+local function scanAndExtractStats(prompt)local statData={Value=0,Luck=0,Size=0,Weight=0,RarityScore=0}local tm=prompt.Parent if not tm then return statData end
+pcall(function()if tm:IsA("Model")then statData.Size=tm:GetExtentsSize().Magnitude elseif tm:IsA("BasePart")then statData.Size=tm.Size.Magnitude end end)
+pcall(function()for attr,val in pairs(tm:GetAttributes())do local nl,vs,nv,wv=attr:lower(),tostring(val):lower(),parseStatValue(val),parseWeightValue(val)
+if nl:find("val")or nl:find("price")or nl:find("cash")or nl:find("money")then if nv>statData.Value then statData.Value=nv end
+elseif nl:find("luck")then if nv>statData.Luck then statData.Luck=nv end
+elseif nl:find("weight")or nl:find("mass")then if wv>statData.Weight then statData.Weight=wv end
+elseif nl:find("size")then if nv>statData.Size then statData.Size=nv end
+elseif nl:find("rarity")or vs:find("legendary")or vs:find("mythic")or vs:find("secret")then statData.RarityScore=statData.RarityScore+100 end end end)
+pcall(function()for _,desc in ipairs(tm:GetDescendants())do if desc:IsA("TextLabel")and(desc.Parent:IsA("BillboardGui")or desc.Parent:IsA("SurfaceGui"))then local text=desc.Text local tl,pv,pw=text:lower(),parseStatValue(text),parseWeightValue(text)
+if tl:find("luck")or tl:find("%%")then if pv>statData.Luck then statData.Luck=pv end
+elseif tl:find("ton")or tl:find("kg")then if pw>statData.Weight then statData.Weight=pw end
+else if pv>0 and pv>statData.Value then statData.Value=pv end end
+if tl:find("secret")or tl:find("mythic")or tl:find("godly")or tl:find("legendary")then statData.RarityScore=statData.RarityScore+500 end end end end)
+return statData end
+local function executeAutoGrabRoutine()if not rootPart then return end
+for _,prompt in ipairs(cachedPrompts)do if isValidGrabPrompt(prompt)then local tm=prompt:FindFirstAncestorOfClass("Model")or prompt.Parent local dist=(rootPart.Position-tm:GetPivot().Position).Magnitude
+if dist<=45 then local stats=scanAndExtractStats(prompt)local tv,tl,ts=getgenv().TargetValue or 0,getgenv().TargetLuck or 0,getgenv().TargetSize or 0
+local meets,activeF=false,0 if tv>0 then activeF=activeF+1 end if tl>0 then activeF=activeF+1 end if ts>0 then activeF=activeF+1 end
+if activeF==0 then meets=true else local vm,lm,sm=true,true,true
+if tv>0 and math.abs(stats.Value-tv)>(tv*0.25)then vm=false end if tl>0 and stats.Luck<tl then lm=false end if ts>0 and stats.Size<ts and stats.Weight<ts then sm=false end
+if tv>0 and tl==0 and ts==0 then meets=vm else meets=true if tv>0 and not vm then meets=false end if tl>0 and not lm then meets=false end if ts>0 and not sm then meets=false end end
+if meets then fireproximityprompt(prompt)end end end end end
+local function SafeTeleport(targetCFrame)if not character or not rootPart then return end
+local safeCFrame=targetCFrame+Vector3.new(0,3,0)local dist=(rootPart.CFrame.Position-safeCFrame.Position).Magnitude local travelTime=math.clamp(dist/250,0.15,0.8)
+rootPart.AssemblyLinearVelocity,rootPart.AssemblyAngularVelocity=Vector3.zero,Vector3.zero
+local tween=TweenService:Create(rootPart,TweenInfo.new(travelTime,Enum.EasingStyle.Linear,Enum.EasingDirection.Out),{CFrame=safeCFrame})
+rootPart.Anchored=true tween:Play()tween.Completed:Connect(function()if rootPart and character then rootPart.AssemblyLinearVelocity=Vector3.zero rootPart.Anchored=false end end)end
+local function scanServerAndTeleport(targetMetric)if not rootPart or not character then return end
+local bestTM,bestPrompt,highestScore=nil,nil,-1
+for _,obj in ipairs(Workspace:GetDescendants())do if obj:IsA("ProximityPrompt")and isValidGrabPrompt(obj)and not obj:IsDescendantOf(player.PlayerGui)and not obj:IsDescendantOf(game:GetService("CoreGui"))then
+local tm=obj:FindFirstAncestorOfClass("Model")or obj.Parent if tm and not tm:IsA("ScreenGui")then local dist=(rootPart.Position-tm:GetPivot().Position).Magnitude
+if dist>18 then local stats=scanAndExtractStats(obj)local cs=0 if targetMetric=="Value"then cs=stats.Value elseif targetMetric=="Luck"then cs=stats.Luck elseif targetMetric=="Size"then cs=stats.Size elseif targetMetric=="Weight"then cs=stats.Weight elseif targetMetric=="Rarity"then cs=stats.RarityScore end
+if cs>highestScore then highestScore=cs bestTM=tm bestPrompt=obj end end end end end
+if bestTM and bestPrompt then SafeTeleport(bestTM:GetPivot())task.delay(0.5,function()if rootPart and character then fireproximityprompt(bestPrompt)end end)end end
+local function setFlying(state)if not rootPart or not humanoid or not linearVelocity then return end isFlying=state
+if isFlying then linearVelocity.MaxForce=100000 humanoid:ChangeState(Enum.HumanoidStateType.Freefall)else linearVelocity.MaxForce=0 linearVelocity.VectorVelocity=Vector3.zero
+if humanoid.FloorMaterial~=Enum.Material.Air then humanoid:ChangeState(Enum.HumanoidStateType.Running)end end end
+local function handleJumpTap()if not flyToggleEnabled then return end local ct=os.clock()local diff=ct-lastJumpTapTime
+if diff<=DOUBLE_TAP_WINDOW then if isFlying then setFlying(false)elseif humanoid and(humanoid:GetState()==Enum.HumanoidStateType.Freefall or humanoid:GetState()==Enum.HumanoidStateType.Jumping)then setFlying(true)end lastJumpTapTime=0 else lastJumpTapTime=ct end end
+UserInputService.JumpRequest:Connect(function()if(os.clock()-lastJumpReqTime)>0.1 then handleJumpTap()end lastJumpReqTime=os.clock()end)
+RunService.Stepped:Connect(function()if getgenv().NoclipActive and character then for _,part in ipairs(character:GetDescendants())do if part:IsA("BasePart")and part.CanCollide then part.CanCollide=false end end end end)
+RunService.Heartbeat:Connect(function(dt)if runSpeedEnabled and rootPart and humanoid and not isFlying then local md=humanoid.MoveDirection if md.Magnitude>0 then rootPart.CFrame=rootPart.CFrame+(md*(runSpeedValue*dt))rootPart.AssemblyLinearVelocity=Vector3.new(0,rootPart.AssemblyLinearVelocity.Y,0)end end end)
+local function applyRapidFire(tool)for _,v in ipairs(tool:GetDescendants())do if v:IsA("NumberValue")or v:IsA("IntValue")then local n=v.Name:lower()
+if n:find("cooldown")or n:find("delay")or n:find("fire")or n:find("rate")or n:find("speed")or n:find("mine")or n:find("dig")or n:find("swing")or n:find("hit")or n:find("power")then
+if not originalToolValues[v]then originalToolValues[v]=v.Value end if n:find("power")or n:find("speed")then v.Value=originalToolValues[v]*5 else v.Value=0 end end end end end
+local function monitorTool(tool)if tool:IsA("Tool")then if rapidFireEnabled then applyRapidFire(tool)end tool.DescendantAdded:Connect(function(v)if rapidFireEnabled and(v:IsA("NumberValue")or v:IsA("IntValue"))then applyRapidFire(tool)end end)end end
+local function setupCharacter(char)character=char rootPart=char:WaitForChild("HumanoidRootPart")humanoid=char:WaitForChild("Humanoid")rootPart.Anchored=false
+if humanoid then defaultJumpPower=humanoid.JumpPower>0 and humanoid.JumpPower or 50 defaultWalkSpeed=humanoid.WalkSpeed>0 and humanoid.WalkSpeed or 16 end
+if rootPart:FindFirstChild("FlightAttachment")then rootPart.FlightAttachment:Destroy()end if rootPart:FindFirstChild("FlightVelocity")then rootPart.FlightVelocity:Destroy()end
+attachment=Instance.new("Attachment",rootPart)attachment.Name="FlightAttachment"
+linearVelocity=Instance.new("LinearVelocity",rootPart)linearVelocity.Name="FlightVelocity"linearVelocity.Attachment0=attachment linearVelocity.RelativeTo=Enum.ActuatorRelativeTo.World linearVelocity.MaxForce=0 linearVelocity.VectorVelocity=Vector3.zero
+char.ChildAdded:Connect(monitorTool)for _,c in ipairs(char:GetChildren())do monitorTool(c)end
+humanoid.Jumping:Connect(function(isActive)if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial~=Enum.Material.Air then local cv=rootPart.AssemblyLinearVelocity rootPart.AssemblyLinearVelocity=Vector3.new(cv.X,jumpPowerValue,cv.Z)end end)
+task.defer(function()if rootPart then pristineRootSize=Vector3.new(2,2,1)originalRootSize=pristineRootSize end if megaHealthEnabled then humanoid.MaxHealth=900000000 humanoid.Health=900000000 end end)
+if not InitialSpawnCFrame then task.delay(0.8,function()if rootPart and not InitialSpawnCFrame then InitialSpawnCFrame=rootPart.CFrame end end)end if flyToggleEnabled then setFlying(true)end end
 setupCharacter(player.Character or player.CharacterAdded:Wait())
-player.CharacterAdded:Connect(function(newChar)
-	flyToggleEnabled = false
-	isFlying = false
-	if linearVelocity then linearVelocity.MaxForce = 0 end
-	setupCharacter(newChar)
-end)
-
-local backpack = player:FindFirstChildOfClass("Backpack")
-if backpack then
-	backpack.ChildAdded:Connect(function(child)
-		monitorTool(child)
-	end)
-end
-
-RunService.RenderStepped:Connect(function(dt)
-	if not camera or not camera.Parent then camera = workspace.CurrentCamera return end
-
-	if godModeEnabled and humanoid then
-		humanoid.Health = humanoid.MaxHealth
-		humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
-	end
-
-	if isFlying and linearVelocity and humanoid and rootPart then
-		if humanoid.FloorMaterial ~= Enum.Material.Air then
-			setFlying(false)
-		elseif controls then
-			local moveVector = controls:GetMoveVector()
-			if moveVector.Magnitude > 0 then
-				local camCFrame = camera.CFrame
-				local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
-				linearVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
-			else
-				linearVelocity.VectorVelocity = Vector3.zero
-			end
-		end
-	end
-
-	if jumpEnabled and humanoid then
-		pcall(function() 
-			humanoid.UseJumpPower = true 
-			humanoid.JumpPower = jumpPowerValue 
-		end)
-	elseif not jumpEnabled and humanoid then
-		pcall(function()
-			if humanoid.JumpPower ~= defaultJumpPower then
-				humanoid.JumpPower = defaultJumpPower
-			end
-		end)
-	end
-
-	if rapidHealingEnabled and humanoid and humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
-		humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + (humanoid.MaxHealth * 0.05))
-	end
-
-	if noFallDamageEnabled and rootPart and humanoid then
-		if humanoid:GetState() == Enum.HumanoidStateType.Freefall or humanoid:GetState() == Enum.HumanoidStateType.FallingDown then
-			pcall(function()
-				if rootPart.AssemblyLinearVelocity.Y < -45 then
-					rootPart.AssemblyLinearVelocity = Vector3.new(rootPart.AssemblyLinearVelocity.X, 0, rootPart.AssemblyLinearVelocity.Z)
-				end
-			end)
-		end
-	end
-
-	if antiMeleeEnabled and rootPart and humanoid then
-		local currentVel = rootPart.AssemblyLinearVelocity
-		if humanoid.MoveDirection.Magnitude == 0 and not isFlying and not runSpeedEnabled then
-			if math.abs(currentVel.X) > 4 or math.abs(currentVel.Z) > 4 then
-				rootPart.AssemblyLinearVelocity = Vector3.new(0, currentVel.Y, 0)
-			end
-		end
-	end
-
-	if hitboxEnabled then
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
-				local hrp = p.Character.HumanoidRootPart
-				if not originalHitboxSizes[hrp] then originalHitboxSizes[hrp] = hrp.Size end
-				hrp.Size = Vector3.new(8, 8, 8)
-				hrp.Transparency = 0.7
-				hrp.CanCollide = false
-			end
-		end
-	end
-
-	if slimHitboxEnabled and rootPart then
-		rootPart.Size = Vector3.new(1.3, 2, 0.7)
-	elseif not slimHitboxEnabled and rootPart and originalRootSize and rootPart.Size ~= originalRootSize then
-		rootPart.Size = originalRootSize
-	end
-
-	if thirdPersonCamEnabled and rootPart then
-		camera.CameraType = Enum.CameraType.Scriptable
-		local head = character and character:FindFirstChild("Head") or rootPart
-		local currentCamRot = camera.CFrame.Rotation
-		local focusPos = head.Position + Vector3.new(0, 1, 0)
-		local targetCFrame = CFrame.new(focusPos) * currentCamRot * CFrame.new(0, 3.5, -8)
-		camera.CFrame = targetCFrame
-	elseif not thirdPersonCamEnabled and camera.CameraType == Enum.CameraType.Scriptable then
-		camera.CameraType = Enum.CameraType.Custom
-	end
-end)
-
-local screenGui = Instance.new("ScreenGui", protectedParent)
-screenGui.Name = "DevPanelGui"
-screenGui.ResetOnSpawn = false
-
-local mainFrame = Instance.new("Frame", screenGui)
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 360, 0, 410)
-mainFrame.Position = UDim2.new(0.5, -180, 0.5, -205)
-mainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
-mainFrame.Active = true
-
-Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
-local stroke = Instance.new("UIStroke", mainFrame)
-stroke.Color = Color3.fromRGB(50, 50, 65)
-stroke.Thickness = 1.5
-
-local topBar = Instance.new("Frame", mainFrame)
-topBar.Name = "TopBar"
-topBar.Size = UDim2.new(1, 0, 0, 38)
-topBar.BackgroundTransparency = 1
-topBar.Active = true
-
-local titleLabel = Instance.new("TextLabel", topBar)
-titleLabel.Size = UDim2.new(1, -50, 1, 0)
-titleLabel.Position = UDim2.new(0, 12, 0, 0)
-titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V4.58 (Native WalkSpeed)"
-titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 13
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-local minimizeButton = Instance.new("TextButton", topBar)
-minimizeButton.Size = UDim2.new(0, 26, 0, 26)
-minimizeButton.Position = UDim2.new(1, -34, 0.5, -13)
-minimizeButton.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-minimizeButton.Text = "-"
-minimizeButton.TextColor3 = Color3.fromRGB(220, 220, 230)
-minimizeButton.Font = Enum.Font.GothamBold
-minimizeButton.TextSize = 16
-Instance.new("UICorner", minimizeButton).CornerRadius = UDim.new(0, 6)
-
-local toggleContainer = Instance.new("ScrollingFrame", mainFrame)
-toggleContainer.Size = UDim2.new(1, 0, 1, -42)
-toggleContainer.Position = UDim2.new(0, 0, 0, 42)
-toggleContainer.BackgroundTransparency = 1
-toggleContainer.BorderSizePixel = 0
-toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 850)
-toggleContainer.ScrollBarThickness = 4
-
-print("GR33D SCRIPTS: V4.58 Loaded Successfully with Native Animation Support!")
+player.CharacterAdded:Connect(function(newChar)flyToggleEnabled=false isFlying=false if linearVelocity then linearVelocity.MaxForce=0 end setupCharacter(newChar)end)
+local backpack=player:FindFirstChildOfClass("Backpack")if backpack then backpack.ChildAdded:Connect(monitorTool)end
+RunService.RenderStepped:Connect(function(dt)if not camera or not camera.Parent then camera=workspace.CurrentCamera return end
+if godModeEnabled and humanoid then humanoid.Health=humanoid.MaxHealth humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead,false)end
+if isFlying and linearVelocity and humanoid and rootPart then if humanoid.FloorMaterial~=Enum.Material.Air then setFlying(false)elseif controls then local mv=controls:GetMoveVector()
+if mv.Magnitude>0 then local cc=camera.CFrame local fd=(cc.RightVector*mv.X)-(cc.LookVector*mv.Z)linearVelocity.VectorVelocity=fd.Unit*FLY_SPEED else linearVelocity.VectorVelocity=Vector3.zero end end end
+if jumpEnabled and humanoid then pcall(function()humanoid.UseJumpPower=true humanoid.JumpPower=jumpPowerValue end)elseif not jumpEnabled and humanoid then pcall(function()if humanoid.JumpPower~=defaultJumpPower then humanoid.JumpPower=defaultJumpPower end end)end
+if rapidHealingEnabled and humanoid and humanoid.Health<humanoid.MaxHealth and humanoid.Health>0 then humanoid.Health=math.min(humanoid.MaxHealth,humanoid.Health+(humanoid.MaxHealth*0.05))end
+if noFallDamageEnabled and rootPart and humanoid then if humanoid:GetState()==Enum.HumanoidStateType.Freefall or humanoid:GetState()==Enum.HumanoidStateType.FallingDown then pcall(function()if rootPart.AssemblyLinearVelocity.Y<-45 then rootPart.AssemblyLinearVelocity=Vector3.new(rootPart.AssemblyLinearVelocity.X,0,rootPart.AssemblyLinearVelocity.Z)end end)end end
+if antiMeleeEnabled and rootPart and humanoid then local cv=rootPart.AssemblyLinearVelocity if humanoid.MoveDirection.Magnitude==0 and not isFlying and not runSpeedEnabled then if math.abs(cv.X)>4 or math.abs(cv.Z)>4 then rootPart.AssemblyLinearVelocity=Vector3.new(0,cv.Y,0)end end end
+if hitboxEnabled then for _,p in ipairs(Players:GetPlayers())do if p~=player and p.Character and p.Character:FindFirstChild("HumanoidRootPart")then local hrp=p.Character.HumanoidRootPart if not originalHitboxSizes[hrp]then originalHitboxSizes[hrp]=hrp.Size end hrp.Size=Vector3.new(8,8,8)hrp.Transparency=0.7 hrp.CanCollide=false end end end
+if slimHitboxEnabled and rootPart then rootPart.Size=Vector3.new(1.3,2,0.7)elseif not slimHitboxEnabled and rootPart and originalRootSize and rootPart.Size~=originalRootSize then rootPart.Size=originalRootSize end
+if thirdPersonCamEnabled and rootPart then camera.CameraType=Enum.CameraType.Scriptable local head=character and character:FindFirstChild("Head")or rootPart local ccr=camera.CFrame.Rotation local fp=head.Position+Vector3.new(0,1,0)camera.CFrame=CFrame.new(fp)*ccr*CFrame.new(0,3.5,-8)elseif not thirdPersonCamEnabled and camera.CameraType==Enum.CameraType.Scriptable then camera.CameraType=Enum.CameraType.Custom end
+if aimbotEnabled and rootPart then local nt,sd=nil,math.huge for _,p in ipairs(Players:GetPlayers())do if p~=player and p.Character then local tm=false if player.Team and p.Team and(p.Team==player.Team or p.TeamColor==player.TeamColor)then tm=true end if p:GetAttribute("Team")and player:GetAttribute("Team")and p:GetAttribute("Team")==player:GetAttribute("Team")then tm=true end
+if not tm then local hrp,hum=p.Character:FindFirstChild("HumanoidRootPart"),p.Character:FindFirstChildOfClass("Humanoid")if hrp and hum and hum.Health>0 and not p.Character:FindFirstChildOfClass("ForceField")then local d=(hrp.Position-rootPart.Position).Magnitude if d<sd then sd=d nt=hrp end end end end end
+for _,hrp in ipairs(cachedMonsters)do if hrp and hrp.Parent then local hum=hrp.Parent:FindFirstChildOfClass("Humanoid")if hum and hum.Health>0 then local d=(hrp.Position-rootPart.Position).Magnitude if d<sd then sd=d nt=hrp end end end end
+if nt then camera.CFrame=camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position,nt.Position),math.clamp(dt*20,0.1,1))end end end)
+local screenGui=Instance.new("ScreenGui",protectedParent)screenGui.Name="DevPanelGui" screenGui.ResetOnSpawn=false
+local mainFrame=Instance.new("Frame",screenGui)mainFrame.Name="MainFrame" mainFrame.Size=UDim2.new(0,360,0,410)mainFrame.Position=UDim2.new(0.5,-180,0.5,-205)mainFrame.BackgroundColor3=Color3.fromRGB(16,16,20)mainFrame.Active=true
+Instance.new("UICorner",mainFrame).CornerRadius=UDim.new(0,12)local stroke=Instance.new("UIStroke",mainFrame)stroke.Color=Color3.fromRGB(50,50,65)stroke.Thickness=1.5
+local topBar=Instance.new("Frame",mainFrame)topBar.Name="TopBar" topBar.Size=UDim2.new(1,0,0,38)topBar.BackgroundTransparency=1 topBar.Active=true
+local titleLabel=Instance.new("TextLabel",topBar)titleLabel.Size=UDim2.new(1,-50,1,0)titleLabel.Position=UDim2.new(0,12,0,0)titleLabel.BackgroundTransparency=1 titleLabel.Text="GR33D Scripts V4.58 (Tweened TP Fix)" titleLabel.TextColor3=Color3.fromRGB(245,245,250)titleLabel.Font=Enum.Font.GothamBold titleLabel.TextSize=13 titleLabel.TextXAlignment=Enum.TextXAlignment.Left
+local minimizeButton=Instance.new("TextButton",topBar)minimizeButton.Size=UDim2.new(0,26,0,26)minimizeButton.Position=UDim2.new(1,-34,0.5,-13)minimizeButton.BackgroundColor3=Color3.fromRGB(30,30,40)minimizeButton.Text="-" minimizeButton.TextColor3=Color3.fromRGB(220,220,230)minimizeButton.Font=Enum.Font.GothamBold minimizeButton.TextSize=16 Instance.new("UICorner",minimizeButton).CornerRadius=UDim.new(0,6)
+local toggleContainer=Instance.new("ScrollingFrame",mainFrame)toggleContainer.Size=UDim2.new(1,0,1,-42)toggleContainer.Position=UDim2.new(0,0,0,42)toggleContainer.BackgroundTransparency=1 toggleContainer.BorderSizePixel=0 toggleContainer.CanvasSize=UDim2.new(0,0,0,850)toggleContainer.ScrollBarThickness=4
+local dragging,dragStart,startPos=false,nil,nil
+local function startDragging(input)if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=true dragStart=input.Position startPos=mainFrame.AbsolutePosition end end
+topBar.InputBegan:Connect(startDragging)minimizeButton.InputBegan:Connect(startDragging)
+UserInputService.InputChanged:Connect(function(input)if dragging and(input.UserInputType==Enum.UserInputType.MouseMovement or input.UserInputType==Enum.UserInputType.Touch)then local delta=input.Position-dragStart mainFrame.Position=UDim2.new(0,startPos.X+delta.X,0,startPos.Y+delta.Y)end end)
+UserInputService.InputEnded:Connect(function(input)if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end end)
+minimizeButton.MouseButton1Click:Connect(function()isMinimized=not isMinimized
+if isMinimized then mainFrame.Size=UDim2.new(0,36,0,36)mainFrame.BackgroundTransparency=1 toggleContainer.Visible=false titleLabel.Visible=false stroke.Transparency=1 minimizeButton.Size=UDim2.new(1,0,1,0)minimizeButton.Position=UDim2.new(0,0,0,0)minimizeButton.Text="+" minimizeButton.BackgroundColor3=Color3.fromRGB(26,26,35)minimizeButton.BackgroundTransparency=0.3
+else mainFrame.Size=UDim2.new(0,360,0,410)mainFrame.BackgroundTransparency=0 toggleContainer.Visible=true titleLabel.Visible=true stroke.Transparency=0 minimizeButton.Size=UDim2.new(0,26,0,26)minimizeButton.Position=UDim2.new(1,-34,0.5,-13)minimizeButton.Text="-" minimizeButton.BackgroundColor3=Color3.fromRGB(30,30,40)minimizeButton.BackgroundTransparency=0 end end)
+local leftGroupFrame=Instance.new("Frame",toggleContainer)leftGroupFrame.Size=UDim2.new(0.48,0,1,-8)leftGroupFrame.Position=UDim2.new(0.01,0,0,4)leftGroupFrame.BackgroundTransparency=1
+local rightGroupFrame=Instance.new("Frame",toggleContainer)rightGroupFrame.Size=UDim2.new(0.48,0,1,-8)rightGroupFrame.Position=UDim2.new(0.51,0,0,4)rightGroupFrame.BackgroundTransparency=1
+local function createCollapsibleGroup(pc,gt,startY,ch)local gh=Instance.new("TextButton",pc)gh.Size=UDim2.new(1,0,0,24)gh.Position=UDim2.new(0,0,0,startY)gh.BackgroundColor3=Color3.fromRGB(22,22,30)gh.Text=" "..gt.." ^" gh.TextColor3=Color3.fromRGB(220,220,230)gh.Font=Enum.Font.GothamBold gh.TextSize=11 gh.TextXAlignment=Enum.TextXAlignment.Left Instance.new("UICorner",gh).CornerRadius=UDim.new(0,5)
+local cb=Instance.new("Frame",pc)cb.Size=UDim2.new(1,0,0,ch)cb.Position=UDim2.new(0,0,0,startY+28)cb.BackgroundTransparency=1 local isOpen=true
+gh.MouseButton1Click:Connect(function()isOpen=not isOpen gh.Text=" "..gt..(isOpen and" ^"or" v")cb.Visible=isOpen end)return cb,startY+32+ch end
+local function createToggleInGroup(parent,name,yPos,cb)local row=Instance.new("Frame",parent)row.Size=UDim2.new(1,0,0,26)row.Position=UDim2.new(0,0,0,yPos)row.BackgroundTransparency=1
+local lbl=Instance.new("TextLabel",row)lbl.Size=UDim2.new(0.65,0,1,0)lbl.BackgroundTransparency=1 lbl.Text=name lbl.TextColor3=Color3.fromRGB(190,190,205)lbl.Font=Enum.Font.GothamMedium lbl.TextSize=10 lbl.TextXAlignment=Enum.TextXAlignment.Left
+local sb=Instance.new("TextButton",row)sb.Size=UDim2.new(0,32,0,16)sb.Position=UDim2.new(1,-32,0.5,-8)sb.BackgroundColor3=Color3.fromRGB(40,40,52)sb.Text="" Instance.new("UICorner",sb).CornerRadius=UDim.new(1,0)
+local knob=Instance.new("Frame",sb)knob.Size=UDim2.new(0,12,0,12)knob.Position=UDim2.new(0,2,0.5,-6)knob.BackgroundColor3=Color3.fromRGB(200,200,215)Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
+local active=false sb.MouseButton1Click:Connect(function()active=not active sb.BackgroundColor3=active and Color3.fromRGB(46,204,113)or Color3.fromRGB(40,40,52)knob:TweenPosition(active and UDim2.new(1,-14,0.5,-6)or UDim2.new(0,2,0.5,-6),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.15,true)cb(active)end)end
+local function createInputInGroup(parent,name,yPos,dv,cb)local row=Instance.new("Frame",parent)row.Size=UDim2.new(1,0,0,26)row.Position=UDim2.new(0,0,0,yPos)row.BackgroundTransparency=1
+local lbl=Instance.new("TextLabel",row)lbl.Size=UDim2.new(0.5,0,1,0)lbl.BackgroundTransparency=1 lbl.Text=name lbl.TextColor3=Color3.fromRGB(190,190,205)lbl.Font=Enum.Font.GothamMedium lbl.TextSize=10 lbl.TextXAlignment=Enum.TextXAlignment.Left
+local tb=Instance.new("TextBox",row)tb.Size=UDim2.new(0,48,0,20)tb.Position=UDim2.new(1,-48,0.5,-10)tb.BackgroundColor3=Color3.fromRGB(26,26,35)tb.Text=tostring(dv)tb.TextColor3=Color3.fromRGB(255,255,255)tb.Font=Enum.Font.GothamBold tb.TextSize=10 Instance.new("UICorner",tb).CornerRadius=UDim.new(0,4)
+tb:GetPropertyChangedSignal("Text"):Connect(function()cb(tb.Text)end)tb.FocusLost:Connect(function()cb(tb.Text)end)end
+local function createActionButtonInGroup(parent,name,yPos,color,cb)local btn=Instance.new("TextButton",parent)btn.Size=UDim2.new(1,0,0,24)btn.Position=UDim2.new(0,0,0,yPos)btn.BackgroundColor3=color btn.Text=name btn.TextColor3=Color3.fromRGB(255,255,255)btn.Font=Enum.Font.GothamBold btn.TextSize=10 Instance.new("UICorner",btn).CornerRadius=UDim.new(0,4)btn.MouseButton1Click:Connect(cb)return btn end
+local movementContent,nextLeftY=createCollapsibleGroup(leftGroupFrame,"Movement & Utility",0,282)
+createToggleInGroup(movementContent,"Flight Mode",0,function(state)flyToggleEnabled=state if not state then setFlying(false)end end)
+createToggleInGroup(movementContent,"God Mode",28,function(state)godModeEnabled=state getgenv().GodModeActive=state if humanoid then humanoid.Health=state and humanoid.MaxHealth or humanoid.Health humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead,not state)end end)
+createToggleInGroup(movementContent,"Mega Health HP",56,function(state)megaHealthEnabled=state getgenv().MegaHealthActive=state if humanoid then humanoid.MaxHealth=state and 900000000 or 100 humanoid.Health=humanoid.MaxHealth end end)
+createToggleInGroup(movementContent,"Rapid Healing",84,function(state)rapidHealingEnabled=state end)
+createToggleInGroup(movementContent,"No Fall Dmg",112,function(state)noFallDamageEnabled=state end)
+createToggleInGroup(movementContent,"Noclip Bypass",140,function(state)getgenv().NoclipActive=state player.DevCameraOcclusionMode=state and Enum.DevCameraOcclusionMode.Invisicam or Enum.DevCameraOcclusionMode.Zoom if not state and character then for _,part in ipairs(character:GetDescendants())do if part:IsA("BasePart")and part.Name~="HumanoidRootPart"then part.CanCollide=true end end end)
+createToggleInGroup(movementContent,"Super Speed",168,function(state)runSpeedEnabled=state end)
+createInputInGroup(movementContent,"Speed Val",196,"50",function(v)runSpeedValue=tonumber(v)or 50 end)
+createToggleInGroup(movementContent,"Custom Jump",224,function(state)jumpEnabled=state if not state and humanoid then pcall(function()humanoid.JumpPower=defaultJumpPower end)end end)
+createInputInGroup(movementContent,"Jump Val",252,"50",function(v)jumpPowerValue=tonumber(v)or 50 end)
+local grabContent,nextLeftY2=createCollapsibleGroup(leftGroupFrame,"Safe Auto-Grab",nextLeftY+8,114)
+createToggleInGroup(grabContent,"Auto Grab Nearby",0,function(state)getgenv().AutoGrabActive=state if state and not autoGrabLoopRunning then autoGrabLoopRunning=true task.spawn(function()while getgenv().AutoGrabActive do executeAutoGrabRoutine()task.wait(0.1)end autoGrabLoopRunning=false end)end end)
+createInputInGroup(grabContent,"Target Val",28,"0",function(v)getgenv().TargetValue=parseStatValue(v)end)
+createInputInGroup(grabContent,"Target Luck",56,"0",function(v)getgenv().TargetLuck=parseStatValue(v)end)
+createInputInGroup(grabContent,"Target Size",84,"0",function(v)getgenv().TargetSize=parseStatValue(v)end)
+local scanContent,_=createCollapsibleGroup(leftGroupFrame,"Server Scan TP",nextLeftY2+8,114)
+createActionButtonInGroup(scanContent,"TP: Most Value",0,Color3.fromRGB(39,174,96),function()scanServerAndTeleport("Value")end)
+createActionButtonInGroup(scanContent,"TP: Most Luck",28,Color3.fromRGB(41,128,185),function()scanServerAndTeleport("Luck")end)
+createActionButtonInGroup(scanContent,"TP: Most Size",56,Color3.fromRGB(142,68,173),function()scanServerAndTeleport("Size")end)
+createActionButtonInGroup(scanContent,"TP: Most Rare",84,Color3.fromRGB(211,84,0),function()scanServerAndTeleport("Rarity")end)
+local combatContent,nextRightY=createCollapsibleGroup(rightGroupFrame,"Combat & Tools",0,316)
+createToggleInGroup(combatContent,"Hitbox Ext",0,function(state)hitboxEnabled=state if not state then for hrp,origSize in pairs(originalHitboxSizes)do if hrp and hrp.Parent then hrp.Size=origSize hrp.Transparency=1 hrp.CanCollide=false end end originalHitboxSizes={}end end)
+createToggleInGroup(combatContent,"Slim Hitbox",28,function(state)slimHitboxEnabled=state getgenv().SlimHitboxActive=state if not state and rootPart and originalRootSize then rootPart.Size=originalRootSize end end)
+createToggleInGroup(combatContent,"Anti-Knockback",56,function(state)antiMeleeEnabled=state end)
+createToggleInGroup(combatContent,"Aimbot",84,function(state)aimbotEnabled=state end)
+createToggleInGroup(combatContent,"Third-Person Cam",112,function(state)thirdPersonCamEnabled=state end)
+createToggleInGroup(combatContent,"Rapid Fire",140,function(state)rapidFireEnabled=state if state and character then for _,tool in ipairs(character:GetChildren())do if tool:IsA("Tool")then applyRapidFire(tool)end end local bp=player:FindFirstChildOfClass("Backpack")if bp then for _,tool in ipairs(bp:GetChildren())do if tool:IsA("Tool")then applyRapidFire(tool)end end end elseif not state then for valObj,origVal in pairs(originalToolValues)do if valObj and valObj.Parent then valObj.Value=origVal end end originalToolValues={}end end)
+createActionButtonInGroup(combatContent,"TP to Spawn",168,Color3.fromRGB(41,128,185),function()if InitialSpawnCFrame then SafeTeleport(InitialSpawnCFrame)end end)
+local saveMapButton=createActionButtonInGroup(combatContent,"Save Location",196,Color3.fromRGB(142,68,173),function()if rootPart then savedMapCFrame=rootPart.CFrame saveMapButton.Text="Saved!" task.delay(1.5,function()saveMapButton.Text="Save Location"end)end end)
+createActionButtonInGroup(combatContent,"TP to Saved",224,Color3.fromRGB(39,174,96),function()if savedMapCFrame then SafeTeleport(savedMapCFrame)end end)
+createActionButtonInGroup(combatContent,"Server Hop (Low)",252,Color3.fromRGB(211,84,0),function()local success,result=pcall(function()local url="https://games.roblox.com/v1/games/"..PlaceId.."/servers/Public?sortOrder=Asc&limit=100"return HttpService:JSONDecode(game:HttpGet(url))end)
+if success and result and result.data then local bestServerId,minPlayers=nil,math.huge for _,srv in ipairs(result.data)do if srv.id~=game.JobId and type(srv.playing)=="number"and srv.playing<srv.maxPlayers then if srv.playing<minPlayers then minPlayers=srv.playing bestServerId=srv.id if srv.playing<=1 then break end end end end
+if bestServerId then TeleportService:TeleportToPlaceInstance(PlaceId,bestServerId,player)else TeleportService:Teleport(PlaceId,player)end else TeleportService:Teleport(PlaceId,player)end end)
+local utilityContent,_=createCollapsibleGroup(rightGroupFrame,"Utilities & ESP",nextRightY+8,84)
+createToggleInGroup(utilityContent,"Egg Name ESP",0,function(state)eggEspEnabled=state if not state then for _,tag in pairs(trackedEggTags)do if tag then tag:Destroy()end end trackedEggTags={}end end)
+createToggleInGroup(utilityContent,"Prompt Extender",28,function(state)promptExtenderEnabled=state if not state then for promptObj,origValues in pairs(originalPromptValues)do if promptObj and promptObj.Parent then promptObj.MaxActivationDistance=origValues.MaxActivationDistance promptObj.RequiresLineOfSight=origValues.RequiresLineOfSight promptObj.HoldDuration=origValues.HoldDuration end end originalPromptValues={}end end)
+createToggleInGroup(utilityContent,"Anti-AFK",56,function(state)antiAfkEnabled=state end)
+print("GR33D SCRIPTS: V4.58 Tweened TP Fix Loaded Successfully!")
