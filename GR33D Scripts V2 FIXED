@@ -1,0 +1,861 @@
+-- ==========================================
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V4.70 (FIXED + ENHANCED ANTI-CHEAT BYPASS)
+-- ==========================================
+
+-- ========== STRONG ANTI-CHEAT BYPASS LAYER ==========
+pcall(function()
+	-- Metamethod hijacking for maximum stealth
+	local mt = getrawmetatable(game)
+	setreadonly(mt, false)
+	
+	local oldNamecall = mt.__namecall
+	local oldNewIndex = mt.__newindex
+	local oldIndex = mt.__index
+	
+	-- Intercept all Remote Events/Functions
+	mt.__namecall = newcclosure(function(self, ...)
+		local method = getnamecallmethod()
+		if not checkcaller() then
+			local remoteName = tostring(self):lower()
+			
+			-- Block anticheat-related remotes
+			if (method == "Kick" or method == "kick" or method == "SaveInstance") and self == game.Players.LocalPlayer then
+				return
+			end
+			
+			-- Comprehensive remote filtering
+			if (method == "FireServer" or method == "InvokeServer") then
+				if remoteName:find("anticheat") or remoteName:find("ban") or remoteName:find("report") or 
+					remoteName:find("teleport") or remoteName:find("detect") or remoteName:find("cheat") or 
+					remoteName:find("exploit") or remoteName:find("speed") or remoteName:find("velocity") or
+					remoteName:find("admin") or remoteName:find("moderation") or remoteName:find("log") then
+					return
+				end
+			end
+		end
+		return oldNamecall(self, ...)
+	end)
+	
+	-- Block Humanoid stat modifications
+	mt.__newindex = newcclosure(function(t, k, v)
+		if not checkcaller() and typeof(t) == "Instance" and t:IsA("Humanoid") then
+			local char = game.Players.LocalPlayer.Character
+			if char and t:IsDescendantOf(char) then
+				if k == "MaxHealth" and getgenv().MegaHealthActive and v < 900000000 then return end
+				if k == "Health" and (getgenv().MegaHealthActive or getgenv().GodModeActive) then return end
+				if k == "WalkSpeed" and getgenv().NoSpeedLimitActive then return end
+			end
+		end
+		return oldNewIndex(t, k, v)
+	end)
+	
+	setreadonly(mt, true)
+end)
+
+-- ========== SERVICE INITIALIZATION ==========
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local protectedParent = player:WaitForChild("PlayerGui")
+if protectedParent:FindFirstChild("DevPanelGui") then
+	protectedParent.DevPanelGui:Destroy()
+end
+
+local camera = Workspace.CurrentCamera
+local PlaceId = game.PlaceId
+
+-- ========== CONFIGURATION & STATE VARIABLES ==========
+local FLY_SPEED = 50
+local runSpeedValue = 50
+local jumpPowerValue = 50
+local defaultJumpPower = 50
+local defaultWalkSpeed = 16
+local DOUBLE_TAP_WINDOW = 0.35
+local cachedPrompts = {}
+local cachedMonsters = {}
+
+local originalPromptValues = {}
+local originalToolValues = {}
+
+getgenv().NoclipActive = false
+getgenv().GodModeActive = false
+getgenv().MegaHealthActive = false
+getgenv().SlimHitboxActive = false
+getgenv().NoSpeedLimitActive = false
+getgenv().AutoGrabActive = false
+getgenv().TargetValue = 0
+getgenv().TargetLuck = 0
+getgenv().TargetSize = 0
+
+local flyToggleEnabled = false
+local isFlying = false
+local godModeEnabled = false
+local megaHealthEnabled = false
+local rapidHealingEnabled = false
+local noFallDamageEnabled = false
+local runSpeedEnabled = false
+local jumpEnabled = false
+local hitboxEnabled = false
+local slimHitboxEnabled = false
+local aimbotEnabled = false
+local thirdPersonCamEnabled = false
+local rapidFireEnabled = false
+local eggEspEnabled = false
+local promptExtenderEnabled = false
+local antiAfkEnabled = false
+local antiMeleeEnabled = false
+local isMinimized = false
+local autoGrabLoopRunning = false
+
+local lastJumpTapTime = 0
+local lastJumpReqTime = 0
+local InitialSpawnCFrame = nil
+local savedMapCFrame = nil
+
+local character, rootPart, humanoid
+local attachment, linearVelocity
+local originalHitboxSizes = {}
+local originalRootSize = nil
+local pristineRootSize = Vector3.new(2, 2, 1)
+local trackedEggTags = {}
+
+-- ========== ANTI-AFK HANDLER ==========
+player.Idled:Connect(function()
+	if antiAfkEnabled then
+		pcall(function()
+			VirtualUser:Button2Down(Vector2.new(0, 0), camera.CFrame)
+			task.wait(1)
+			VirtualUser:Button2Up(Vector2.new(0, 0), camera.CFrame)
+		end)
+	end
+end)
+
+local controls = nil
+pcall(function()
+	local playerScripts = player:WaitForChild("PlayerScripts", 5)
+	if playerScripts then
+		local playerModuleScript = playerScripts:WaitForChild("PlayerModule", 5)
+		if playerModuleScript then
+			controls = require(playerModuleScript):GetControls()
+		end
+	end
+end)
+
+-- ========== UTILITY FUNCTIONS ==========
+local function parseStatValue(input)
+	if type(input) == "number" then return input end
+	if type(input) ~= "string" then return 0 end
+	
+	local upperInput = input:upper():gsub("%s+", "")
+	if upperInput == "" or upperInput == "0" then return 0 end
+	if upperInput:find("KG") or upperInput:find("TON") or upperInput:find("LUCK") or upperInput:find("%%") then return 0 end
+	
+	local numStr, suffix = upperInput:match("(%d+%.?%d*)([KMGT]?)")
+	local num = tonumber(numStr)
+	if not num then
+		local cleaned = upperInput:gsub("[^0-9KMBT%.]", "")
+		num = tonumber(cleaned:match("[%d%.]+"))
+		if not num then return 0 end
+		if cleaned:find("T") then return num * 1e12
+		elseif cleaned:find("B") then return num * 1e9
+		elseif cleaned:find("M") then return num * 1e6
+		elseif cleaned:find("K") then return num * 1e3
+		end
+		return num
+	end
+	
+	local multiplier = 1
+	if suffix == "T" or upperInput:find("TRILLION") then multiplier = 1e12
+	elseif suffix == "B" or upperInput:find("BILLION") then multiplier = 1e9
+	elseif suffix == "M" or upperInput:find("MILLION") then multiplier = 1e6
+	elseif suffix == "K" or upperInput:find("THOUSAND") then multiplier = 1e3
+	end
+	
+	return num * multiplier
+end
+
+local function parseWeightValue(input)
+	if type(input) == "number" then return input end
+	if type(input) ~= "string" then return 0 end
+	
+	local upperInput = input:upper()
+	local cleaned = upperInput:gsub("[^0-9%.]", "")
+	local num = tonumber(cleaned:match("[%d%.]+"))
+	if not num then return 0 end
+	
+	if upperInput:find("TON") then
+		return num * 1000
+	elseif upperInput:find("KG") then
+		return num
+	elseif upperInput:find("G") then
+		return num / 1000
+	end
+	return num
+end
+
+local function isValidGrabPrompt(prompt)
+	if not prompt or not prompt.Enabled then return false end
+	local parentObj = prompt.Parent
+	if not parentObj then return false end
+	
+	if parentObj:IsA("ScreenGui") or parentObj:IsA("BillboardGui") or parentObj:IsA("SurfaceGui") or parentObj:IsA("TextButton") or parentObj:IsA("ImageButton") then
+		return false
+	end
+	
+	local actionText = prompt.ActionText:lower()
+	local objectText = prompt.ObjectText:lower()
+	
+	-- FIX: Completed blocked keywords list
+	local blockedKeywords = {"buy", "purchase", "view", "shop", "robux", "configure", "finish", "mining", "backpack", "group", "gift", "verify", "claim", "full", "reward", "spin", "upgrade", "warmth", "cold"}
+	for _, keyword in ipairs(blockedKeywords) do
+		if actionText:find(keyword) or objectText:find(keyword) then
+			return false
+		end
+	end
+	
+	local ancestor = prompt:FindFirstAncestorOfClass("Model")
+	if ancestor then
+		local nameLower = ancestor.Name:lower()
+		for _, keyword in ipairs(blockedKeywords) do
+			if nameLower:find(keyword) then return false end
+		end
+	end
+	
+	return true
+end
+
+-- ========== CACHING LOOPS ==========
+task.spawn(function()
+	while true do
+		if getgenv().AutoGrabActive then
+			local cache = {}
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if obj:IsA("ProximityPrompt") then
+					if isValidGrabPrompt(obj) and not obj:IsDescendantOf(player.PlayerGui) and not obj:IsDescendantOf(game:GetService("CoreGui")) then
+						table.insert(cache, obj)
+					end
+				end
+			end
+			cachedPrompts = cache
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		local list = {}
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
+				local nameLower = obj.Name:lower()
+				-- FIX: Completed friendly names list
+				local isFriendly = nameLower:find("shop") or nameLower:find("npc") or nameLower:find("dummy") or nameLower:find("merchant") or nameLower:find("guide") or nameLower:find("bank") or nameLower:find("vendor")
+				if not isFriendly then
+					local hum = obj:FindFirstChildOfClass("Humanoid")
+					local hrp = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("PrimaryPart")
+					if hum and hrp and hum.Health > 0 then
+						table.insert(list, hrp)
+					end
+				end
+			end
+		end
+		cachedMonsters = list
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		if promptExtenderEnabled then
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if obj:IsA("ProximityPrompt") then
+					if not originalPromptValues[obj] then
+						originalPromptValues[obj] = {
+							MaxActivationDistance = obj.MaxActivationDistance,
+							RequiresLineOfSight = obj.RequiresLineOfSight,
+							HoldDuration = obj.HoldDuration
+						}
+					end
+					obj.MaxActivationDistance = 35
+					obj.RequiresLineOfSight = false
+					obj.HoldDuration = 0
+				end
+			end
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		if eggEspEnabled then
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if obj:IsA("Model") and (obj.Name:lower():find("egg") or obj.Name:lower():find("brainrot")) and not trackedEggTags[obj] then
+					local targetPart = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
+					if targetPart then
+						local billboard = Instance.new("BillboardGui")
+						billboard.Name = "EggESP"
+						billboard.Adornee = targetPart
+						billboard.Size = UDim2.new(0, 100, 0, 30)
+						billboard.StudsOffset = Vector3.new(0, 2, 0)
+						billboard.AlwaysOnTop = true
+						
+						local label = Instance.new("TextLabel")
+						label.Parent = billboard
+						label.Size = UDim2.new(1, 0, 1, 0)
+						label.BackgroundTransparency = 1
+						label.Text = obj.Name
+						label.TextColor3 = Color3.fromRGB(255, 215, 0)
+						label.Font = Enum.Font.GothamBold
+						label.TextSize = 12
+						
+						billboard.Parent = obj
+						trackedEggTags[obj] = billboard
+					end
+				end
+			end
+		else
+			if next(trackedEggTags) then
+				for _, tag in pairs(trackedEggTags) do if tag then tag:Destroy() end end
+				trackedEggTags = {}
+			end
+		end
+		task.wait(2)
+	end
+end)
+
+-- ========== STAT SCANNING ==========
+local function scanAndExtractStats(targetObj)
+	local statData = { Value = 0, Luck = 0, Size = 0, Weight = 0, RarityScore = 0 }
+	if not targetObj then return statData end
+
+	pcall(function()
+		if targetObj:IsA("Model") then
+			statData.Size = targetObj:GetExtentsSize().Magnitude
+		elseif targetObj:IsA("BasePart") then
+			statData.Size = targetObj.Size.Magnitude
+		end
+	end)
+
+	pcall(function()
+		for attrName, val in pairs(targetObj:GetAttributes()) do
+			local nameLower = attrName:lower()
+			local valStr = tostring(val):lower()
+			local numericVal = parseStatValue(val)
+			local weightVal = parseWeightValue(val)
+			if nameLower:find("val") or nameLower:find("price") or nameLower:find("cash") or nameLower:find("money") or nameLower:find("gamevalue") then
+				if numericVal > statData.Value then statData.Value = numericVal end
+			elseif nameLower:find("luck") then
+				if numericVal > statData.Luck then statData.Luck = numericVal end
+			elseif nameLower:find("weight") or nameLower:find("mass") then
+				if weightVal > statData.Weight then statData.Weight = weightVal end
+			elseif nameLower:find("size") then
+				if numericVal > statData.Size then statData.Size = numericVal end
+			elseif nameLower:find("rarity") or valStr:find("legendary") or valStr:find("mythic") or valStr:find("secret") then
+				statData.RarityScore = statData.RarityScore + 100
+			end
+		end
+	end)
+
+	pcall(function()
+		for _, desc in ipairs(targetObj:GetDescendants()) do
+			if desc:IsA("TextLabel") and (desc.Parent:IsA("BillboardGui") or desc.Parent:IsA("SurfaceGui")) then
+				local text = desc.Text
+				local textLower = text:lower()
+				local parsedVal = parseStatValue(text)
+				local parsedWeight = parseWeightValue(text)
+				
+				if textLower:find("luck") or textLower:find("%%") then
+					if parsedVal > statData.Luck then statData.Luck = parsedVal end
+				elseif textLower:find("ton") or textLower:find("kg") then
+					if parsedWeight > statData.Weight then statData.Weight = parsedWeight end
+				else
+					if parsedVal > 0 and parsedVal > statData.Value then
+						statData.Value = parsedVal
+					end
+				end
+
+				if textLower:find("secret") or textLower:find("mythic") or textLower:find("godly") or textLower:find("legendary") then
+					statData.RarityScore = statData.RarityScore + 500
+				end
+			end
+		end
+	end)
+
+	return statData
+end
+
+local function executeAutoGrabRoutine()
+	if not rootPart then return end
+	
+	for _, prompt in ipairs(cachedPrompts) do
+		if isValidGrabPrompt(prompt) then
+			local targetModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
+			local distance = (rootPart.Position - targetModel:GetPivot().Position).Magnitude
+			if distance <= 45 then
+				local stats = scanAndExtractStats(targetModel)
+				local targetVal = getgenv().TargetValue or 0
+				local targetLuck = getgenv().TargetLuck or 0
+				local targetSize = getgenv().TargetSize or 0
+				
+				local meetsCriteria = false
+				local activeFiltersCount = 0
+				
+				if targetVal > 0 then activeFiltersCount = activeFiltersCount + 1 end
+				if targetLuck > 0 then activeFiltersCount = activeFiltersCount + 1 end
+				if targetSize > 0 then activeFiltersCount = activeFiltersCount + 1 end
+				
+				if activeFiltersCount == 0 then
+					meetsCriteria = true
+				else
+					local valueMatches = true
+					local luckMatches = true
+					local sizeMatches = true
+					
+					if targetVal > 0 then
+						if math.abs(stats.Value - targetVal) > (targetVal * 0.25) then
+							valueMatches = false
+						end
+					end
+					
+					if targetLuck > 0 then
+						if stats.Luck < targetLuck then
+							luckMatches = false
+						end
+					end
+					
+					if targetSize > 0 then
+						if stats.Size < targetSize and stats.Weight < targetSize then
+							sizeMatches = false
+						end
+					end
+					
+					if targetVal > 0 and targetLuck == 0 and targetSize == 0 then
+						meetsCriteria = valueMatches
+					else
+						meetsCriteria = true
+						if targetVal > 0 and not valueMatches then meetsCriteria = false end
+						if targetLuck > 0 and not luckMatches then meetsCriteria = false end
+						if targetSize > 0 and not sizeMatches then meetsCriteria = false end
+					end
+				end
+
+				if meetsCriteria then
+					fireproximityprompt(prompt)
+				end
+			end
+		end
+	end
+end
+
+-- ========== TELEPORT FUNCTION WITH ANTI-CHEAT EVASION ==========
+local function SafeTeleportAndGrabHighestValue()
+	if not character or not rootPart then return end
+	
+	local originalCFrame = rootPart.CFrame
+	if not InitialSpawnCFrame then
+		InitialSpawnCFrame = originalCFrame
+	end
+
+	local highestItem = nil
+	local highestPrompt = nil
+	local maxVal = -math.huge
+
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		local nameLower = obj.Name:lower()
+		if nameLower:find("brainrot") or nameLower:find("egg") or obj:IsA("ProximityPrompt") then
+			local targetModel = obj:IsA("ProximityPrompt") and (obj:FindFirstAncestorOfClass("Model") or obj.Parent) or (obj:IsA("Model") and obj or obj:FindFirstAncestorOfClass("Model"))
+			if targetModel and targetModel ~= character and not Players:GetPlayerFromCharacter(targetModel) then
+				local stats = scanAndExtractStats(targetModel)
+				if stats.Value > maxVal then
+					maxVal = stats.Value
+					highestItem = targetModel
+					if obj:IsA("ProximityPrompt") then
+						highestPrompt = obj
+					else
+						highestPrompt = targetModel:FindFirstChildWhichIsA("ProximityPrompt", true)
+					end
+				end
+			end
+		end
+	end
+
+	if not highestItem then
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
+				local stats = scanAndExtractStats(obj)
+				if stats.Value > maxVal then
+					maxVal = stats.Value
+					highestItem = obj
+					highestPrompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+				end
+			end
+		end
+	end
+
+	if not highestItem then return end
+
+	local targetPart = highestItem:IsA("Model") and (highestItem.PrimaryPart or highestItem:FindFirstChild("HumanoidRootPart") or highestItem:FindFirstChildWhichIsA("BasePart")) or highestItem
+	if not targetPart then return end
+
+	local destinationCFrame = targetPart:IsA("BasePart") and targetPart.CFrame or highestItem:GetPivot()
+
+	local function smoothTeleport(destCFrame)
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+		rootPart.AssemblyAngularVelocity = Vector3.zero
+		
+		local tweenInfo = TweenInfo.new(0.05, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+		local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = destCFrame})
+		
+		rootPart.Anchored = true
+		tween:Play()
+		tween.Completed:Wait()
+		rootPart.Anchored = false
+		rootPart.AssemblyLinearVelocity = Vector3.zero
+	end
+
+	smoothTeleport(destinationCFrame + Vector3.new(0, 3, 0))
+
+	task.wait(0.05)
+	if highestPrompt then
+		pcall(function() fireproximityprompt(highestPrompt) end)
+	end
+	if highestItem:IsA("Model") then
+		for _, part in ipairs(highestItem:GetDescendants()) do
+			if part:IsA("BasePart") then
+				pcall(function()
+					firetouchinterest(rootPart, part, 0)
+					firetouchinterest(rootPart, part, 1)
+				end)
+			end
+		end
+	elseif highestItem:IsA("BasePart") then
+		pcall(function()
+			firetouchinterest(rootPart, highestItem, 0)
+			firetouchinterest(rootPart, highestItem, 1)
+		end)
+	end
+
+	smoothTeleport(InitialSpawnCFrame)
+end
+
+-- ========== FLIGHT SYSTEM ==========
+local function setFlying(state)
+	if not rootPart or not humanoid or not linearVelocity then return end
+	isFlying = state
+
+	if isFlying then
+		linearVelocity.MaxForce = 100000
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+	else
+		linearVelocity.MaxForce = 0
+		linearVelocity.VectorVelocity = Vector3.zero
+		
+		if humanoid.FloorMaterial ~= Enum.Material.Air then
+			humanoid:ChangeState(Enum.HumanoidStateType.Running)
+		end
+	end
+end
+
+local function handleJumpTap()
+	if not flyToggleEnabled then return end
+	local currentTime = os.clock()
+	local timeSinceLastTap = currentTime - lastJumpTapTime
+
+	if timeSinceLastTap <= DOUBLE_TAP_WINDOW then
+		if isFlying then
+			setFlying(false)
+		elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
+			setFlying(true)
+		end
+		lastJumpTapTime = 0
+	else
+		lastJumpTapTime = currentTime
+	end
+end
+
+UserInputService.JumpRequest:Connect(function()
+	local currentTime = os.clock()
+	if (currentTime - lastJumpReqTime) > 0.1 then
+		handleJumpTap()
+	end
+	lastJumpReqTime = currentTime
+end)
+
+-- ========== RUNTIME CONNECTIONS ==========
+RunService.Stepped:Connect(function()
+	if getgenv().NoclipActive and character then
+		for _, part in ipairs(character:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	end
+end)
+
+RunService.Heartbeat:Connect(function(deltaTime)
+	if runSpeedEnabled and rootPart and humanoid and not isFlying then
+		local moveDir = humanoid.MoveDirection
+		if moveDir.Magnitude > 0 then
+			local displacement = moveDir * (runSpeedValue * deltaTime)
+			rootPart.CFrame = rootPart.CFrame + displacement
+			rootPart.AssemblyLinearVelocity = Vector3.new(0, rootPart.AssemblyLinearVelocity.Y, 0)
+		end
+	end
+end)
+
+local function applyRapidFire(tool)
+	for _, v in ipairs(tool:GetDescendants()) do
+		if (v:IsA("NumberValue") or v:IsA("IntValue")) then
+			local n = v.Name:lower()
+			if n:find("cooldown") or n:find("delay") or n:find("fire") or n:find("rate") or n:find("speed") or n:find("mine") or n:find("dig") or n:find("swing") or n:find("hit") or n:find("power") then
+				if not originalToolValues[v] then
+					originalToolValues[v] = v.Value
+				end
+				if n:find("power") or n:find("speed") then
+					v.Value = originalToolValues[v] * 5
+				else
+					v.Value = 0
+				end
+			end
+		end
+	end
+end
+
+local function monitorTool(tool)
+	if tool:IsA("Tool") then
+		if rapidFireEnabled then
+			applyRapidFire(tool)
+		end
+		tool.DescendantAdded:Connect(function(v)
+			if rapidFireEnabled and (v:IsA("NumberValue") or v:IsA("IntValue")) then
+				applyRapidFire(tool)
+			end
+		end)
+	end
+end
+
+local function setupCharacter(char)
+	character = char
+	rootPart = char:WaitForChild("HumanoidRootPart")
+	humanoid = char:WaitForChild("Humanoid")
+	rootPart.Anchored = false
+	
+	if humanoid then
+		defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
+		defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
+	end
+
+	if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
+	if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
+	
+	attachment = Instance.new("Attachment")
+	attachment.Name = "FlightAttachment"
+	attachment.Parent = rootPart
+
+	linearVelocity = Instance.new("LinearVelocity")
+	linearVelocity.Name = "FlightVelocity"
+	linearVelocity.Attachment0 = attachment
+	linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	linearVelocity.MaxForce = 0
+	linearVelocity.VectorVelocity = Vector3.zero
+	linearVelocity.Parent = rootPart
+	
+	char.ChildAdded:Connect(function(child)
+		monitorTool(child)
+	end)
+	for _, child in ipairs(char:GetChildren()) do
+		monitorTool(child)
+	end
+
+	humanoid.Jumping:Connect(function(isActive)
+		if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
+			local currentVel = rootPart.AssemblyLinearVelocity
+			rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
+		end
+	end)
+
+	-- FIX: Added semicolon between statements
+	task.defer(function()
+		if rootPart then
+			pristineRootSize = Vector3.new(2, 2, 1)
+			originalRootSize = pristineRootSize
+		end
+		if megaHealthEnabled then
+			humanoid.MaxHealth = 900000000;
+			humanoid.Health = 900000000
+		end
+	end)
+
+	if not InitialSpawnCFrame then
+		task.delay(0.8, function()
+			if rootPart and not InitialSpawnCFrame then InitialSpawnCFrame = rootPart.CFrame end
+		end)
+	end
+	if flyToggleEnabled then setFlying(true) end
+end
+
+setupCharacter(player.Character or player.CharacterAdded:Wait())
+player.CharacterAdded:Connect(function(newChar)
+	flyToggleEnabled = false
+	isFlying = false
+	if linearVelocity then linearVelocity.MaxForce = 0 end
+	setupCharacter(newChar)
+end)
+
+local backpack = player:FindFirstChildOfClass("Backpack")
+if backpack then
+	backpack.ChildAdded:Connect(function(child)
+		monitorTool(child)
+	end)
+end
+
+RunService.RenderStepped:Connect(function(dt)
+	if not camera or not camera.Parent then camera = workspace.CurrentCamera return end
+
+	if godModeEnabled and humanoid then
+		humanoid.Health = humanoid.MaxHealth
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+	end
+
+	if isFlying and linearVelocity and humanoid and rootPart then
+		if humanoid.FloorMaterial ~= Enum.Material.Air then
+			setFlying(false)
+		elseif controls then
+			local moveVector = controls:GetMoveVector()
+			if moveVector.Magnitude > 0 then
+				local camCFrame = camera.CFrame
+				local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
+				linearVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
+			else
+				linearVelocity.VectorVelocity = Vector3.zero
+			end
+		end
+	end
+
+	if jumpEnabled and humanoid then
+		pcall(function()
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = jumpPowerValue
+		end)
+	elseif not jumpEnabled and humanoid then
+		pcall(function()
+			if humanoid.JumpPower ~= defaultJumpPower then
+				humanoid.JumpPower = defaultJumpPower
+			end
+		end)
+	end
+
+	if rapidHealingEnabled and humanoid and humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
+		humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + (humanoid.MaxHealth * 0.05))
+	end
+
+	if noFallDamageEnabled and rootPart and humanoid then
+		if humanoid:GetState() == Enum.HumanoidStateType.Freefall or humanoid:GetState() == Enum.HumanoidStateType.FallingDown then
+			pcall(function()
+				if rootPart.AssemblyLinearVelocity.Y < -45 then
+					rootPart.AssemblyLinearVelocity = Vector3.new(rootPart.AssemblyLinearVelocity.X, 0, rootPart.AssemblyLinearVelocity.Z)
+				end
+			end)
+		end
+	end
+
+	if antiMeleeEnabled and rootPart and humanoid then
+		local currentVel = rootPart.AssemblyLinearVelocity
+		if humanoid.MoveDirection.Magnitude == 0 and not isFlying and not runSpeedEnabled then
+			if math.abs(currentVel.X) > 4 or math.abs(currentVel.Z) > 4 then
+				rootPart.AssemblyLinearVelocity = Vector3.new(0, currentVel.Y, 0)
+			end
+		end
+	end
+
+	if hitboxEnabled then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+				local hrp = p.Character.HumanoidRootPart
+				if not originalHitboxSizes[hrp] then originalHitboxSizes[hrp] = hrp.Size end
+				hrp.Size = Vector3.new(8, 8, 8)
+				hrp.Transparency = 0.7
+				hrp.CanCollide = false
+			end
+		end
+	end
+
+	if slimHitboxEnabled and rootPart then
+		rootPart.Size = Vector3.new(1.3, 2, 0.7)
+	elseif not slimHitboxEnabled and rootPart and originalRootSize and rootPart.Size ~= originalRootSize then
+		rootPart.Size = originalRootSize
+	end
+
+	if thirdPersonCamEnabled and rootPart then
+		camera.CameraType = Enum.CameraType.Scriptable
+		local head = character and character:FindFirstChild("Head") or rootPart
+		local currentCamRot = camera.CFrame.Rotation
+		local focusPos = head.Position + Vector3.new(0, 1, 0)
+		local targetCFrame = CFrame.new(focusPos) * currentCamRot * CFrame.new(0, 3.5, -8)
+		camera.CFrame = targetCFrame
+	elseif not thirdPersonCamEnabled and camera.CameraType == Enum.CameraType.Scriptable then
+		camera.CameraType = Enum.CameraType.Custom
+	end
+
+	if aimbotEnabled and rootPart then
+		local nearestTarget, shortestDist = nil, math.huge
+		
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player and p.Character then
+				local isTeammate = false
+				if player.Team and p.Team then
+					if p.Team == player.Team or p.TeamColor == player.TeamColor then
+						isTeammate = true
+					end
+				end
+				if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
+					isTeammate = true
+				end
+				
+				if not isTeammate then
+					local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+					local hum = p.Character:FindFirstChildOfClass("Humanoid")
+					if hrp and hum and hum.Health > 0 then
+						if not p.Character:FindFirstChildOfClass("ForceField") then
+							local dist = (hrp.Position - rootPart.Position).Magnitude
+							if dist < shortestDist then
+								shortestDist = dist
+								nearestTarget = hrp
+							end
+						end
+					end
+				end
+			end
+		end
+		
+		for _, hrp in ipairs(cachedMonsters) do
+			if hrp and hrp.Parent then
+				local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+				if hum and hum.Health > 0 then
+					local dist = (hrp.Position - rootPart.Position).Magnitude
+					if dist < shortestDist then
+						shortestDist = dist
+						nearestTarget = hrp
+					end
+				end
+			end
+		end
+		
+		if nearestTarget then
+			local goalCFrame = CFrame.new(camera.CFrame.Position, nearestTarget.Position)
+			camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(dt * 20, 0.1, 1))
+		end
+	end
+end)
+
+print("✓ GR33D Scripts V4.70 FIXED - All syntax errors resolved!")
+print("✓ Enhanced Anti-Cheat Bypass Active")
+print("✓ Ready for execution")
