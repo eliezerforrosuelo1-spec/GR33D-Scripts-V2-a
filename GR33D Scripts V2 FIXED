@@ -94,6 +94,10 @@ getgenv().TargetValue = 0
 getgenv().TargetLuck = 0
 getgenv().TargetSize = 0
 
+-- State variables additions from weapon integration
+local bulletFollowEnabled = false
+getgenv().BulletFollowMode = false
+
 local flyToggleEnabled = false
 local isFlying = false
 local godModeEnabled = false
@@ -212,7 +216,6 @@ local function isValidGrabPrompt(prompt)
 	local actionText = prompt.ActionText:lower()
 	local objectText = prompt.ObjectText:lower()
 	
-	-- FIX: Completed blocked keywords list
 	local blockedKeywords = {"buy", "purchase", "view", "shop", "robux", "configure", "finish", "mining", "backpack", "group", "gift", "verify", "claim", "full", "reward", "spin", "upgrade", "warmth", "heal"}
 	for _, keyword in ipairs(blockedKeywords) do
 		if actionText:find(keyword) or objectText:find(keyword) then
@@ -229,6 +232,193 @@ local function isValidGrabPrompt(prompt)
 	end
 	
 	return true
+end
+
+-- ========== WEAPON TYPE DETECTION ==========
+local function detectWeaponType()
+    local backpack = player:FindFirstChildOfClass("Backpack")
+    local equippedTool = character and character:FindFirstChildOfClass("Tool")
+    
+    local currentTool = equippedTool or (backpack and backpack:FindFirstChildOfClass("Tool"))
+    
+    if not currentTool then return "NONE" end
+    
+    local toolName = currentTool.Name:lower()
+    local descValue = currentTool:FindFirstChild("Description")
+    local toolDesc = (descValue and descValue:IsA("StringValue") and descValue.Value:lower()) or ""
+    
+    if toolName:match("gun") or toolName:match("pistol") or toolName:match("rifle") or 
+       toolName:match("sniper") or toolName:match("shotgun") or toolName:match("blaster") or
+       toolDesc:match("gun") or toolDesc:match("shoot") or toolDesc:match("bullet") then
+        return "GUN"
+    end
+    
+    if toolName:match("sword") or toolName:match("bat") or toolName:match("axe") or
+       toolName:match("hammer") or toolName:match("club") or toolName:match("knife") or
+       toolDesc:match("melee") or toolDesc:match("swing") or toolDesc:match("strike") then
+        return "MELEE"
+    end
+    
+    if toolName:match("rod") or toolName:match("projectile") or toolName:match("bow") then
+        return "PROJECTILE"
+    end
+    
+    return "UNKNOWN"
+end
+
+-- ========== GUN AIMBOT (CAMERA-BASED) ==========
+local function runGunAimbot(dt)
+    if not aimbotEnabled or not rootPart or not camera then return end
+    
+    local nearestTarget, shortestDist = nil, 100
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local isTeammate = false
+            if player.Team and p.Team then
+                if p.Team == player.Team or p.TeamColor == player.TeamColor then
+                    isTeammate = true
+                end
+            end
+            if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
+                isTeammate = true
+            end
+            
+            if not isTeammate then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    if not p.Character:FindFirstChildOfClass("ForceField") then
+                        local dist = (hrp.Position - rootPart.Position).Magnitude
+                        if dist < shortestDist then
+                            shortestDist = dist
+                            nearestTarget = hrp
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    for _, hrp in ipairs(cachedMonsters) do
+        if hrp and hrp.Parent then
+            local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local dist = (hrp.Position - rootPart.Position).Magnitude
+                if dist < shortestDist then
+                    shortestDist = dist
+                    nearestTarget = hrp
+                end
+            end
+        end
+    end
+    
+    if nearestTarget then
+        local goalCFrame = CFrame.new(camera.CFrame.Position, nearestTarget.Position + Vector3.new(0, 1.5, 0))
+        camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(0.15, 0, 1))
+    end
+end
+
+-- ========== MELEE AIMBOT (BODY MOVEMENT-BASED) ==========
+local function runMeleeAimbot(dt)
+    if not aimbotEnabled or not rootPart or not humanoid then return end
+    
+    local nearestTarget, shortestDist = nil, 20
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local isTeammate = false
+            if player.Team and p.Team then
+                if p.Team == player.Team or p.TeamColor == player.TeamColor then
+                    isTeammate = true
+                end
+            end
+            if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
+                isTeammate = true
+            end
+            
+            if not isTeammate then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    if not p.Character:FindFirstChildOfClass("ForceField") then
+                        local dist = (hrp.Position - rootPart.Position).Magnitude
+                        if dist < shortestDist then
+                            shortestDist = dist
+                            nearestTarget = hrp
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    for _, hrp in ipairs(cachedMonsters) do
+        if hrp and hrp.Parent then
+            local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local dist = (hrp.Position - rootPart.Position).Magnitude
+                if dist < shortestDist then
+                    shortestDist = dist
+                    nearestTarget = hrp
+                end
+            end
+        end
+    end
+    
+    if nearestTarget then
+        local direction = (nearestTarget.Position - rootPart.Position).Unit
+        local newCFrame = rootPart.CFrame:Lerp(CFrame.new(rootPart.Position, rootPart.Position + direction), 0.1)
+        rootPart.CFrame = newCFrame
+    end
+end
+
+-- ========== BULLET FOLLOW AIMBOT (ADVANCED GUN AIMBOT) ==========
+local function runBulletFollowAimbot(dt)
+    if not aimbotEnabled or not rootPart or not camera then return end
+    
+    local BULLET_SPEED = 100
+    local nearestTarget, shortestDist = nil, 100
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local isTeammate = false
+            if player.Team and p.Team then
+                if p.Team == player.Team or p.TeamColor == player.TeamColor then
+                    isTeammate = true
+                end
+            end
+            if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
+                isTeammate = true
+            end
+            
+            if not isTeammate then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0 then
+                    local dist = (hrp.Position - camera.CFrame.Position).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        nearestTarget = hrp
+                    end
+                end
+            end
+        end
+    end
+    
+    if nearestTarget then
+        local targetPos = nearestTarget.Position
+        local targetVel = nearestTarget.AssemblyLinearVelocity
+        local bulletOrigin = camera.CFrame.Position
+        local distToTarget = (targetPos - bulletOrigin).Magnitude
+        local timeToHit = distToTarget / BULLET_SPEED
+        
+        local predictedPos = targetPos + (targetVel * timeToHit)
+        local compensatedPos = predictedPos + Vector3.new(0, 0.5, 0)
+        
+        local goalCFrame = CFrame.new(camera.CFrame.Position, compensatedPos)
+        camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(0.12, 0, 1))
+    end
 end
 
 -- ========== CACHING LOOPS ==========
@@ -255,7 +445,6 @@ task.spawn(function()
 		for _, obj in ipairs(Workspace:GetDescendants()) do
 			if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
 				local nameLower = obj.Name:lower()
-				-- FIX: Completed friendly names list
 				local isFriendly = nameLower:find("shop") or nameLower:find("npc") or nameLower:find("dummy") or nameLower:find("merchant") or nameLower:find("guide") or nameLower:find("bank") or nameLower:find("vendor")
 				if not isFriendly then
 					local hum = obj:FindFirstChildOfClass("Humanoid")
@@ -390,160 +579,6 @@ local function scanAndExtractStats(targetObj)
 	end)
 
 	return statData
-end
-
-local function executeAutoGrabRoutine()
-	if not rootPart then return end
-	
-	for _, prompt in ipairs(cachedPrompts) do
-		if isValidGrabPrompt(prompt) then
-			local targetModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
-			local distance = (rootPart.Position - targetModel:GetPivot().Position).Magnitude
-			if distance <= 45 then
-				local stats = scanAndExtractStats(targetModel)
-				local targetVal = getgenv().TargetValue or 0
-				local targetLuck = getgenv().TargetLuck or 0
-				local targetSize = getgenv().TargetSize or 0
-				
-				local meetsCriteria = false
-				local activeFiltersCount = 0
-				
-				if targetVal > 0 then activeFiltersCount = activeFiltersCount + 1 end
-				if targetLuck > 0 then activeFiltersCount = activeFiltersCount + 1 end
-				if targetSize > 0 then activeFiltersCount = activeFiltersCount + 1 end
-				
-				if activeFiltersCount == 0 then
-					meetsCriteria = true
-				else
-					local valueMatches = true
-					local luckMatches = true
-					local sizeMatches = true
-					
-					if targetVal > 0 then
-						if math.abs(stats.Value - targetVal) > (targetVal * 0.25) then
-							valueMatches = false
-						end
-					end
-					
-					if targetLuck > 0 then
-						if stats.Luck < targetLuck then
-							luckMatches = false
-						end
-					end
-					
-					if targetSize > 0 then
-						if stats.Size < targetSize and stats.Weight < targetSize then
-							sizeMatches = false
-						end
-					end
-					
-					if targetVal > 0 and targetLuck == 0 and targetSize == 0 then
-						meetsCriteria = valueMatches
-					else
-						meetsCriteria = true
-						if targetVal > 0 and not valueMatches then meetsCriteria = false end
-						if targetLuck > 0 and not luckMatches then meetsCriteria = false end
-						if targetSize > 0 and not sizeMatches then meetsCriteria = false end
-					end
-				end
-
-				if meetsCriteria then
-					fireproximityprompt(prompt)
-				end
-			end
-		end
-	end
-end
-
--- ========== TELEPORT FUNCTION WITH ANTI-CHEAT EVASION ==========
-local function SafeTeleportAndGrabHighestValue()
-	if not character or not rootPart then return end
-	
-	local originalCFrame = rootPart.CFrame
-	if not InitialSpawnCFrame then
-		InitialSpawnCFrame = originalCFrame
-	end
-
-	local highestItem = nil
-	local highestPrompt = nil
-	local maxVal = -math.huge
-
-	for _, obj in ipairs(Workspace:GetDescendants()) do
-		local nameLower = obj.Name:lower()
-		if nameLower:find("brainrot") or nameLower:find("egg") or obj:IsA("ProximityPrompt") then
-			local targetModel = obj:IsA("ProximityPrompt") and (obj:FindFirstAncestorOfClass("Model") or obj.Parent) or (obj:IsA("Model") and obj or obj:FindFirstAncestorOfClass("Model"))
-			if targetModel and targetModel ~= character and not Players:GetPlayerFromCharacter(targetModel) then
-				local stats = scanAndExtractStats(targetModel)
-				if stats.Value > maxVal then
-					maxVal = stats.Value
-					highestItem = targetModel
-					if obj:IsA("ProximityPrompt") then
-						highestPrompt = obj
-					else
-						highestPrompt = targetModel:FindFirstChildWhichIsA("ProximityPrompt", true)
-					end
-				end
-			end
-		end
-	end
-
-	if not highestItem then
-		for _, obj in ipairs(Workspace:GetDescendants()) do
-			if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
-				local stats = scanAndExtractStats(obj)
-				if stats.Value > maxVal then
-					maxVal = stats.Value
-					highestItem = obj
-					highestPrompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
-				end
-			end
-		end
-	end
-
-	if not highestItem then return end
-
-	local targetPart = highestItem:IsA("Model") and (highestItem.PrimaryPart or highestItem:FindFirstChild("HumanoidRootPart") or highestItem:FindFirstChildWhichIsA("BasePart")) or highestItem
-	if not targetPart then return end
-
-	local destinationCFrame = targetPart:IsA("BasePart") and targetPart.CFrame or highestItem:GetPivot()
-
-	local function smoothTeleport(destCFrame)
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-		rootPart.AssemblyAngularVelocity = Vector3.zero
-		
-		local tweenInfo = TweenInfo.new(0.05, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-		local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = destCFrame})
-		
-		rootPart.Anchored = true
-		tween:Play()
-		tween.Completed:Wait()
-		rootPart.Anchored = false
-		rootPart.AssemblyLinearVelocity = Vector3.zero
-	end
-
-	smoothTeleport(destinationCFrame + Vector3.new(0, 3, 0))
-
-	task.wait(0.05)
-	if highestPrompt then
-		pcall(function() fireproximityprompt(highestPrompt) end)
-	end
-	if highestItem:IsA("Model") then
-		for _, part in ipairs(highestItem:GetDescendants()) do
-			if part:IsA("BasePart") then
-				pcall(function()
-					firetouchinterest(rootPart, part, 0)
-					firetouchinterest(rootPart, part, 1)
-				end)
-			end
-		end
-	elseif highestItem:IsA("BasePart") then
-		pcall(function()
-			firetouchinterest(rootPart, highestItem, 0)
-			firetouchinterest(rootPart, highestItem, 1)
-		end)
-	end
-
-	smoothTeleport(InitialSpawnCFrame)
 end
 
 -- ========== FLIGHT SYSTEM ==========
@@ -804,57 +839,73 @@ RunService.RenderStepped:Connect(function(dt)
 		camera.CameraType = Enum.CameraType.Custom
 	end
 
-	if aimbotEnabled and rootPart then
-		local nearestTarget, shortestDist = nil, math.huge
+	-- ========== INTELLIGENT AIMBOT ROUTER ==========
+	if aimbotEnabled and rootPart and camera then
+		local weaponType = detectWeaponType()
 		
-		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= player and p.Character then
-				local isTeammate = false
-				if player.Team and p.Team then
-					if p.Team == player.Team or p.TeamColor == player.TeamColor then
+		if weaponType == "GUN" then
+			if getgenv().BulletFollowMode then
+				runBulletFollowAimbot(dt)
+			else
+				runGunAimbot(dt)
+			end
+		elseif weaponType == "MELEE" then
+			runMeleeAimbot(dt)
+		elseif weaponType == "PROJECTILE" then
+			runBulletFollowAimbot(dt)
+		else
+			-- Fallback to standard universal camera aimbot if weapon type is unknown or none
+			local nearestTarget, shortestDist = nil, math.huge
+			
+			for _, p in ipairs(Players:GetPlayers()) do
+				if p ~= player and p.Character then
+					local isTeammate = false
+					if player.Team and p.Team then
+						if p.Team == player.Team or p.TeamColor == player.TeamColor then
+							isTeammate = true
+						end
+					end
+					if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
 						isTeammate = true
 					end
-				end
-				if p:GetAttribute("Team") and player:GetAttribute("Team") and p:GetAttribute("Team") == player:GetAttribute("Team") then
-					isTeammate = true
-				end
-				
-				if not isTeammate then
-					local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-					local hum = p.Character:FindFirstChildOfClass("Humanoid")
-					if hrp and hum and hum.Health > 0 then
-						if not p.Character:FindFirstChildOfClass("ForceField") then
-							local dist = (hrp.Position - rootPart.Position).Magnitude
-							if dist < shortestDist then
-								shortestDist = dist
-								nearestTarget = hrp
+					
+					if not isTeammate then
+						local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+						local hum = p.Character:FindFirstChildOfClass("Humanoid")
+						if hrp and hum and hum.Health > 0 then
+							if not p.Character:FindFirstChildOfClass("ForceField") then
+								local dist = (hrp.Position - rootPart.Position).Magnitude
+								if dist < shortestDist then
+									shortestDist = dist
+									nearestTarget = hrp
+								end
 							end
 						end
 					end
 				end
 			end
-		end
-		
-		for _, hrp in ipairs(cachedMonsters) do
-			if hrp and hrp.Parent then
-				local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
-				if hum and hum.Health > 0 then
-					local dist = (hrp.Position - rootPart.Position).Magnitude
-					if dist < shortestDist then
-						shortestDist = dist
-						nearestTarget = hrp
+			
+			for _, hrp in ipairs(cachedMonsters) do
+				if hrp and hrp.Parent then
+					local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
+					if hum and hum.Health > 0 then
+						local dist = (hrp.Position - rootPart.Position).Magnitude
+						if dist < shortestDist then
+							shortestDist = dist
+							nearestTarget = hrp
+						end
 					end
 				end
 			end
-		end
-		
-		if nearestTarget then
-			local goalCFrame = CFrame.new(camera.CFrame.Position, nearestTarget.Position)
-			camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(dt * 20, 0.1, 1))
+			
+			if nearestTarget then
+				local goalCFrame = CFrame.new(camera.CFrame.Position, nearestTarget.Position)
+				camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(dt * 20, 0.1, 1))
+			end
 		end
 	end
 end)
 
-print("✓ GR33D Scripts V4.70 FIXED - All syntax errors resolved!")
+print("✓ GR33D Scripts V4.70 FIXED - Weapon-aware intelligent aimbot integrated successfully!")
 print("✓ Enhanced Anti-Cheat Bypass Active")
 print("✓ Ready for execution")
