@@ -213,7 +213,7 @@ local function isValidGrabPrompt(prompt)
 	local objectText = prompt.ObjectText:lower()
 	
 	-- FIX: Completed blocked keywords list
-	local blockedKeywords = {"buy", "purchase", "view", "shop", "robux", "configure", "finish", "mining", "backpack", "group", "gift", "verify", "claim", "full", "reward", "spin", "upgrade", "warmth", "cold"}
+	local blockedKeywords = {"buy", "purchase", "view", "shop", "robux", "configure", "finish", "mining", "backpack", "group", "gift", "verify", "claim", "full", "reward", "spin", "upgrade", "warmth", "heal"}
 	for _, keyword in ipairs(blockedKeywords) do
 		if actionText:find(keyword) or objectText:find(keyword) then
 			return false
@@ -682,14 +682,13 @@ local function setupCharacter(char)
 		end
 	end)
 
-	-- FIX: Added semicolon between statements
 	task.defer(function()
 		if rootPart then
 			pristineRootSize = Vector3.new(2, 2, 1)
 			originalRootSize = pristineRootSize
 		end
 		if megaHealthEnabled then
-			humanoid.MaxHealth = 900000000;
+			humanoid.MaxHealth = 900000000
 			humanoid.Health = 900000000
 		end
 	end)
