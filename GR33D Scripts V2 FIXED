@@ -1,5 +1,5 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V4.70 (ALL FEATURES FIXED & FULLY WIRED)
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V4.76 (FULLY FIXED & OPTIMIZED)
 -- ==========================================
 
 -- ========== STRONG ANTI-CHEAT BYPASS LAYER ==========
@@ -52,7 +52,6 @@ local Workspace = game:GetService("Workspace")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
-local TweenService = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -69,13 +68,11 @@ local runSpeedValue = 50
 local jumpPowerValue = 50
 local defaultJumpPower = 50
 local defaultWalkSpeed = 16
-local DOUBLE_TAP_WINDOW = 0.35
 local cachedPrompts = {}
-local cachedMonsters = {}
 
-local originalPromptValues = {}
 local originalToolValues = {}
 local originalHitboxSizes = {}
+local originalSlimSizes = {}
 
 getgenv().NoclipActive = false
 getgenv().GodModeActive = false
@@ -106,14 +103,11 @@ local antiAfkEnabled = false
 local antiMeleeEnabled = false
 local isMinimized = false
 
-local lastJumpTapTime = 0
-local lastJumpReqTime = 0
 local InitialSpawnCFrame = nil
 local savedMapCFrame = nil
 
 local character, rootPart, humanoid
 local attachment, linearVelocity
-local originalRootSize = nil
 local trackedEggTags = {}
 
 -- ========== ANTI-AFK HANDLER ==========
@@ -167,20 +161,6 @@ local function parseStatValue(input)
 	return num * multiplier
 end
 
-local function parseWeightValue(input)
-	if type(input) == "number" then return input end
-	if type(input) ~= "string" then return 0 end
-	local upperInput = input:upper()
-	local cleaned = upperInput:gsub("[^0-9%.]", "")
-	local num = tonumber(cleaned:match("[%d%.]+"))
-	if not num then return 0 end
-	if upperInput:find("TON") then return num * 1000
-	elseif upperInput:find("KG") then return num
-	elseif upperInput:find("G") then return num / 1000
-	end
-	return num
-end
-
 local function isValidGrabPrompt(prompt)
 	if not prompt or not prompt.Enabled then return false end
 	local parentObj = prompt.Parent
@@ -197,33 +177,19 @@ local function isValidGrabPrompt(prompt)
 	return true
 end
 
--- ========== WEAPON TYPE DETECTION & BULLET TRACKING ==========
-local function detectWeaponType()
-    local backpack = player:FindFirstChildOfClass("Backpack")
-    local equippedTool = character and character:FindFirstChildOfClass("Tool")
-    local currentTool = equippedTool or (backpack and backpack:FindFirstChildOfClass("Tool"))
-    if not currentTool then return "NONE" end
-    local toolName = currentTool.Name:lower()
-    if toolName:match("gun") or toolName:match("pistol") or toolName:match("rifle") or toolName:match("sniper") or toolName:match("shotgun") or toolName:match("blaster") then
-        return "GUN"
-    elseif toolName:match("sword") or toolName:match("bat") or toolName:match("axe") or toolName:match("hammer") or toolName:match("club") or toolName:match("knife") then
-        return "MELEE"
-    end
-    return "UNKNOWN"
-end
-
+-- ========== DIRECT AIMBOT TARGETING ENGINE ==========
 local function getClosestTarget()
 	if not rootPart then return nil end
 	local nearestTarget, shortestDist = nil, 300
 	for _, p in ipairs(Players:GetPlayers()) do
 		if p ~= player and p.Character then
-			local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+			local targetPart = p.Character:FindFirstChild("Head") or p.Character:FindFirstChild("HumanoidRootPart")
 			local hum = p.Character:FindFirstChildOfClass("Humanoid")
-			if hrp and hum and hum.Health > 0 then
-				local dist = (hrp.Position - rootPart.Position).Magnitude
+			if targetPart and hum and hum.Health > 0 then
+				local dist = (targetPart.Position - rootPart.Position).Magnitude
 				if dist < shortestDist then
 					shortestDist = dist
-					nearestTarget = hrp
+					nearestTarget = targetPart
 				end
 			end
 		end
@@ -231,38 +197,21 @@ local function getClosestTarget()
 	return nearestTarget
 end
 
--- Bullet Follow / Silent Aim Redirection Hook
-pcall(function()
-	local oldRaycast
-	oldRaycast = hookmetamethod(workspace, "__namecall", function(self, ...)
-		local method = getnamecallmethod()
-		local args = {...}
-		if aimbotEnabled and (method == "Raycast" or method == "raycast") and checkcaller() then
-			local target = getClosestTarget()
-			if target and args[1] and args[2] then
-				local origin = args[1]
-				local direction = (target.Position - origin).Unit * args[2].Magnitude
-				args[2] = direction
-				return oldRaycast(self, unpack(args))
-			end
-		end
-		return oldRaycast(self, ...)
-	end)
-end)
-
--- ========== CACHING & BACKGROUND LOOPS ==========
+-- ========== CACHING & BACKGROUND LOOPS (WITH ACTIVE AUTO-GRAB FIRE) ==========
 task.spawn(function()
 	while true do
 		if getgenv().AutoGrabActive then
-			local cache = {}
 			for _, obj in ipairs(Workspace:GetDescendants()) do
 				if obj:IsA("ProximityPrompt") and isValidGrabPrompt(obj) then
-					table.insert(cache, obj)
+					obj.MaxActivationDistance = 50
+					obj.HoldDuration = 0
+					pcall(function()
+						fireproximityprompt(obj)
+					end)
 				end
 			end
-			cachedPrompts = cache
 		end
-		task.wait(1)
+		task.wait(0.5)
 	end
 end)
 
@@ -277,6 +226,43 @@ task.spawn(function()
 			end
 		end
 		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		if eggEspEnabled then
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if obj:IsA("Model") and (obj.Name:lower():find("egg") or obj.Name:lower():find("brainrot")) and not trackedEggTags[obj] then
+					local targetPart = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
+					if targetPart then
+						local billboard = Instance.new("BillboardGui")
+						billboard.Name = "EggESP"
+						billboard.Adornee = targetPart
+						billboard.Size = UDim2.new(0, 100, 0, 30)
+						billboard.StudsOffset = Vector3.new(0, 2, 0)
+						billboard.AlwaysOnTop = true
+						
+						local label = Instance.new("TextLabel", billboard)
+						label.Size = UDim2.new(1, 0, 1, 0)
+						label.BackgroundTransparency = 1
+						label.Text = obj.Name
+						label.TextColor3 = Color3.fromRGB(255, 215, 0)
+						label.Font = Enum.Font.GothamBold
+						label.TextSize = 12
+						
+						billboard.Parent = obj
+						trackedEggTags[obj] = billboard
+					end
+				end
+			end
+		else
+			if next(trackedEggTags) then
+				for _, tag in pairs(trackedEggTags) do if tag then tag:Destroy() end end
+				trackedEggTags = {}
+			end
+		end
+		task.wait(2)
 	end
 end)
 
@@ -328,38 +314,77 @@ RunService.Stepped:Connect(function()
 	end
 end)
 
+UserInputService.JumpRequest:Connect(function()
+	if jumpEnabled and rootPart and humanoid and humanoid.FloorMaterial ~= Enum.Material.Air then
+		local currentVel = rootPart.AssemblyLinearVelocity
+		rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
+	end
+end)
+
 RunService.Heartbeat:Connect(function(deltaTime)
-	if runSpeedEnabled and rootPart and humanoid and not isFlying then
-		local moveDir = humanoid.MoveDirection
-		if moveDir.Magnitude > 0 then
-			local displacement = moveDir * (runSpeedValue * deltaTime)
-			rootPart.CFrame = rootPart.CFrame + displacement
-			rootPart.AssemblyLinearVelocity = Vector3.new(0, rootPart.AssemblyLinearVelocity.Y, 0)
+	if humanoid then
+		if runSpeedEnabled then
+			humanoid.WalkSpeed = runSpeedValue
+		elseif humanoid.WalkSpeed == runSpeedValue and not runSpeedEnabled then
+			humanoid.WalkSpeed = defaultWalkSpeed
 		end
 	end
 
-	-- Hitbox Extender Loop
+	-- HITBOX EXTENDER
 	if hitboxEnabled then
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= player and p.Character then
 				local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-				if hrp then
-					if not originalHitboxSizes[hrp] then originalHitboxSizes[hrp] = hrp.Size end
+				local hum = p.Character:FindFirstChildOfClass("Humanoid")
+				if hrp and hum and hum.Health > 0 then
+					if not originalHitboxSizes[hrp] then 
+						originalHitboxSizes[hrp] = {Size = hrp.Size, Transparency = hrp.Transparency} 
+					end
 					hrp.Size = Vector3.new(7, 7, 7)
-					hrp.Transparency = 0.6
+					hrp.Transparency = 0.5
 					hrp.CanCollide = false
 				end
 			end
 		end
 	else
-		for hrp, originalSize in pairs(originalHitboxSizes) do
+		for hrp, data in pairs(originalHitboxSizes) do
 			if hrp and hrp.Parent then
-				hrp.Size = originalSize
-				hrp.Transparency = 1
+				hrp.Size = data.Size
+				hrp.Transparency = data.Transparency
 				hrp.CanCollide = true
 			end
 		end
 		table.clear(originalHitboxSizes)
+	end
+
+	-- SLIM HITBOX
+	if slimHitboxEnabled then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= player and p.Character then
+				local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					if not originalSlimSizes[hrp] then
+						originalSlimSizes[hrp] = {Size = hrp.Size}
+					end
+					hrp.Size = Vector3.new(1.5, 1.5, 1.5)
+				end
+			end
+		end
+	else
+		for hrp, data in pairs(originalSlimSizes) do
+			if hrp and hrp.Parent then
+				hrp.Size = data.Size
+			end
+		end
+		table.clear(originalSlimSizes)
+	end
+
+	-- ANTI-KNOCKBACK / ANTI-MELEE
+	if antiMeleeEnabled and rootPart then
+		local vel = rootPart.AssemblyLinearVelocity
+		if math.abs(vel.X) > 40 or math.abs(vel.Z) > 40 then
+			rootPart.AssemblyLinearVelocity = Vector3.new(0, vel.Y, 0)
+		end
 	end
 end)
 
@@ -369,6 +394,11 @@ local function setupCharacter(char)
 	humanoid = char:WaitForChild("Humanoid")
 	rootPart.Anchored = false
 	
+	if humanoid then
+		defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
+		defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
+	end
+
 	if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
 	if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
 	
@@ -407,8 +437,38 @@ RunService.RenderStepped:Connect(function(dt)
 	if not camera or not camera.Parent then camera = workspace.CurrentCamera return end
 
 	if godModeEnabled and humanoid then
-		humanoid.Health = humanoid.MaxHealth
+		if humanoid.Health < humanoid.MaxHealth then
+			humanoid.Health = humanoid.MaxHealth
+		end
 		humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+	end
+
+	-- FULLY IMPLEMENTED NO FALL DAMAGE
+	if noFallDamageEnabled and humanoid and rootPart then
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.GettingUp, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+			if rootPart.AssemblyLinearVelocity.Y < -75 then
+				rootPart.AssemblyLinearVelocity = Vector3.new(rootPart.AssemblyLinearVelocity.X, -10, rootPart.AssemblyLinearVelocity.Z)
+			end
+		end
+	end
+
+	-- THIRD-PERSON CAM
+	if thirdPersonCamEnabled then
+		player.CameraMode = Enum.CameraMode.Classic
+		player.CameraMaxZoomDistance = 100
+	end
+
+	if jumpEnabled and humanoid then
+		pcall(function()
+			humanoid.UseJumpPower = true
+			humanoid.JumpPower = jumpPowerValue
+			humanoid.JumpHeight = jumpPowerValue / 3
+		end)
 	end
 
 	if rapidHealingEnabled and humanoid and humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
@@ -430,11 +490,12 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
+	-- DIRECT CAM TARGETING AIMBOT
 	if aimbotEnabled and rootPart and camera then
 		local target = getClosestTarget()
 		if target then
-			local goalCFrame = CFrame.new(camera.CFrame.Position, target.Position + Vector3.new(0, 1.5, 0))
-			camera.CFrame = camera.CFrame:Lerp(goalCFrame, 0.15)
+			local goalCFrame = CFrame.new(camera.CFrame.Position, target.Position)
+			camera.CFrame = camera.CFrame:Lerp(goalCFrame, 0.3)
 		end
 	end
 end)
@@ -468,7 +529,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V4.70"
+titleLabel.Text = "GR33D Scripts V4.76"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -634,7 +695,7 @@ local combat, rightY = createCollapsibleGroup(rightGroupFrame, "Combat & Tools",
 createToggle(combat, "Hitbox Ext", 0, function(state) hitboxEnabled = state end)
 createToggle(combat, "Slim Hitbox", 28, function(state) slimHitboxEnabled = state getgenv().SlimHitboxActive = state end)
 createToggle(combat, "Anti-Knockback", 56, function(state) antiMeleeEnabled = state end)
-createToggle(combat, "Aimbot / Bullet Follow", 84, function(state) aimbotEnabled = state end)
+createToggle(combat, "Direct Aimbot", 84, function(state) aimbotEnabled = state end)
 createToggle(combat, "Third-Person Cam", 112, function(state) thirdPersonCamEnabled = state end)
 createToggle(combat, "Rapid Fire", 140, function(state) rapidFireEnabled = state end)
 
@@ -649,9 +710,12 @@ createButton(combat, "TP to Saved", 224, Color3.fromRGB(39, 174, 96), function()
 end)
 createButton(combat, "Server Hop (Low)", 252, Color3.fromRGB(211, 84, 0), function()
 	pcall(function()
-		local servers = HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..PlaceId.."/servers/public?sortOrder=Asc&limit=100")).data
+		local req = (syn and syn.request) or request or http_request
+		local url = "https://games.roblox.com/v1/games/"..PlaceId.."/servers/public?sortOrder=Asc&limit=100"
+		local body = req and req({Url = url}) and req({Url = url}).Body or game:HttpGet(url)
+		local servers = HttpService:JSONDecode(body).data
 		for _, s in ipairs(servers) do
-			if s.playing < s.maxPlayers then
+			if s.playing < s.maxPlayers and s.id ~= game.JobId then
 				TeleportService:TeleportToPlaceInstance(PlaceId, s.id, player)
 				break
 			end
@@ -710,4 +774,4 @@ minimizeButton.MouseButton1Click:Connect(function()
 	end
 end)
 
-print("✓ GR33D Scripts V4.70 FIXED - All features and UI successfully integrated!")
+print("✓ GR33D Scripts V4.76 - Fully integrated with functional Auto-Grab triggers, velocity fall-damage negation, and direct camera aimbot!")
