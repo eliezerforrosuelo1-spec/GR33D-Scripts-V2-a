@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.02 (PROFESSIONAL EDITION)
--- AUTO BULLET FOLLOW EDITION - ALL FLAWS FIXED
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.03 (PROFESSIONAL EDITION)
+-- AUTO BULLET FOLLOW EDITION - DELTA EXECUTOR COMPATIBLE
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -13,19 +13,16 @@ local getnamecallmethod  = getnamecallmethod  or function() return "" end
 local fireproximityprompt= fireproximityprompt or function() end
 local firetouchinterest  = firetouchinterest  or function() end
 local typeof             = typeof             or type
-local hookfunction       = hookfunction       or function(a, b) return a end
-local hookmetamethod     = hookmetamethod     or function() end
-local getconnections     = getconnections     or function() return {} end
 
 if type(getgenv()) ~= "table" then
     getgenv = function() return _G end
 end
 
--- ========== ADVANCED ANTI-CHEAT BYPASS LAYER ==========
+-- ========== ANTI-CHEAT BYPASS LAYER ==========
 pcall(function()
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then
-        warn("⚠️ Metatable protection active — bypass layer reduced effectiveness")
+        warn("⚠️ Metatable protection active")
         return
     end
 
@@ -103,16 +100,15 @@ pcall(function()
     end)
 
     setreadonly(mt, true)
-    print("✓ Professional anti-cheat layer initialized")
+    print("✓ Anti-cheat layer initialized")
 end)
 
--- ========== SERVICE INITIALIZATION ==========
+-- ========== SERVICES ==========
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Players          = game:GetService("Players")
 local Workspace        = game:GetService("Workspace")
 local TeleportService  = game:GetService("TeleportService")
-local HttpService      = game:GetService("HttpService")
 local VirtualUser      = game:GetService("VirtualUser")
 local TweenService     = game:GetService("TweenService")
 local CoreGui          = game:GetService("CoreGui")
@@ -127,14 +123,14 @@ end
 local camera  = Workspace.CurrentCamera
 local PlaceId = game.PlaceId
 
--- ========== CONFIGURATION & STATE VARIABLES ==========
-local FLY_SPEED         = 50
-local runSpeedValue     = 50
-local jumpPowerValue    = 50
-local defaultJumpPower  = 50
-local defaultWalkSpeed  = 16
-local DOUBLE_TAP_WINDOW = 0.35
-local BULLET_FOLLOW_RANGE = 500   -- Max range to acquire targets
+-- ========== CONFIG ==========
+local FLY_SPEED           = 50
+local runSpeedValue       = 50
+local jumpPowerValue      = 50
+local defaultJumpPower    = 50
+local defaultWalkSpeed    = 16
+local DOUBLE_TAP_WINDOW   = 0.35
+local BULLET_FOLLOW_RANGE = 500
 
 local cachedPrompts  = {}
 local cachedMonsters = {}
@@ -144,7 +140,6 @@ local originalToolValues              = {}
 local originalCharacterTransparencies = {}
 local grabCooldowns                   = {}
 
--- Initialize state flags in getgenv
 local G = getgenv()
 G.NoclipActive       = false
 G.GodModeActive      = false
@@ -157,7 +152,6 @@ G.TargetValue        = 0
 G.TargetLuck         = 0
 G.TargetSize         = 0
 
--- Local feature toggles (set by UI)
 local flyToggleEnabled      = false
 local isFlying              = false
 local godModeEnabled        = false
@@ -169,35 +163,27 @@ local jumpEnabled           = false
 local hitboxEnabled         = false
 local slimHitboxEnabled     = false
 local aimbotEnabled         = false
-local bulletFollowEnabled   = false   -- REPLACES thirdPersonCamEnabled
+local bulletFollowEnabled   = false
 local rapidFireEnabled      = false
 local eggEspEnabled         = false
 local promptExtenderEnabled = false
 local antiAfkEnabled        = false
 local antiMeleeEnabled      = false
-local isMinimized           = false
-local autoGrabLoopRunning   = false
 
 local lastJumpTapTime    = 0
 local lastJumpReqTime    = 0
 local InitialSpawnCFrame = nil
-local savedMapCFrame     = nil
 
 local character, rootPart, humanoid
 local attachment, linearVelocity
 local originalHitboxSizes = {}
 local originalRootSize    = nil
-local pristineRootSize    = Vector3.new(2, 2, 1)
 local trackedEggTags      = {}
 
--- Connection tracking
 local godModeConnection       = nil
-local noclipConnections       = {}
 local noclipAddedConnections  = {}
 local originalCollisionStates = {}
 local toolConnections         = {}
-local bulletFollowConnections = {}
-local hookedRemotes           = {}
 
 -- Forward declarations
 local setFlying
@@ -209,9 +195,7 @@ local disableNoclip
 local monitorTool
 local getBulletFollowTarget
 
--- ========== AUTO BULLET FOLLOW — TARGET ACQUISITION ==========
--- Returns the closest valid target (HRP or BasePart) for bullet redirection.
--- Priority: enemy players > monsters/zombies/NPCs (cached)
+-- ========== BULLET FOLLOW TARGET ACQUISITION ==========
 getBulletFollowTarget = function(originPosition)
     if not originPosition then
         originPosition = camera.CFrame.Position
@@ -219,10 +203,8 @@ getBulletFollowTarget = function(originPosition)
 
     local bestTarget, bestDist = nil, BULLET_FOLLOW_RANGE
 
-    -- 1) Enemy players
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and p.Character then
-            -- Skip teammates
             local isTeammate = false
             if player.Team and p.Team and (p.Team == player.Team or p.TeamColor == player.TeamColor) then
                 isTeammate = true
@@ -247,7 +229,6 @@ getBulletFollowTarget = function(originPosition)
         end
     end
 
-    -- 2) Monsters / zombies / NPCs (from cache)
     for _, hrp in ipairs(cachedMonsters) do
         if hrp and hrp.Parent then
             local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
@@ -264,7 +245,7 @@ getBulletFollowTarget = function(originPosition)
     return bestTarget, bestDist
 end
 
--- ========== EXPOSE UI HOOKS ==========
+-- ========== UI HOOKS ==========
 G.GR33D = G.GR33D or {}
 G.GR33D.Toggle = function(name, value)
     if name == "Noclip" then
@@ -323,7 +304,7 @@ G.GR33D.Toggle = function(name, value)
     end
 end
 
--- ========== ANTI-AFK HANDLER ==========
+-- ========== ANTI-AFK ==========
 player.Idled:Connect(function()
     if antiAfkEnabled then
         pcall(function()
@@ -345,7 +326,7 @@ pcall(function()
     end
 end)
 
--- ========== UTILITY FUNCTIONS ==========
+-- ========== UTILITY ==========
 local function parseStatValue(input)
     if type(input) == "number" then return input end
     if type(input) ~= "string" then return 0 end
@@ -446,7 +427,7 @@ local function isValidGrabPrompt(prompt)
     return true
 end
 
--- ========== CACHING LOOPS ==========
+-- ========== CACHING ==========
 task.spawn(function()
     while true do
         if G.AutoGrabActive then
@@ -878,7 +859,7 @@ end
 
 G.GR33D.TeleportAndGrab = SafeTeleportAndGrabHighestValue
 
--- ========== FLIGHT SYSTEM ==========
+-- ========== FLIGHT ==========
 function setFlying(state)
     if not rootPart or not humanoid or not linearVelocity then return end
     isFlying = state
@@ -961,7 +942,7 @@ function disableNoclip(char)
     end
 end
 
--- ========== GOD MODE (INVISIBILITY) ==========
+-- ========== GOD MODE ==========
 function makeInvisible(char)
     if not char then return end
 
@@ -1017,7 +998,7 @@ end
 function setupGodMode(char)
     if godModeEnabled then
         makeInvisible(char)
-        print("✓ God Mode (Invisibility) Activated")
+        print("✓ God Mode Activated")
     end
 end
 
@@ -1082,58 +1063,37 @@ end
 -- ==========================================
 -- ========== AUTO BULLET FOLLOW ============
 -- ==========================================
--- How it works:
--- 1) We hook the game's metatable __namecall to intercept FireServer / InvokeServer.
--- 2) When the player fires a weapon (any remote that carries a position/direction,
---    or when a projectile part is created), we acquire the nearest enemy and
---    re-aim the shot at them.
--- 3) We also hook projectile creation (Instance.new on Workspace) to steer
---    physical bullets toward the nearest enemy mid-flight.
---
--- This works for both hitscan and projectile weapons in most Roblox games.
--- ==========================================
-
--- Track active projectiles we've spawned/steered
 local trackedProjectiles = {}
 
--- Acquire target and return the direction from origin to target
-local function getBulletFollowDirection(originPos)
-    local targetPart = getBulletFollowTarget(originPos)
-    if not targetPart then return nil end
-    return (targetPart.Position - originPos).Unit, targetPart
-end
-
--- Try to redirect common "fire" remote arguments.
--- Many Roblox shooters pass: FireServer(direction, origin, ...) or FireServer(origin, direction)
--- We detect vector-like args and replace the direction/position with our target's.
+-- FIXED: no `...` inside this function — uses `args` parameter properly
 local function tryRedirectFireArgs(args, originPos)
-    if not bulletFollowEnabled then return args end
-
-    local targetPart = getBulletFollowTarget(originPos or (rootPart and rootPart.Position) or camera.CFrame.Position)
-    if not targetPart then return args end
+    if not bulletFollowEnabled then return nil end
+    if not args or #args == 0 then return nil end
 
     local origin = originPos or (rootPart and rootPart.Position) or camera.CFrame.Position
+    local targetPart = getBulletFollowTarget(origin)
+    if not targetPart then return nil end
+
     local newDir = (targetPart.Position - origin)
 
-    -- Copy args into a mutable table (namecall passes varargs)
-    local newArgs = { ... }
+    -- Copy args into a mutable table
+    local newArgs = {}
+    for i = 1, #args do
+        newArgs[i] = args[i]
+    end
 
-    -- Heuristic: find first Vector3 argument that looks like a direction (unit-ish length)
-    -- and second that looks like origin, or vice versa. Replace direction.
+    -- Replace first unit-like Vector3 (direction)
     for i, arg in ipairs(newArgs) do
         if typeof(arg) == "Vector3" then
             local mag = arg.Magnitude
-            -- direction vectors are typically ~1 in magnitude
             if mag > 0.5 and mag < 2.5 then
                 newArgs[i] = newDir.Unit
                 return newArgs, targetPart
             end
-            -- origin vectors are far from target; if we find two vectors, the second is usually dir
         end
     end
 
-    -- Fallback: if we found at least one Vector3 that's clearly an origin (magnitude > 5),
-    -- inject direction right after it.
+    -- Fallback: inject direction after origin vector
     for i, arg in ipairs(newArgs) do
         if typeof(arg) == "Vector3" and arg.Magnitude > 5 then
             table.insert(newArgs, i + 1, newDir.Unit)
@@ -1141,60 +1101,51 @@ local function tryRedirectFireArgs(args, originPos)
         end
     end
 
-    return args
+    return nil
 end
 
--- Hook projectile creation: when a new BasePart with Velocity/AssemblyLinearVelocity
--- appears in Workspace, steer it toward the nearest enemy.
 local function shouldTrackProjectile(part)
     if not part or not part:IsA("BasePart") then return false end
-    if part:IsDescendantOf(character) then return false end
-    -- Must be a small, fast part — typical bullet
-    local size = part.Size.Magnitude
-    if size > 4 then return false end
+    if character and part:IsDescendantOf(character) then return false end
+    if part.Size.Magnitude > 4 then return false end
     return true
 end
 
 local function steerProjectile(part)
-    if not trackedProjectiles[part] then
-        trackedProjectiles[part] = true
+    if trackedProjectiles[part] then return end
+    trackedProjectiles[part] = true
 
-        -- Steer over a short window
-        local elapsed = 0
-        local conn
-        conn = RunService.Heartbeat:Connect(function(dt)
-            elapsed = elapsed + dt
-            if not part or not part.Parent or elapsed > 2 then
-                if conn then conn:Disconnect() end
-                trackedProjectiles[part] = nil
-                return
-            end
+    local elapsed = 0
+    local conn
+    conn = RunService.Heartbeat:Connect(function(dt)
+        elapsed = elapsed + dt
+        if not part or not part.Parent or elapsed > 2 then
+            if conn then conn:Disconnect() end
+            trackedProjectiles[part] = nil
+            return
+        end
 
-            if not bulletFollowEnabled then return end
+        if not bulletFollowEnabled then return end
 
-            local targetPart = getBulletFollowTarget(part.Position)
-            if not targetPart then return end
+        local targetPart = getBulletFollowTarget(part.Position)
+        if not targetPart then return end
 
-            local toTarget = (targetPart.Position - part.Position)
-            if toTarget.Magnitude < 0.1 then return end
+        local toTarget = (targetPart.Position - part.Position)
+        if toTarget.Magnitude < 0.1 then return end
 
-            local speed = part.AssemblyLinearVelocity.Magnitude
-            if speed < 1 then return end
+        local speed = part.AssemblyLinearVelocity.Magnitude
+        if speed < 1 then return end
 
-            -- Redirect velocity toward target, preserving speed
-            pcall(function()
-                part.AssemblyLinearVelocity = toTarget.Unit * speed
-                part.CFrame = CFrame.new(part.Position, part.Position + toTarget.Unit)
-            end)
+        pcall(function()
+            part.AssemblyLinearVelocity = toTarget.Unit * speed
+            part.CFrame = CFrame.new(part.Position, part.Position + toTarget.Unit)
         end)
-    end
+    end)
 end
 
--- Watch Workspace for new projectiles
-local projectileWatcher = Workspace.DescendantAdded:Connect(function(desc)
+Workspace.DescendantAdded:Connect(function(desc)
     if not bulletFollowEnabled then return end
     if shouldTrackProjectile(desc) then
-        -- Small delay so the game can set initial velocity
         task.delay(0.02, function()
             if desc and desc.Parent and bulletFollowEnabled then
                 steerProjectile(desc)
@@ -1203,47 +1154,52 @@ local projectileWatcher = Workspace.DescendantAdded:Connect(function(desc)
     end
 end)
 
--- Hook namecall to intercept FireServer / InvokeServer for hitscan weapons
+-- FIXED: no `...` captured outside vararg function
 pcall(function()
     local mt = getrawmetatable and getrawmetatable(game)
-    if mt then
-        local oldNamecall = mt.__namecall
-        setreadonly(mt, false)
+    if not mt then return end
 
-        mt.__namecall = newcclosure(function(self, ...)
-            local method = getnamecallmethod()
+    local oldNamecall = mt.__namecall
+    setreadonly(mt, false)
 
-            -- Only intercept firing remotes
-            if bulletFollowEnabled
-               and (method == "FireServer" or method == "InvokeServer")
-               and typeof(self) == "Instance" then
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
 
-                local nameLower = self.Name:lower()
-                local isFireRemote = nameLower:find("fire")
-                                     or nameLower:find("shoot")
-                                     or nameLower:find("attack")
-                                     or nameLower:find("hit")
-                                     or nameLower:find("damage")
-                                     or nameLower:find("cast")
-                                     or nameLower:find("projectile")
-                                     or nameLower:find("bullet")
-                                     or nameLower:find("weapon")
+        if bulletFollowEnabled
+           and (method == "FireServer" or method == "InvokeServer")
+           and typeof(self) == "Instance" then
 
-                if isFireRemote then
-                    local args = { ... }
-                    local newArgs, targetPart = tryRedirectFireArgs(args)
-                    if newArgs and targetPart then
-                        return oldNamecall(self, table.unpack(newArgs))
-                    end
+            local nameLower = self.Name:lower()
+            local isFireRemote = nameLower:find("fire")
+                                 or nameLower:find("shoot")
+                                 or nameLower:find("attack")
+                                 or nameLower:find("hit")
+                                 or nameLower:find("damage")
+                                 or nameLower:find("cast")
+                                 or nameLower:find("projectile")
+                                 or nameLower:find("bullet")
+                                 or nameLower:find("weapon")
+
+            if isFireRemote then
+                -- FIXED: build args table from varargs properly
+                local args = {}
+                local count = select("#", ...)
+                for i = 1, count do
+                    args[i] = select(i, ...)
+                end
+
+                local newArgs, targetPart = tryRedirectFireArgs(args)
+                if newArgs and targetPart then
+                    return oldNamecall(self, table.unpack(newArgs))
                 end
             end
+        end
 
-            return oldNamecall(self, ...)
-        end)
+        return oldNamecall(self, ...)
+    end)
 
-        setreadonly(mt, true)
-        print("✓ Bullet Follow namecall hook installed")
-    end
+    setreadonly(mt, true)
+    print("✓ Bullet Follow hook installed")
 end)
 
 -- ========== CHARACTER SETUP ==========
@@ -1289,8 +1245,7 @@ local function setupCharacter(char)
 
     task.defer(function()
         if rootPart then
-            pristineRootSize = Vector3.new(2, 2, 1)
-            originalRootSize = pristineRootSize
+            originalRootSize = Vector3.new(2, 2, 1)
         end
         if megaHealthEnabled and humanoid then
             humanoid.MaxHealth = 900000000
@@ -1302,14 +1257,8 @@ local function setupCharacter(char)
         if rootPart then InitialSpawnCFrame = rootPart.CFrame end
     end)
 
-    if godModeEnabled then
-        setupGodMode(char)
-    end
-
-    if G.NoclipActive then
-        enableNoclip(char)
-    end
-
+    if godModeEnabled then setupGodMode(char) end
+    if G.NoclipActive then enableNoclip(char) end
     if flyToggleEnabled then setFlying(true) end
 end
 
@@ -1340,7 +1289,6 @@ player.CharacterAdded:Connect(function(newChar)
         godModeConnection = nil
     end
 
-    -- Clear projectile tracking
     trackedProjectiles = {}
 
     setupCharacter(newChar)
@@ -1367,7 +1315,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         camera = Workspace.CurrentCamera
     end
 
-    -- Run speed
     if runSpeedEnabled and humanoid and not isFlying then
         local moveDir = humanoid.MoveDirection
         if moveDir.Magnitude > 0 then
@@ -1381,14 +1328,12 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Rapid healing
     if rapidHealingEnabled and humanoid and humanoid.Health > 0
        and humanoid.Health < humanoid.MaxHealth then
         local healAmount = humanoid.MaxHealth * 3 * deltaTime
         humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + healAmount)
     end
 
-    -- No fall damage
     if noFallDamageEnabled and rootPart and humanoid then
         local state = humanoid:GetState()
         if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.FallingDown then
@@ -1401,7 +1346,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Anti-melee
     if antiMeleeEnabled and rootPart and humanoid then
         local currentVel = rootPart.AssemblyLinearVelocity
         if humanoid.MoveDirection.Magnitude == 0 and not isFlying and not runSpeedEnabled then
@@ -1411,7 +1355,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Hitbox expander
     if hitboxEnabled then
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= player and p.Character then
@@ -1439,7 +1382,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Slim hitbox
     if rootPart then
         if slimHitboxEnabled then
             local targetSize = Vector3.new(1.5, 2, 0.8)
@@ -1451,7 +1393,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Aimbot (camera) — still supported alongside bullet follow
     if aimbotEnabled and rootPart then
         local nearestTarget, shortestDist = nil, 100
 
@@ -1500,12 +1441,11 @@ RunService.Heartbeat:Connect(function(deltaTime)
             camera.CameraType = Enum.CameraType.Scriptable
         end
     elseif camera.CameraType == Enum.CameraType.Scriptable then
-        -- Restore camera when aimbot is off
         camera.CameraType = Enum.CameraType.Custom
     end
 end)
 
--- ========== FLIGHT RENDER LOOP ==========
+-- ========== FLIGHT RENDER ==========
 RunService.RenderStepped:Connect(function(dt)
     if not camera or not camera.Parent then
         camera = Workspace.CurrentCamera
@@ -1552,13 +1492,11 @@ task.spawn(function()
     end
 end)
 
--- ========== EXPOSE BULLET FOLLOW HELPERS ==========
+-- ========== EXPOSE HELPERS ==========
 G.GR33D.GetBulletFollowTarget = getBulletFollowTarget
 G.GR33D.BulletFollowRange    = BULLET_FOLLOW_RANGE
 
-print("✓ GR33D Scripts V5.02 (PROFESSIONAL EDITION) - All fixes applied!")
-print("✓ Advanced anti-cheat layer initialized")
-print("✓ Full invisibility god mode system ready")
-print("✓ Auto Bullet Follow installed (hitscan + projectile)")
-print("✓ Toggle features via: getgenv().GR33D.Toggle('FeatureName', true/false)")
-print("✓ Ready for execution")
+print("✓ GR33D Scripts V5.03 (DELTA COMPATIBLE) - All fixes applied!")
+print("✓ Bullet Follow installed (hitscan + projectile)")
+print("✓ Toggle via: getgenv().GR33D.Toggle('FeatureName', true/false)")
+print("✓ Ready")
