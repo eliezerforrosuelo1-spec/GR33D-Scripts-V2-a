@@ -1,7 +1,7 @@
 -- ==========================================
--- GR33D SCRIPTS: V7.03 — STEALTH + TRUE GHOST
+-- GR33D SCRIPTS: V8.00 — HONEYPOT + KICK-SAFE
 -- SERVER-SIDE STEAL + TP + HIDDEN GODMODE
--- KICK-SAFE TELEPORT EDITION
+-- ANTI-DETECTION HONEYPOT LAYER
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -71,8 +71,8 @@ local CONFIG = {
     -- TP settings
     TP_TWEEN_DURATION     = 0.12,
     TP_NOCLIP_LINGER      = 0.15,
-    TP_REASSERT_FRAMES    = 5,      -- NEW: anti rubber-band frames
-    TP_SETTLE_FRAMES      = 2,      -- NEW: state settle frames
+    TP_REASSERT_FRAMES    = 5,
+    TP_SETTLE_FRAMES      = 2,
     -- Stealth
     STEALTH_MODE          = false,
     GHOST_STRENGTH        = 1,
@@ -143,7 +143,7 @@ local flyDebounceUntil      = 0
 local lastJumpTapTime       = 0
 local lastJumpReqTime       = 0
 local InitialSpawnCFrame    = nil
-local spawnLocked           = false      -- NEW: lock spawn capture once
+local spawnLocked           = false
 local savedMapCFrame        = nil
 local savedSlots            = {}
 
@@ -170,7 +170,159 @@ local knockbackInProgress   = false
 
 local antiTrapBlocked       = 0
 local antiRagdollBlocked    = 0
-local tpKickAvoided         = 0      -- NEW: count of TP kick-avoidance
+local tpKickAvoided         = 0
+
+-- ============================================================
+-- ========== HONEYPOT ANTI-DETECTION LAYER ==================
+-- ============================================================
+-- Emits believable "normal player" activity so the server's
+-- behavior analyzer sees genuine gameplay while cheat
+-- functions run through a jittered, low-profile channel.
+-- ============================================================
+
+local HONEYPOT = {
+    ENABLED            = true,
+    DECOY_WALK         = true,
+    DECOY_REMOTES      = true,
+    DECOY_JUMPS        = true,
+    DECOY_CHAT         = false,
+    JITTER_MIN         = 0.08,
+    JITTER_MAX         = 0.42,
+    PAD_INTERVAL_MIN   = 4.0,
+    PAD_INTERVAL_MAX   = 11.0,
+    DECOY_WALK_RADIUS  = 6,
+}
+
+-- Real player input tracker (so we don't fight actual input)
+local realInput = {
+    lastMoveTime = 0,
+    lastJumpTime = 0,
+}
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.W or input.KeyCode == Enum.KeyCode.A
+       or input.KeyCode == Enum.KeyCode.S or input.KeyCode == Enum.KeyCode.D then
+        realInput.lastMoveTime = tick()
+    elseif input.KeyCode == Enum.KeyCode.Space then
+        realInput.lastJumpTime = tick()
+    end
+end)
+
+-- Queue of pending risky actions that get jittered
+local honeypotQueue = {}
+local honeypotRunning = false
+
+local function honeypotEnqueue(label, fn)
+    if not HONEYPOT.ENABLED then
+        return fn()
+    end
+    table.insert(honeypotQueue, {
+        label = label,
+        fn    = fn,
+        time  = tick(),
+    })
+    return true
+end
+
+task.spawn(function()
+    if honeypotRunning then return end
+    honeypotRunning = true
+    while true do
+        task.wait(0.05)
+        if #honeypotQueue > 0 then
+            local recentlyMoved = (tick() - realInput.lastMoveTime) < 0.15
+            if not recentlyMoved then
+                local job = table.remove(honeypotQueue, 1)
+                if job then
+                    local jitter = HONEYPOT.JITTER_MIN
+                                 + math.random() * (HONEYPOT.JITTER_MAX - HONEYPOT.JITTER_MIN)
+                    task.wait(jitter)
+                    pcall(job.fn)
+                end
+            end
+        end
+    end
+end)
+
+-- ------------------------------------------------------------
+-- Decoy 1: fake movement (walk back and forth subtly)
+-- ------------------------------------------------------------
+task.spawn(function()
+    while true do
+        task.wait(3 + math.random() * 6)
+        if not HONEYPOT.ENABLED or not HONEYPOT.DECOY_WALK then continue end
+        if not humanoid or not rootPart or humanoid.Health <= 0 then continue end
+        if isFlying or runSpeedEnabled then continue end
+        if humanoid.MoveDirection.Magnitude > 0.1 then continue end
+        if (tick() - realInput.lastMoveTime) < 2 then continue end
+
+        local angle = math.random() * math.pi * 2
+        local dist  = 1 + math.random() * HONEYPOT.DECOY_WALK_RADIUS
+        local dir   = Vector3.new(math.cos(angle), 0, math.sin(angle))
+        local startPos = rootPart.Position
+
+        task.spawn(function()
+            local elapsed = 0
+            while elapsed < 0.9 and humanoid and humanoid.Health > 0 do
+                if humanoid.MoveDirection.Magnitude > 0.1 then return end
+                humanoid:Move(dir, false)
+                task.wait(0.1)
+                elapsed = elapsed + 0.1
+                if rootPart and (rootPart.Position - startPos).Magnitude > dist then break end
+            end
+            if humanoid then humanoid:Move(Vector3.zero, false) end
+        end)
+    end
+end)
+
+-- ------------------------------------------------------------
+-- Decoy 2: harmless remote chatter (empty heartbeats)
+-- ------------------------------------------------------------
+local honeyRemotes = {}
+
+task.spawn(function()
+    for _, obj in ipairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") then
+            local n = obj.Name:lower()
+            local isRisky = n:find("cheat") or n:find("ban") or n:find("report")
+                         or n:find("kick")  or n:find("valid") or n:find("check")
+                         or n:find("anti")  or n:find("admin")
+            local isSafe  = n:find("heartbeat") or n:find("ping") or n:find("alive")
+                         or n:find("update")    or n:find("ready") or n:find("sync")
+            if isSafe and not isRisky then
+                honeyRemotes[#honeyRemotes + 1] = obj
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(HONEYPOT.PAD_INTERVAL_MIN
+                + math.random() * (HONEYPOT.PAD_INTERVAL_MAX - HONEYPOT.PAD_INTERVAL_MIN))
+        if not HONEYPOT.ENABLED or not HONEYPOT.DECOY_REMOTES then continue end
+        if #honeyRemotes == 0 then continue end
+        local r = honeyRemotes[math.random(1, #honeyRemotes)]
+        if r and r.Parent then
+            pcall(function() r:FireServer() end)
+        end
+    end
+end)
+
+-- ------------------------------------------------------------
+-- Decoy 3: occasional idle jump
+-- ------------------------------------------------------------
+task.spawn(function()
+    while true do
+        task.wait(8 + math.random() * 20)
+        if not HONEYPOT.ENABLED or not HONEYPOT.DECOY_JUMPS then continue end
+        if not humanoid or not rootPart or humanoid.Health <= 0 then continue end
+        if isFlying then continue end
+        if humanoid.FloorMaterial == Enum.Material.Air then continue end
+        if (tick() - realInput.lastJumpTime) < 5 then continue end
+        pcall(function() humanoid.Jump = true end)
+    end
+end)
 
 -- ============================================================
 -- ========== ANTI TRAP + ANTI RAGDOLL HOOK =================
@@ -327,34 +479,21 @@ end
 -- ============================================================
 -- ========== TP ENGINE (KICK-SAFE) ==========================
 -- ============================================================
--- Two-tier teleport:
---   TIER 1 (stealthTeleport) — uses HumanoidStateType.Physics +
---           Heartbeat-synced writes + velocity zeroing. Best for
---           avoiding "network connection lost" kicks.
---   TIER 2 (safeTeleport)    — legacy tween + anchor + re-assert.
---           Used as fallback if tier 1 fails.
--- ============================================================
-
 local function stealthTeleport(targetCFrame)
     if not character or not rootPart or not humanoid or not targetCFrame then
         return false
     end
 
     local ok = pcall(function()
-        -- 1. Freeze physics so the server sees us as stationary
         humanoid:ChangeState(Enum.HumanoidStateType.Physics)
 
-        -- 2. Kill all momentum
         rootPart.AssemblyLinearVelocity  = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
 
-        -- 3. Let server register "stationary" state
         for _ = 1, CONFIG.TP_SETTLE_FRAMES do
             RunService.Heartbeat:Wait()
         end
 
-        -- 4. Write the new CFrame, then hold it for several frames
-        --    so the server acknowledges the position update.
         for _ = 1, CONFIG.TP_REASSERT_FRAMES do
             if rootPart and rootPart.Parent then
                 rootPart.CFrame = targetCFrame
@@ -364,7 +503,6 @@ local function stealthTeleport(targetCFrame)
             RunService.Heartbeat:Wait()
         end
 
-        -- 5. Release physics control back to the humanoid
         humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
     end)
 
@@ -374,10 +512,8 @@ end
 local function safeTeleport(targetCFrame)
     if not character or not rootPart or not humanoid or not targetCFrame then return false end
 
-    -- TIER 1: try kick-safe method first
     local tier1 = stealthTeleport(targetCFrame)
     if tier1 then
-        -- Verify we actually landed near the target
         task.wait(0.05)
         if rootPart and rootPart.Parent then
             local dist = (rootPart.Position - targetCFrame.Position).Magnitude
@@ -388,7 +524,6 @@ local function safeTeleport(targetCFrame)
         end
     end
 
-    -- TIER 2: legacy tween fallback
     pcall(function()
         rootPart.AssemblyLinearVelocity  = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
@@ -428,7 +563,6 @@ local function safeTeleport(targetCFrame)
         while not done and (tick() - startTime) < (dur + 1) do RunService.Heartbeat:Wait() end
         if conn then conn:Disconnect() end
 
-        -- Re-assert position for a few frames to fight server rubber-banding
         for _ = 1, CONFIG.TP_REASSERT_FRAMES do
             RunService.Heartbeat:Wait()
             if rootPart and rootPart.Parent then
@@ -462,8 +596,6 @@ local function safeTeleport(targetCFrame)
     return true
 end
 
--- Fallback: if we couldn't capture the spawn, find the actual
--- SpawnLocation part in the map (the literal spawn pad).
 local function findSpawnLocationCFrame()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") then
@@ -809,6 +941,8 @@ G.GR33D.Toggle = function(name, value)
         CONFIG.AUTO_STEAL_ENABLED = value
     elseif name == "Stealth" then
         CONFIG.STEALTH_MODE = value
+    elseif name == "Honeypot" then
+        HONEYPOT.ENABLED = value
     end
 end
 
@@ -916,7 +1050,7 @@ local function isValidGrabPrompt(prompt)
 end
 
 -- ============================================================
--- ========== AUTO STEAL LOOP (human-like) ===================
+-- ========== AUTO STEAL LOOP (human-like + honeypot) ========
 -- ============================================================
 task.spawn(function()
     while true do
@@ -936,7 +1070,11 @@ task.spawn(function()
                                         * (CONFIG.AUTO_STEAL_DELAY_MAX - CONFIG.AUTO_STEAL_DELAY_MIN)
                             task.spawn(function()
                                 task.wait(delay)
-                                if G.AutoStealActive then G.StealHighestValue() end
+                                if G.AutoStealActive then
+                                    honeypotEnqueue("auto_steal", function()
+                                        G.StealHighestValue()
+                                    end)
+                                end
                             end)
                         end
                     end
@@ -1339,23 +1477,16 @@ end
 -- ============================================================
 -- ========== SPAWN CAPTURE (exact join position, once) ======
 -- ============================================================
--- Captures the HumanoidRootPart CFrame at the FIRST possible
--- frame after the character loads, then permanently locks it.
--- This is the same position the server placed you at on join.
--- Never overwritten afterwards, even on respawn.
--- ============================================================
 local function lockSpawnFrom(char)
     if spawnLocked then return end
     if not char then return end
 
-    -- Grab HRP immediately (no wait, no delay)
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then
         hrp = char:WaitForChild("HumanoidRootPart", 3)
     end
     if not hrp then return end
 
-    -- First read = server-assigned spawn CFrame
     InitialSpawnCFrame = hrp.CFrame
     spawnLocked = true
     log("✓ Spawn locked at: " .. tostring(InitialSpawnCFrame.Position))
@@ -1532,8 +1663,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
             end
         end
         if humanoid.FloorMaterial ~= Enum.Material.Air then
-            jumpImpulseApplied = false
-            jumpImpulseTime = 0
+            jumpImpulseApplied = false            jumpImpulseTime = 0
         end
     end
 
@@ -1716,7 +1846,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V7.03"
+titleLabel.Text = "GR33D Scripts V8.00"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -1862,7 +1992,7 @@ local function createButton(parent, text, y, buttonColor, callback)
     button.MouseButton1Click:Connect(function() if callback then callback() end end)
 end
 
-local movement = createCollapsibleGroup(leftGroupFrame, "Movement & Utility", 0, 350)
+local movement = createCollapsibleGroup(leftGroupFrame, "Movement & Utility", 0, 378)
 createToggle(movement, "Flight Mode",    0,   function(s) G.GR33D.Toggle("Fly", s) end)
 createToggle(movement, "God Mode (Ghost)", 28, function(s) G.GR33D.Toggle("GodMode", s) end)
 createToggle(movement, "Mega Health HP", 56,  function(s) G.GR33D.Toggle("MegaHealth", s) end)
@@ -1881,8 +2011,9 @@ createInput(movement,  "Jump Power",      280, 100, function(v)
     if n and n > 0 and n <= 500 then CONFIG.jumpPowerValue = n end
 end)
 createToggle(movement, "Stealth Mode (no logs)", 308, function(s) G.GR33D.Toggle("Stealth", s) end)
+createToggle(movement, "🪤 Honeypot Stealth", 336, function(s) G.GR33D.Toggle("Honeypot", s) end)
 
-local grab = createCollapsibleGroup(leftGroupFrame, "Auto-Grab & Steal", 358, 150)
+local grab = createCollapsibleGroup(leftGroupFrame, "Auto-Grab & Steal", 386, 150)
 createToggle(grab, "Auto Grab Nearby",    0,  function(s) G.GR33D.Toggle("AutoGrab", s) end)
 createInput(grab,  "Target Val",          28, 0, function(v) G.TargetValue = parseStatValue(v) end)
 createInput(grab,  "Target Luck",         56, 0, function(v) G.TargetLuck  = parseStatValue(v) end)
@@ -1918,24 +2049,30 @@ createButton(tpGroup, "💾 Save Location",   0,  Color3.fromRGB(142, 68, 173), 
 end)
 
 createButton(tpGroup, "🏠 TP to Spawn",     28, Color3.fromRGB(41, 128, 185), function()
-    G.TeleportToSpawn()
+    G.Honeypot.Enqueue("tp_spawn", function() G.TeleportToSpawn() end)
 end)
 
 createButton(tpGroup, "🎯 TP to Saved",     56, Color3.fromRGB(39, 174, 96), function()
-    G.TeleportToSaved()
+    G.Honeypot.Enqueue("tp_saved", function() G.TeleportToSaved() end)
 end)
 
 createButton(tpGroup, "🔥 Grab Highest Now", 84, Color3.fromRGB(220, 50, 50), function()
-    G.StealHighestValue()
+    G.Honeypot.Enqueue("steal_highest", function() G.StealHighestValue() end)
 end)
 
 createButton(tpGroup, "📌 Save Slot 1",  112, Color3.fromRGB(80, 80, 130), function() G.SaveSlot(1) end)
-createButton(tpGroup, "📍 TP Slot 1",    140, Color3.fromRGB(60, 60, 100), function() G.TeleportToSlot(1) end)
+createButton(tpGroup, "📍 TP Slot 1",    140, Color3.fromRGB(60, 60, 100), function()
+    G.Honeypot.Enqueue("tp_slot1", function() G.TeleportToSlot(1) end)
+end)
 
-local utilities = createCollapsibleGroup(rightGroupFrame, "Utilities", 428, 108)
+local utilities = createCollapsibleGroup(rightGroupFrame, "Utilities", 428, 136)
 createToggle(utilities, "Egg Name ESP",   0,  function(s) G.GR33D.Toggle("EggESP", s) end)
 createToggle(utilities, "Prompt Extender", 28, function(s) G.GR33D.Toggle("PromptExtender", s) end)
 createToggle(utilities, "Anti-AFK",        56, function(s) G.GR33D.Toggle("AntiAFK", s) end)
+createToggle(utilities, "🪤 Honeypot Layer", 84, function(s)
+    G.Honeypot.Enable(s)
+    log(s and "✓ Honeypot enabled" or "✗ Honeypot disabled")
+end)
 
 -- ========== DRAG SYSTEM ==========
 local dragging = false
@@ -2017,6 +2154,14 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
+-- ========== PUBLIC HONEYPOT API ==========
+G.Honeypot = {
+    Enable   = function(v) HONEYPOT.ENABLED = v end,
+    Enqueue  = honeypotEnqueue,
+    Config   = HONEYPOT,
+    QueueLen = function() return #honeypotQueue end,
+}
+
 -- ========== EXPOSED API ==========
 getgenv().ResetUI = function()
     local vp = workspace.CurrentCamera.ViewportSize
@@ -2034,14 +2179,18 @@ getgenv().GetStats = function()
         antiRagdollBlocked = antiRagdollBlocked,
         grabRemotesFound   = #grabRemotes,
         tpKickAvoided      = tpKickAvoided,
+        honeypotEnabled    = HONEYPOT.ENABLED,
+        honeypotQueue      = G.Honeypot.QueueLen(),
+        honeypotRemotes    = #honeyRemotes,
     }
 end
 
 -- ========== SAFE BOOT PRINT ==========
 log("")
 log("╔══════════════════════════════════════════════╗")
-log("║  GR33D Scripts V7.03 — KICK-SAFE EDITION     ║")
+log("║  GR33D Scripts V8.00 — HONEYPOT EDITION      ║")
 log("║  Server-Side Steal + TP + Hidden GodMode     ║")
+log("║  + Anti-Detection Honeypot Layer             ║")
 log("╚══════════════════════════════════════════════╝")
 log("")
 log("✓ Anti Trap installed")
@@ -2051,11 +2200,14 @@ log("✓ Server-side grab engine active")
 log("✓ Auto Steal with human-like delay")
 log("✓ TP kick-safe (Physics + Heartbeat sync)")
 log("✓ Spawn locked at exact join position")
+log("✓ Honeypot anti-detection layer active")
 log("✓ Stealth Mode suppresses console output")
 log("")
 log("Commands:")
-log("  getgenv().ResetUI()      - re-center UI")
-log("  getgenv().GetStats()     - view block stats")
-log("  getgenv().GetConfig()    - view config")
-log("  getgenv().SaveSlot(1-5)  - save slot")
+log("  getgenv().ResetUI()           - re-center UI")
+log("  getgenv().GetStats()          - view block stats")
+log("  getgenv().GetConfig()         - view config")
+log("  getgenv().SaveSlot(1-5)       - save slot")
 log("  getgenv().TeleportToSlot(1-5) - tp to slot")
+log("  getgenv().Honeypot.Enable(b)  - toggle honeypot")
+log("  getgenv().Honeypot.Config     - tune honeypot"),
