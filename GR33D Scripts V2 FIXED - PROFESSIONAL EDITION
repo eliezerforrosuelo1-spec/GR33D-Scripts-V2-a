@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.22
--- MOBILE-FIT UI + HARDENED DRAG + ALL FEATURES
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.23
+-- FIXED STEAL & RETURN + DEEP PAYLOAD DUMPER
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -61,7 +61,8 @@ local TP_JITTER           = 1.5
 local TP_FF_LINGER        = 0.5
 local TP_HOLD_DURATION    = 1.0
 local TP_NOCLIP_LINGER    = 0.3
-local STEAL_RETURN_DELAY  = 1.0
+local STEAL_RETURN_DELAY  = 0.5
+local GRAB_HOLD_DURATION  = 1.5
 
 local cachedPrompts  = {}
 local cachedMonsters = {}
@@ -239,10 +240,68 @@ local function reinstallSyncHooks()
     end
 end
 
+-- ============================================================
+-- ========== DEEP PAYLOAD DUMPER ============================
+-- ============================================================
+-- Logs the FULL contents of every State_Sync payload (recursive)
+-- so you can see what's inside the [data] table. Use this to
+-- find the exact reset key.
+
+local dumpEnabled = true
+local function dumpTable(t, prefix, depth)
+    depth = depth or 0
+    if depth > 5 then return end
+    prefix = prefix or ""
+    for k, v in pairs(t) do
+        local kStr = tostring(k)
+        if type(v) == "table" then
+            print(prefix .. "[" .. kStr .. "] = table")
+            dumpTable(v, prefix .. "  ", depth + 1)
+        elseif type(v) == "string" then
+            if #v > 120 then v = v:sub(1, 120) .. "..." end
+            print(prefix .. "[" .. kStr .. "] = \"" .. v .. "\"")
+        elseif type(v) == "number" or type(v) == "boolean" then
+            print(prefix .. "[" .. kStr .. "] = " .. tostring(v))
+        else
+            print(prefix .. "[" .. kStr .. "] = " .. typeof(v))
+        end
+    end
+end
+
+-- Install dumper on all State_Sync remotes
+task.spawn(function()
+    for _, obj in ipairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and SYNC_REMOTES[obj.Name] then
+            obj.OnClientEvent:Connect(function(...)
+                if not dumpEnabled then return end
+                local args = {...}
+                for i, arg in ipairs(args) do
+                    if type(arg) == "table" then
+                        print("====== " .. obj.Name .. " payload #" .. i .. " ======")
+                        dumpTable(arg)
+                        print("================================")
+                    end
+                end
+            end)
+        end
+    end
+end)
+
 game.DescendantAdded:Connect(function(desc)
     if desc:IsA("RemoteEvent") and SYNC_REMOTES[desc.Name] then
         task.wait(0.5)
         pcall(reinstallSyncHooks)
+        desc.OnClientEvent:Connect(function(...)
+            if not dumpEnabled then return end
+            local args = {...}
+            for i, arg in ipairs(args) do
+                if type(arg) == "table" then
+                    print("====== " .. desc.Name .. " payload #" .. i .. " ======")
+                    dumpTable(arg)
+                    print("================================")
+                end
+            end
+        end)
     end
 end)
 
@@ -1204,7 +1263,7 @@ G.TeleportToHighestValue = function()
     if not item or not part then warn("⚠️ No value item"); return end
     print(string.format("✓ Highest: %s ($%s)", item.Name, tostring(value)))
     if isTeleporting then warn("⚠️ Already teleporting"); return end
-    local targetPos = part.CFrame + Vector3.new(0, 5, 0)
+    local targetPos = CFrame.new(part.Position + Vector3.new(0, 3, 0))
     if proZoneTeleport(targetPos) then
         task.wait(0.15)
         if prompt and fireproximityprompt then pcall(fireproximityprompt, prompt) end
@@ -1218,40 +1277,107 @@ G.TeleportToHighestValue = function()
     end
 end
 
+-- ============================================================
+-- ========== STEAL & RETURN (FIXED) =========================
+-- ============================================================
+-- Fixes:
+-- 1. Holds character anchored for 1.5s during grab window
+-- 2. Re-applies position every frame (server needs multiple syncs)
+-- 3. Fires prompt repeatedly (server-side distance check needs retries)
+-- 4. Searches both `part` and `item` for the correct prompt
+-- 5. Land 3 studs above item (not 5) so we're centered on it
+-- 6. Logs grab attempts to console
+
 G.StealAndReturn = function()
     if not rootPart then warn("⚠️ No character"); return end
     if isTeleporting then warn("⚠️ Already teleporting"); return end
+
+    -- Step 1: Save current position
     preStealCFrame = rootPart.CFrame
     print("📍 Saved pre-steal position")
+
+    -- Step 2: Find target
     print("🔍 Scanning for highest value...")
     local item, part, prompt, value = findHighestValue()
     if not item or not part then warn("⚠️ No value item"); return end
     print(string.format("✓ Target: %s ($%s)", item.Name, tostring(value)))
-    local targetPos = part.CFrame + Vector3.new(0, 5, 0)
+
+    -- Step 3: Find the exact prompt
+    local actualPrompt = part:FindFirstChildWhichIsA("ProximityPrompt", true)
+                      or item:FindFirstChildWhichIsA("ProximityPrompt", true)
+                      or prompt
+
+    -- Step 4: Compute landing position (3 studs above item)
+    local targetPos = CFrame.new(part.Position + Vector3.new(0, 3, 0))
+
+    -- Step 5: Teleport with zone bypass
     if not proZoneTeleport(targetPos) then
         warn("⚠️ Failed to teleport to target")
         return
     end
     print("✓ Arrived at target")
-    task.wait(0.2)
-    if prompt and fireproximityprompt then
-        pcall(fireproximityprompt, prompt)
-        print("✓ Fired grab prompt")
+
+    -- ================================================================
+    -- Step 6: GRAB WITH HOLD — keep anchored during grab
+    -- ================================================================
+    local anchoredParts = {}
+    for _, p in ipairs(character:GetDescendants()) do
+        if p:IsA("BasePart") then
+            anchoredParts[p] = p.Anchored
+            p.Anchored = true
+        end
     end
-    if firetouchinterest and rootPart and part then
-        pcall(firetouchinterest, rootPart, part, 0)
-        pcall(firetouchinterest, rootPart, part, 1)
+
+    local grabStart = os.clock()
+    local firesSent = 0
+
+    while os.clock() - grabStart < GRAB_HOLD_DURATION do
+        if rootPart and rootPart.Parent then
+            pcall(function()
+                rootPart.CFrame = targetPos
+                rootPart.AssemblyLinearVelocity = Vector3.zero
+                rootPart.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+
+        if actualPrompt and actualPrompt.Parent then
+            pcall(function()
+                fireproximityprompt(actualPrompt)
+                firesSent = firesSent + 1
+            end)
+        end
+
+        if firetouchinterest and rootPart and part then
+            pcall(function()
+                firetouchinterest(rootPart, part, 0)
+                task.wait()
+                firetouchinterest(rootPart, part, 1)
+            end)
+        end
+
+        RunService.Heartbeat:Wait()
     end
-    task.wait(STEAL_RETURN_DELAY)
-    if prompt and fireproximityprompt then
-        pcall(fireproximityprompt, prompt)
+
+    print("✓ Fired " .. firesSent .. " grab attempts")
+
+    -- Step 7: Restore anchors
+    for p, wasAnchored in pairs(anchoredParts) do
+        if p and p.Parent then
+            pcall(function() p.Anchored = wasAnchored end)
+        end
     end
-    task.wait(0.3)
+
+    task.wait(0.5)
+
+    -- Step 8: Return to saved position
     print("🔙 Returning to saved position...")
     if proZoneTeleport(preStealCFrame) then
         print("✓ Returned with the item!")
     else
-        warn("⚠️ Failed to return")
+        warn("⚠️ Failed to return — forcing position")
+        if rootPart then
+            pcall(function() rootPart.CFrame = preStealCFrame end)
+        end
     end
 end
 
@@ -1795,7 +1921,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.22"
+titleLabel.Text = "GR33D Scripts V5.23"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -2051,7 +2177,6 @@ topBar.InputBegan:Connect(function(input)
     if not (isMouse or isTouch) then return end
 
     dragging = true
-
     local touchPos = input.Position
     local framePos = mainFrame.AbsolutePosition
     dragOffset = Vector2.new(touchPos.X - framePos.X, touchPos.Y - framePos.Y)
@@ -2065,7 +2190,6 @@ end)
 
 UserInputService.InputChanged:Connect(function(input)
     if not dragging then return end
-
     local isMouseMove = input.UserInputType == Enum.UserInputType.MouseMovement
     local isTouchMove = input.UserInputType == Enum.UserInputType.Touch
     if not (isMouseMove or isTouchMove) then return end
@@ -2073,17 +2197,13 @@ UserInputService.InputChanged:Connect(function(input)
     if isTouchMove and dragTouch and input ~= dragTouch then
         local dx = math.abs(input.Position.X - dragTouch.Position.X)
         local dy = math.abs(input.Position.Y - dragTouch.Position.Y)
-        if dx > 50 or dy > 50 then
-            return
-        end
+        if dx > 50 or dy > 50 then return end
     end
-
     if not dragOffset then return end
 
     local newX = input.Position.X - dragOffset.X
     local newY = input.Position.Y - dragOffset.Y
 
-    -- Clamp to keep at least 40 pixels visible on screen
     local vp = workspace.CurrentCamera.ViewportSize
     newX = math.clamp(newX, -mainFrame.AbsoluteSize.X + 40, vp.X - 40)
     newY = math.clamp(newY, 0, vp.Y - 40)
@@ -2095,11 +2215,7 @@ UserInputService.InputEnded:Connect(function(input)
     local isMouseEnd = input.UserInputType == Enum.UserInputType.MouseButton1
     local isTouchEnd = input.UserInputType == Enum.UserInputType.Touch
     if not (isMouseEnd or isTouchEnd) then return end
-
-    if isTouchEnd and dragTouch and input ~= dragTouch then
-        return
-    end
-
+    if isTouchEnd and dragTouch and input ~= dragTouch then return end
     dragging = false
     dragTouch = nil
     dragOffset = nil
@@ -2148,8 +2264,6 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
--- Emergency reset: exposes a global function to re-center the UI
--- Run this from Delta console any time: getgenv().ResetUI()
 getgenv().ResetUI = function()
     local vp = workspace.CurrentCamera.ViewportSize
     local w = math.min(320, vp.X - 40)
@@ -2159,11 +2273,16 @@ getgenv().ResetUI = function()
     print("✓ UI re-centered")
 end
 
-print("✓ GR33D Scripts V5.22 loaded")
-print("✓ Mobile-fit UI (auto-sized to your screen)")
-print("✓ Mobile-hardened drag with clamping")
-print("✓ Type getgenv().ResetUI() to re-center if lost")
+getgenv().ToggleDump = function(state)
+    dumpEnabled = state
+    print("[GR33D] Payload dump " .. (state and "ENABLED" or "DISABLED"))
+end
+
+print("✓ GR33D Scripts V5.23 loaded")
+print("✓ Fixed Steal & Return (holds position + fires prompt 1.5s)")
+print("✓ Deep payload dumper ACTIVE — trigger a zone reset to see keys")
+print("✓ Type getgenv().ResetUI() to re-center if UI lost")
+print("✓ Type getgenv().ToggleDump(false) to stop payload spam")
+print("✓ Mobile-fit UI + hardened drag")
 print("✓ State Sync Interceptor active")
-print("✓ Steal & Return workflow")
-print("✓ Speed (velocity), Jump (impulse) techniques")
 print("✓ All features preserved")
