@@ -1,7 +1,7 @@
 -- ==========================================
--- GR33D SCRIPTS: V8.00 — HONEYPOT + KICK-SAFE
+-- GR33D SCRIPTS: V8.10 — MULTI-BYPASS FALLBACK
 -- SERVER-SIDE STEAL + TP + HIDDEN GODMODE
--- ANTI-DETECTION HONEYPOT LAYER
+-- HONEYPOT + 5-PATH TP + 4-CHANNEL STEAL
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -175,11 +175,6 @@ local tpKickAvoided         = 0
 -- ============================================================
 -- ========== HONEYPOT ANTI-DETECTION LAYER ==================
 -- ============================================================
--- Emits believable "normal player" activity so the server's
--- behavior analyzer sees genuine gameplay while cheat
--- functions run through a jittered, low-profile channel.
--- ============================================================
-
 local HONEYPOT = {
     ENABLED            = true,
     DECOY_WALK         = true,
@@ -193,7 +188,6 @@ local HONEYPOT = {
     DECOY_WALK_RADIUS  = 6,
 }
 
--- Real player input tracker (so we don't fight actual input)
 local realInput = {
     lastMoveTime = 0,
     lastJumpTime = 0,
@@ -208,7 +202,6 @@ UserInputService.InputBegan:Connect(function(input, processed)
     end
 end)
 
--- Queue of pending risky actions that get jittered
 local honeypotQueue = {}
 local honeypotRunning = false
 
@@ -244,9 +237,7 @@ task.spawn(function()
     end
 end)
 
--- ------------------------------------------------------------
--- Decoy 1: fake movement (walk back and forth subtly)
--- ------------------------------------------------------------
+-- Decoy 1: fake movement
 task.spawn(function()
     while true do
         task.wait(3 + math.random() * 6)
@@ -275,9 +266,7 @@ task.spawn(function()
     end
 end)
 
--- ------------------------------------------------------------
--- Decoy 2: harmless remote chatter (empty heartbeats)
--- ------------------------------------------------------------
+-- Decoy 2: harmless remote chatter
 local honeyRemotes = {}
 
 task.spawn(function()
@@ -309,9 +298,7 @@ task.spawn(function()
     end
 end)
 
--- ------------------------------------------------------------
 -- Decoy 3: occasional idle jump
--- ------------------------------------------------------------
 task.spawn(function()
     while true do
         task.wait(8 + math.random() * 20)
@@ -325,56 +312,116 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- ========== ANTI TRAP + ANTI RAGDOLL HOOK =================
+-- ========== MULTI-LAYER METAMETHOD HARDENING ==============
 -- ============================================================
+local hookLayers = { namecall = false, index = false, newindex = false }
+local hookFallbackSignals = { calls = 0, indexReads = 0, indexWrites = 0 }
+
+local function isTrapName(n)
+    n = n:lower()
+    return n:find("trap") or n:find("restrict") or n:find("outofbounds")
+        or n:find("wallcheck") or n:find("boundary") or n:find("zonecheck")
+        or n:find("positioncheck") or n:find("teleportcheck")
+end
+
+local function isRagdollName(n)
+    n = n:lower()
+    return n:find("ragdoll") or n:find("knockdown") or n:find("stun")
+        or n:find("fall") or n:find("stagger") or n:find("flinch")
+end
+
 pcall(function()
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
     setreadonly(mt, false)
-    local oldNamecall = mt.__namecall
 
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
+    -- LAYER 1: __namecall
+    if mt.__namecall then
+        local oldNamecall = mt.__namecall
+        mt.__namecall = newcclosure(function(self, ...)
+            hookFallbackSignals.calls = hookFallbackSignals.calls + 1
+            local method = getnamecallmethod()
 
-        if CONFIG.ANTI_TRAP_ENABLED and typeof(self) == "Instance" then
-            local nameLower = self.Name:lower()
-            local isTrapRemote =
-                nameLower:find("trap") or nameLower:find("restrict") or
-                nameLower:find("outofbounds") or nameLower:find("wallcheck") or
-                nameLower:find("boundary") or nameLower:find("zonecheck") or
-                nameLower:find("positioncheck")
-
-            if isTrapRemote and (method == "InvokeServer" or method == "FireServer") then
-                antiTrapBlocked = antiTrapBlocked + 1
-                local args = {...}
-                for i, arg in ipairs(args) do
-                    if typeof(arg) == "Vector3" then args[i] = Vector3.new(0, 0, 0) end
+            if CONFIG.ANTI_TRAP_ENABLED and typeof(self) == "Instance"
+               and isTrapName(self.Name) then
+                if method == "InvokeServer" or method == "FireServer" then
+                    antiTrapBlocked = antiTrapBlocked + 1
+                    local args = {...}
+                    for i, arg in ipairs(args) do
+                        if typeof(arg) == "Vector3" then args[i] = Vector3.new(0, 0, 0) end
+                    end
+                    return oldNamecall(self, table.unpack(args))
                 end
-                return oldNamecall(self, table.unpack(args))
             end
-        end
 
-        if CONFIG.ANTI_RAGDOLL_ENABLED and typeof(self) == "Instance" then
-            local nameLower = self.Name:lower()
-            local isRagdollRemote =
-                nameLower:find("ragdoll") or nameLower:find("knockdown") or
-                nameLower:find("stun") or nameLower:find("fall")
-
-            if isRagdollRemote and (method == "FireClient" or method == "FireAllClients") then
-                antiRagdollBlocked = antiRagdollBlocked + 1
-                return nil
+            if CONFIG.ANTI_RAGDOLL_ENABLED and typeof(self) == "Instance"
+               and isRagdollName(self.Name) then
+                if method == "FireClient" or method == "FireAllClients" then
+                    antiRagdollBlocked = antiRagdollBlocked + 1
+                    return nil
+                end
             end
-        end
 
-        return oldNamecall(self, ...)
-    end)
+            return oldNamecall(self, ...)
+        end)
+        hookLayers.namecall = true
+    end
+
+    -- LAYER 2: __index
+    if mt.__index then
+        local oldIndex = mt.__index
+        mt.__index = newcclosure(function(self, key)
+            hookFallbackSignals.indexReads = hookFallbackSignals.indexReads + 1
+            return oldIndex(self, key)
+        end)
+        hookLayers.index = true
+    end
+
+    -- LAYER 3: __newindex — blocks server Health resets while GodMode on
+    if mt.__newindex then
+        local oldNewIndex = mt.__newindex
+        mt.__newindex = newcclosure(function(self, key, value)
+            hookFallbackSignals.indexWrites = hookFallbackSignals.indexWrites + 1
+            if godModeEnabled and typeof(self) == "Instance"
+               and self:IsA("Humanoid") and key == "Health" then
+                local myHum = character and character:FindFirstChildOfClass("Humanoid")
+                if myHum == self and value < self.MaxHealth * 0.9 then
+                    return oldNewIndex(self, key, self.MaxHealth - 0.15)
+                end
+            end
+            return oldNewIndex(self, key, value)
+        end)
+        hookLayers.newindex = true
+    end
 
     setreadonly(mt, true)
-    log("[GR33D] ✓ Anti Trap + Anti Ragdoll installed")
+    log(string.format("[GR33D] ✓ Hooks: namecall=%s index=%s newindex=%s",
+        tostring(hookLayers.namecall),
+        tostring(hookLayers.index),
+        tostring(hookLayers.newindex)))
+end)
+
+-- LAYER 4: RemoteEvent watcher on PlayerScripts
+task.spawn(function()
+    local playerScripts = player:WaitForChild("PlayerScripts", 10)
+    if not playerScripts then return end
+    local watched = {}
+    local function watch(inst)
+        if not inst:IsA("RemoteEvent") and not inst:IsA("RemoteFunction") then return end
+        if watched[inst] then return end
+        watched[inst] = true
+        local n = inst.Name:lower()
+        if isTrapName(n) or isRagdollName(n) then
+            pcall(function() inst.Parent = nil end)
+            antiTrapBlocked = antiTrapBlocked + 1
+        end
+    end
+    for _, obj in ipairs(game:GetDescendants()) do watch(obj) end
+    game.DescendantAdded:Connect(watch)
 end)
 
 -- ============================================================
--- ========== SERVER-SIDE STEAL ENGINE ======================
+-- ========== SERVER-SIDE STEAL ENGINE (4-CHANNEL) ==========
 -- ============================================================
 local grabRemotes = {}
 task.spawn(function()
@@ -394,28 +441,54 @@ local function serverSideGrab(prompt)
     local itemModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
     if not itemModel then return false end
 
-    local success = pcall(function() fireproximityprompt(prompt) end)
+    local channels = 0
 
+    -- Channel 1: native prompt fire
+    if pcall(fireproximityprompt, prompt) then channels = channels + 1 end
+
+    -- Channel 2: fire all nearby remotes with multiple signatures
     for remote in pairs(grabRemotes) do
         if remote and remote.Parent then
-            pcall(function() remote:FireServer(itemModel) end)
-            pcall(function() remote:FireServer(prompt) end)
-            pcall(function() remote:FireServer(itemModel.Name) end)
+            for _, arg in ipairs({itemModel, prompt, itemModel.Name,
+                                  prompt.Name, player, rootPart}) do
+                pcall(function() remote:FireServer(arg) end)
+            end
+            channels = channels + 1
         end
     end
 
+    -- Channel 3: fire the prompt's own Triggered via fake touch
     if firetouchinterest and rootPart then
         local targetPart = itemModel.PrimaryPart
                           or itemModel:FindFirstChildWhichIsA("BasePart")
         if targetPart then
             pcall(function()
                 firetouchinterest(rootPart, targetPart, 0)
+                task.wait(0.02)
                 firetouchinterest(rootPart, targetPart, 1)
             end)
+            channels = channels + 1
         end
     end
 
-    return success
+    -- Channel 4: walk into range and let natural physics fire it
+    task.spawn(function()
+        if rootPart and itemModel.PrimaryPart then
+            local oldCF = rootPart.CFrame
+            local target = itemModel.PrimaryPart.Position
+            for _ = 1, 3 do
+                pcall(function()
+                    rootPart.CFrame = CFrame.new(target + Vector3.new(0, 3, 0))
+                end)
+                RunService.Heartbeat:Wait()
+            end
+            pcall(fireproximityprompt, prompt)
+            RunService.Heartbeat:Wait()
+            pcall(function() rootPart.CFrame = oldCF end)
+        end
+    end)
+
+    return channels > 0
 end
 
 local function findHighestValueItem()
@@ -477,57 +550,48 @@ G.StealHighestValue = function()
 end
 
 -- ============================================================
--- ========== TP ENGINE (KICK-SAFE) ==========================
+-- ========== TP ENGINE — 5-PATH FALLBACK CHAIN =============
 -- ============================================================
-local function stealthTeleport(targetCFrame)
-    if not character or not rootPart or not humanoid or not targetCFrame then
-        return false
-    end
+local tpPathUsed = { p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0 }
 
-    local ok = pcall(function()
+local function tpPath1_PhysicsState(target)
+    return pcall(function()
         humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-
         rootPart.AssemblyLinearVelocity  = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
-
-        for _ = 1, CONFIG.TP_SETTLE_FRAMES do
-            RunService.Heartbeat:Wait()
-        end
-
+        for _ = 1, CONFIG.TP_SETTLE_FRAMES do RunService.Heartbeat:Wait() end
         for _ = 1, CONFIG.TP_REASSERT_FRAMES do
             if rootPart and rootPart.Parent then
-                rootPart.CFrame = targetCFrame
+                rootPart.CFrame = target
                 rootPart.AssemblyLinearVelocity  = Vector3.zero
                 rootPart.AssemblyAngularVelocity = Vector3.zero
             end
             RunService.Heartbeat:Wait()
         end
-
         humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
     end)
-
-    return ok
 end
 
-local function safeTeleport(targetCFrame)
-    if not character or not rootPart or not humanoid or not targetCFrame then return false end
-
-    local tier1 = stealthTeleport(targetCFrame)
-    if tier1 then
+local function tpPath2_MoveTo(target)
+    return pcall(function()
+        character:MoveTo(target.Position)
         task.wait(0.05)
         if rootPart and rootPart.Parent then
-            local dist = (rootPart.Position - targetCFrame.Position).Magnitude
-            if dist < 15 then
-                tpKickAvoided = tpKickAvoided + 1
-                return true
-            end
+            rootPart.CFrame = target
         end
-    end
+    end)
+end
 
-    pcall(function()
-        rootPart.AssemblyLinearVelocity  = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
+local function tpPath3_RawCFrame(target)
+    return pcall(function()
+        rootPart.CFrame = target
+        for _ = 1, 3 do RunService.Heartbeat:Wait() end
+        rootPart.CFrame = target
+    end)
+end
 
+local function tpPath4_Tween(target)
+    return pcall(function()
         local originalCollide = {}
         for _, p in ipairs(character:GetDescendants()) do
             if p:IsA("BasePart") then
@@ -535,7 +599,6 @@ local function safeTeleport(targetCFrame)
                 p.CanCollide = false
             end
         end
-
         local anchoredParts = {}
         for _, p in ipairs(character:GetDescendants()) do
             if p:IsA("BasePart") then
@@ -543,58 +606,84 @@ local function safeTeleport(targetCFrame)
                 p.Anchored = true
             end
         end
-
-        local oldFF = character:FindFirstChildOfClass("ForceField")
-        local tempFF
-        if not oldFF then
-            tempFF = Instance.new("ForceField")
-            tempFF.Visible = false
-            tempFF.Parent = character
-        end
-
         local dur = CONFIG.TP_TWEEN_DURATION * (0.85 + math.random() * 0.3)
-        local info = TweenInfo.new(dur, Enum.EasingStyle.Linear)
-        local tween = TweenService:Create(rootPart, info, {CFrame = targetCFrame})
+        local tween = TweenService:Create(rootPart,
+            TweenInfo.new(dur, Enum.EasingStyle.Linear), {CFrame = target})
         tween:Play()
-
         local done = false
         local conn = tween.Completed:Connect(function() done = true end)
-        local startTime = tick()
-        while not done and (tick() - startTime) < (dur + 1) do RunService.Heartbeat:Wait() end
+        local t0 = tick()
+        while not done and (tick() - t0) < (dur + 1) do RunService.Heartbeat:Wait() end
         if conn then conn:Disconnect() end
-
         for _ = 1, CONFIG.TP_REASSERT_FRAMES do
             RunService.Heartbeat:Wait()
-            if rootPart and rootPart.Parent then
-                pcall(function() rootPart.CFrame = targetCFrame end)
-                pcall(function()
-                    rootPart.AssemblyLinearVelocity  = Vector3.zero
-                    rootPart.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
+            if rootPart and rootPart.Parent then rootPart.CFrame = target end
         end
-
         for p, a in pairs(anchoredParts) do
             if p and p.Parent then pcall(function() p.Anchored = a end) end
         end
-
-        task.wait(CONFIG.TP_NOCLIP_LINGER * (0.8 + math.random() * 0.4))
+        task.wait(CONFIG.TP_NOCLIP_LINGER)
         for p, c in pairs(originalCollide) do
             if p and p.Parent then pcall(function() p.CanCollide = c end) end
         end
+    end)
+end
 
-        rootPart.AssemblyLinearVelocity  = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-
-        if tempFF then
-            task.delay(0.3, function()
-                if tempFF and tempFF.Parent then tempFF:Destroy() end
-            end)
+local function tpPath5_VelocitySlam(target)
+    return pcall(function()
+        local delta = target.Position - rootPart.Position
+        local dist = delta.Magnitude
+        if dist > 0 then
+            local dir = delta.Unit
+            humanoid.Jump = true
+            task.wait(0.05)
+            rootPart.AssemblyLinearVelocity = dir * math.min(dist * 8, 500)
+            local t0 = tick()
+            while (tick() - t0) < 1.5 do
+                if (rootPart.Position - target.Position).Magnitude < 5 then break end
+                RunService.Heartbeat:Wait()
+            end
+            rootPart.CFrame = target
+            rootPart.AssemblyLinearVelocity = Vector3.zero
         end
     end)
-
-    return true
 end
+
+local function multiPathTeleport(targetCFrame)
+    if not character or not rootPart or not humanoid or not targetCFrame then
+        return false
+    end
+
+    local paths = {
+        { name = "p1", fn = tpPath1_PhysicsState },
+        { name = "p2", fn = tpPath2_MoveTo },
+        { name = "p3", fn = tpPath3_RawCFrame },
+        { name = "p4", fn = tpPath4_Tween },
+        { name = "p5", fn = tpPath5_VelocitySlam },
+    }
+
+    for _, path in ipairs(paths) do
+        local ok = path.fn(targetCFrame)
+        if ok then
+            task.wait(0.05)
+            if rootPart and rootPart.Parent then
+                local dist = (rootPart.Position - targetCFrame.Position).Magnitude
+                if dist < 15 then
+                    tpPathUsed[path.name] = tpPathUsed[path.name] + 1
+                    tpKickAvoided = tpKickAvoided + 1
+                    log(("✓ TP via %s (dist %.2f)"):format(path.name, dist))
+                    return true
+                end
+            end
+        end
+    end
+
+    warnlog("⚠️ All TP paths failed")
+    return false
+end
+
+local safeTeleport = multiPathTeleport
+local stealthTeleport = tpPath1_PhysicsState
 
 local function findSpawnLocationCFrame()
     for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -866,6 +955,23 @@ end
 
 function makeInvisible(char) applyGhost(char) end
 function makeVisible(char)   removeGhost(char) end
+
+-- ============================================================
+-- ========== GOD MODE — HEALTH CLAMP DEFENSE ================
+-- ============================================================
+task.spawn(function()
+    while true do
+        RunService.Heartbeat:Wait()
+        if godModeEnabled and humanoid and humanoid.Parent then
+            if humanoid.MaxHealth < 1e8 then
+                pcall(function() humanoid.MaxHealth = 900000000 end)
+            end
+            if humanoid.Health < humanoid.MaxHealth * 0.95 then
+                pcall(function() humanoid.Health = humanoid.MaxHealth - 0.15 end)
+            end
+        end
+    end
+end)
 
 -- ============================================================
 -- ========== UI HOOKS =======================================
@@ -1304,7 +1410,7 @@ function monitorTool(tool)
 end
 
 -- ============================================================
--- ========== BULLET FOLLOW ==================================
+-- ========== BULLET FOLLOW — MULTI-INJECTION ================
 -- ============================================================
 local hooks_bulletFollow = nil
 
@@ -1434,6 +1540,62 @@ local function removeBulletFollowHook()
     hooks_bulletFollow = nil
 end
 
+-- Layer A: BindableEvent.Fire hijack
+local originalBindableFire = nil
+pcall(function()
+    local bindableMT = getrawmetatable and getrawmetatable(game:GetService("BindableEvent"))
+    if not bindableMT or not bindableMT.Fire then return end
+    setreadonly(bindableMT, false)
+    originalBindableFire = bindableMT.Fire
+    bindableMT.Fire = newcclosure(function(self, ...)
+        if COMBAT.BulletFollowEnabled then
+            local args = {...}
+            local ok, newArgs = pcall(tryRedirectFireArgs, args)
+            if ok and newArgs then return originalBindableFire(self, table.unpack(newArgs)) end
+        end
+        return originalBindableFire(self, ...)
+    end)
+    setreadonly(bindableMT, true)
+end)
+
+-- Layer B: Actor:SendMessage hijack
+local originalActorSend = nil
+pcall(function()
+    local actorMT = getrawmetatable and getrawmetatable(game:GetService("Actor"))
+    if not actorMT or not actorMT.SendMessage then return end
+    setreadonly(actorMT, false)
+    originalActorSend = actorMT.SendMessage
+    actorMT.SendMessage = newcclosure(function(self, topic, ...)
+        if COMBAT.BulletFollowEnabled then
+            local args = {...}
+            local ok, newArgs = pcall(tryRedirectFireArgs, args)
+            if ok and newArgs then return originalActorSend(self, topic, table.unpack(newArgs)) end
+        end
+        return originalActorSend(self, topic, ...)
+    end)
+    setreadonly(actorMT, true)
+end)
+
+-- Layer C: Camera-only fallback
+task.spawn(function()
+    while true do
+        task.wait(0.03)
+        if COMBAT.BulletFollowEnabled and not hooks_bulletFollow then
+            local target = getBulletFollowTarget(camera.CFrame.Position)
+            if target then
+                local head = target.Parent and target.Parent:FindFirstChild("Head")
+                local aimPos = head and head.Position or target.Position
+                if CONFIG.AIMBOT_PREDICT and target.AssemblyLinearVelocity then
+                    aimPos = aimPos + target.AssemblyLinearVelocity * 0.12
+                end
+                pcall(function()
+                    camera.CFrame = CFrame.new(camera.CFrame.Position, aimPos)
+                end)
+            end
+        end
+    end
+end)
+
 -- ============================================================
 -- ========== STATE REAPPLICATION ============================
 -- ============================================================
@@ -1521,6 +1683,24 @@ local function setupCharacter(char)
         end
     end)
     task.defer(function() if rootPart then originalRootSize = Vector3.new(2, 2, 1) end end)
+
+    -- HealthChanged / Died defenses
+    pcall(function()
+        humanoid.HealthChanged:Connect(function(newHealth)
+            if godModeEnabled and humanoid and humanoid.Parent then
+                if newHealth < humanoid.MaxHealth * 0.95 then
+                    pcall(function() humanoid.Health = humanoid.MaxHealth - 0.15 end)
+                end
+            end
+        end)
+        humanoid.Died:Connect(function()
+            if godModeEnabled then
+                task.wait(0.1)
+                pcall(function() player:LoadCharacter() end)
+            end
+        end)
+    end)
+
     reapplyAllStates(char)
 end
 
@@ -1663,7 +1843,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
             end
         end
         if humanoid.FloorMaterial ~= Enum.Material.Air then
-            jumpImpulseApplied = false            jumpImpulseTime = 0
+            jumpImpulseApplied = false
+            jumpImpulseTime = 0
         end
     end
 
@@ -1846,7 +2027,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V8.00"
+titleLabel.Text = "GR33D Scripts V8.10"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -2185,29 +2366,46 @@ getgenv().GetStats = function()
     }
 end
 
+getgenv().GetDiagnostics = function()
+    return {
+        hookLayers       = hookLayers,
+        hookSignals      = hookFallbackSignals,
+        tpPathUsed       = tpPathUsed,
+        honeypotRemotes  = #honeyRemotes,
+        grabRemotes      = #grabRemotes,
+        godModeActive    = godModeEnabled,
+        combatMode       = COMBAT.AimbotEnabled and "aimbot"
+                        or COMBAT.BulletFollowEnabled and "bulletfollow"
+                        or "none",
+    }
+end
+
 -- ========== SAFE BOOT PRINT ==========
 log("")
 log("╔══════════════════════════════════════════════╗")
-log("║  GR33D Scripts V8.00 — HONEYPOT EDITION      ║")
+log("║  GR33D Scripts V8.10 — MULTI-BYPASS EDITION  ║")
 log("║  Server-Side Steal + TP + Hidden GodMode     ║")
-log("║  + Anti-Detection Honeypot Layer             ║")
+log("║  + Honeypot + 5-Path TP + 4-Channel Steal    ║")
 log("╚══════════════════════════════════════════════╝")
 log("")
-log("✓ Anti Trap installed")
+log("✓ Multi-layer metatable hooks (namecall/index/newindex)")
+log("✓ RemoteEvent watcher (4th layer)")
 log("✓ Anti Ragdoll installed")
-log("✓ True Ghost GodMode (multi-layer invisibility)")
-log("✓ Server-side grab engine active")
+log("✓ True Ghost GodMode + HealthChanged/Died defense")
+log("✓ 4-channel steal engine")
+log("✓ 5-path teleport fallback chain")
 log("✓ Auto Steal with human-like delay")
-log("✓ TP kick-safe (Physics + Heartbeat sync)")
 log("✓ Spawn locked at exact join position")
 log("✓ Honeypot anti-detection layer active")
+log("✓ Bullet Follow multi-injection (namecall/Bindable/Actor/Camera)")
 log("✓ Stealth Mode suppresses console output")
 log("")
 log("Commands:")
 log("  getgenv().ResetUI()           - re-center UI")
 log("  getgenv().GetStats()          - view block stats")
+log("  getgenv().GetDiagnostics()    - view fallback path usage")
 log("  getgenv().GetConfig()         - view config")
 log("  getgenv().SaveSlot(1-5)       - save slot")
 log("  getgenv().TeleportToSlot(1-5) - tp to slot")
 log("  getgenv().Honeypot.Enable(b)  - toggle honeypot")
-log("  getgenv().Honeypot.Config     - tune honeypot"),
+log("  getgenv().Honeypot.Config     - tune honeypot")
