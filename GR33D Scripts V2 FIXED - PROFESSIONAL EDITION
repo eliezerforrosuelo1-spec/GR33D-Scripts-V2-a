@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.18
--- ZONE BYPASS TP + STEAL & RETURN
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.19
+-- STATE SYNC INTERCEPTOR — ZONE RESET BYPASS
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -12,6 +12,7 @@ local checkcaller        = checkcaller        or function() return true end
 local getnamecallmethod  = getnamecallmethod  or function() return "" end
 local fireproximityprompt= fireproximityprompt or function() end
 local firetouchinterest  = firetouchinterest  or function() end
+local getconnections     = getconnections     or function() return {} end
 local typeof             = typeof             or type
 
 if type(getgenv()) ~= "table" then
@@ -54,14 +55,13 @@ local AIMBOT_FOV          = 60
 local AIMBOT_TARGET_PART  = "Head"
 local JUMP_BOOST_DURATION = 0.5
 
--- Pro Teleport config
 local TP_CHUNKS           = 6
 local TP_CHUNK_DELAY      = 0.03
 local TP_JITTER           = 1.5
 local TP_FF_LINGER        = 0.5
-local TP_HOLD_DURATION    = 1.0     -- position lock duration for zone bypass
-local TP_NOCLIP_LINGER    = 0.3     -- how long noclip stays after warp
-local STEAL_RETURN_DELAY  = 1.0     -- delay after grab before returning
+local TP_HOLD_DURATION    = 1.0
+local TP_NOCLIP_LINGER    = 0.3
+local STEAL_RETURN_DELAY  = 1.0
 
 local cachedPrompts  = {}
 local cachedMonsters = {}
@@ -110,7 +110,7 @@ local lastJumpTapTime       = 0
 local lastJumpReqTime       = 0
 local InitialSpawnCFrame    = nil
 local savedMapCFrame        = nil
-local preStealCFrame        = nil   -- for steal-and-return
+local preStealCFrame        = nil
 
 local character, rootPart, humanoid
 local flyVelocity           = nil
@@ -121,7 +121,6 @@ local trackedEggTags        = {}
 local godModeConnection       = nil
 local toolConnections         = {}
 
--- Pro Speed state
 local speedVelocity         = nil
 local speedAttach           = nil
 local lastSpeedCFrame       = nil
@@ -129,14 +128,144 @@ local lastReconTime         = 0
 local speedRamp             = 0
 local RAMP_RATE             = 1.5
 
--- Pro Jump state
 local jumpImpulseApplied    = false
 local jumpImpulseTime       = 0
 
--- Pro Teleport state
 local isTeleporting         = false
 
--- ========== LAZY HOOK MANAGERS ==========
+-- ============================================================
+-- ========== STATE SYNC INTERCEPTOR =========================
+-- ============================================================
+-- The game pushes State_SyncPrivate / State_SyncShared every tick.
+-- When we go out of bounds, the server puts reset flags in the
+-- payload. This module STRIPS those flags so the client never
+-- sees the reset command.
+
+local SYNC_REMOTES = {
+    ["State_SyncPrivate"] = true,
+    ["State_SyncShared"]  = true,
+}
+
+-- Keys commonly used for reset / warp / zone-violation payloads.
+-- Any key matching these gets removed before the game reads it.
+local BLOCKED_SYNC_KEYS = {
+    "reset", "Reset", "RESET",
+    "resetPosition", "ResetPosition",
+    "warpToSpawn", "WarpToSpawn", "warptospawn",
+    "restoreWalls", "RestoreWalls", "restorewalls",
+    "restore", "Restore",
+    "outOfBounds", "OutOfBounds", "outofbounds",
+    "oos", "oosync",
+    "syncReset", "SyncReset",
+    "teleport", "Teleport",
+    "kick", "Kick",
+    "ban", "Ban",
+    "flag", "Flag",
+    "violation", "Violation",
+    "restrict", "Restrict",
+    "deny", "Deny",
+    "invalid", "Invalid",
+    "antiCheat", "AntiCheat", "anticheat",
+    "acs", "acFlag", "acReset",
+}
+
+local function shouldStripKey(key)
+    if type(key) ~= "string" then return false end
+    for _, blocked in ipairs(BLOCKED_SYNC_KEYS) do
+        if key == blocked then return true end
+        -- Also strip anything containing "reset" / "violation" etc.
+        if key:lower():find("reset") then return true end
+        if key:lower():find("violation") then return true end
+        if key:lower():find("outofbounds") then return true end
+        if key:lower():find("warptospawn") then return true end
+    end
+    return false
+end
+
+local function sanitizeSyncPayload(value, depth)
+    depth = depth or 0
+    if depth > 12 then return value end
+    if type(value) ~= "table" then return value end
+
+    local cleaned = {}
+    for k, v in pairs(value) do
+        if shouldStripKey(k) then
+            -- Skip this entry entirely
+        else
+            cleaned[k] = sanitizeSyncPayload(v, depth + 1)
+        end
+    end
+    return cleaned
+end
+
+-- Also strip blocked STRING VALUES (some games pass "reset" as a value)
+local function sanitizeValue(v)
+    if type(v) == "string" then
+        local lower = v:lower()
+        if lower == "reset" or lower == "violation"
+           or lower == "outofbounds" or lower == "warptospawn"
+           or lower == "restorewalls" then
+            return nil
+        end
+        return v
+    elseif type(v) == "table" then
+        return sanitizeSyncPayload(v)
+    end
+    return v
+end
+
+-- Install interceptor via getconnections replacement
+local syncInstalled = {}
+local function reinstallSyncHooks()
+    for _, obj in ipairs(game:GetDescendants()) do
+        if obj:IsA("RemoteEvent") and SYNC_REMOTES[obj.Name] then
+            local signal = obj.OnClientEvent
+            local existingFns = {}
+            local existingConns = getconnections(signal)
+            for _, conn in ipairs(existingConns) do
+                if conn.Function then
+                    table.insert(existingFns, conn.Function)
+                end
+            end
+
+            -- Disconnect all current handlers
+            for _, conn in ipairs(existingConns) do
+                pcall(function() conn:Disconnect() end)
+            end
+
+            -- Reconnect with sanitizer wrapper
+            for _, fn in ipairs(existingFns) do
+                signal:Connect(function(...)
+                    local args = {...}
+                    for i, arg in ipairs(args) do
+                        args[i] = sanitizeValue(arg)
+                    end
+                    -- Remove nil-holes from args
+                    local cleanArgs = {}
+                    for i = 1, select("#", ...) do
+                        cleanArgs[i] = args[i]
+                    end
+                    pcall(fn, table.unpack(cleanArgs, 1, select("#", ...)))
+                end)
+            end
+
+            syncInstalled[obj] = true
+            print("[GR33D] ✓ Hooked " .. obj.Name .. " (" .. #existingFns .. " handlers wrapped)")
+        end
+    end
+end
+
+-- Also auto-hook newly added State_Sync remotes
+game.DescendantAdded:Connect(function(desc)
+    if desc:IsA("RemoteEvent") and SYNC_REMOTES[desc.Name] then
+        task.wait(0.5)
+        pcall(reinstallSyncHooks)
+    end
+end)
+
+-- ============================================================
+-- ========== LAZY HOOK MANAGERS =============================
+-- ============================================================
 local hooks = {
     anticheat    = nil,
     bulletFollow = nil,
@@ -320,7 +449,6 @@ function setFlying(state)
     if not rootPart or not humanoid then return end
     if not state then flyDebounceUntil = os.clock() + FLY_DEBOUNCE end
     isFlying = state
-
     if not flyVelocity and rootPart then
         local att = Instance.new("Attachment")
         att.Name = "Gr33dFlightAtt"
@@ -333,7 +461,6 @@ function setFlying(state)
         flyVelocity.MaxForce = 0
         flyVelocity.Parent = rootPart
     end
-
     if isFlying then
         flyVelocity.MaxForce = 9e4
         if humanoid.FloorMaterial == Enum.Material.Air then
@@ -417,20 +544,16 @@ local function teardownSpeedVelocity()
     lastSpeedCFrame = nil
 end
 
--- ============================================================
--- ========== PRO STEALTH TELEPORT (STANDARD) ================
--- ============================================================
+-- ========== PRO TELEPORT ==========
 local function proTeleport(targetCFrame)
     if isTeleporting then return false end
     if not character or not rootPart or not humanoid then return false end
     isTeleporting = true
-
     pcall(function()
         humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
     end)
-
     local oldFF = character:FindFirstChildOfClass("ForceField")
     local tempFF
     if not oldFF then
@@ -438,7 +561,6 @@ local function proTeleport(targetCFrame)
         tempFF.Visible = false
         tempFF.Parent = character
     end
-
     local anchoredParts = {}
     for _, p in ipairs(character:GetDescendants()) do
         if p:IsA("BasePart") then
@@ -446,10 +568,8 @@ local function proTeleport(targetCFrame)
             p.Anchored = true
         end
     end
-
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
-
     local startCFrame = rootPart.CFrame
     for i = 1, TP_CHUNKS do
         local alpha = i / TP_CHUNKS
@@ -467,46 +587,36 @@ local function proTeleport(targetCFrame)
         end
     end
     pcall(function() rootPart.CFrame = targetCFrame end)
-
     for part, wasAnchored in pairs(anchoredParts) do
         if part and part.Parent then
             pcall(function() part.Anchored = wasAnchored end)
         end
     end
-
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
-
     pcall(function()
         humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
     end)
-
     if tempFF then
         task.delay(TP_FF_LINGER, function()
             if tempFF and tempFF.Parent then tempFF:Destroy() end
         end)
     end
-
     isTeleporting = false
     return true
 end
 
--- ============================================================
--- ========== PRO ZONE-BYPASS TELEPORT =======================
--- ============================================================
 local function proZoneTeleport(targetCFrame)
     if isTeleporting then return false end
     if not character or not rootPart or not humanoid then return false end
     isTeleporting = true
-
     pcall(function()
         humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
     end)
-
     local oldFF = character:FindFirstChildOfClass("ForceField")
     local tempFF
     if not oldFF then
@@ -514,8 +624,6 @@ local function proZoneTeleport(targetCFrame)
         tempFF.Visible = false
         tempFF.Parent = character
     end
-
-    -- Noclip during warp (bypass walls / barriers)
     local originalCollide = {}
     for _, p in ipairs(character:GetDescendants()) do
         if p:IsA("BasePart") then
@@ -523,7 +631,6 @@ local function proZoneTeleport(targetCFrame)
             p.CanCollide = false
         end
     end
-
     local anchoredParts = {}
     for _, p in ipairs(character:GetDescendants()) do
         if p:IsA("BasePart") then
@@ -531,10 +638,8 @@ local function proZoneTeleport(targetCFrame)
             p.Anchored = true
         end
     end
-
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
-
     local startCFrame = rootPart.CFrame
     for i = 1, TP_CHUNKS do
         local alpha = i / TP_CHUNKS
@@ -552,14 +657,11 @@ local function proZoneTeleport(targetCFrame)
         end
     end
     pcall(function() rootPart.CFrame = targetCFrame end)
-
     for part, wasAnchored in pairs(anchoredParts) do
         if part and part.Parent then
             pcall(function() part.Anchored = wasAnchored end)
         end
     end
-
-    -- POSITION HOLD — critical for zone bypass
     local holdEnd = os.clock() + TP_HOLD_DURATION
     while os.clock() < holdEnd do
         if rootPart and rootPart.Parent then
@@ -572,32 +674,26 @@ local function proZoneTeleport(targetCFrame)
         else break end
         RunService.Heartbeat:Wait()
     end
-
-    -- Release noclip after linger
     task.wait(TP_NOCLIP_LINGER)
     for part, origCollide in pairs(originalCollide) do
         if part and part.Parent then
             pcall(function() part.CanCollide = origCollide end)
         end
     end
-
     pcall(function()
         rootPart.AssemblyLinearVelocity  = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
     end)
-
     pcall(function()
         humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
     end)
-
     if tempFF then
         task.delay(TP_FF_LINGER + 0.5, function()
             if tempFF and tempFF.Parent then tempFF:Destroy() end
         end)
     end
-
     isTeleporting = false
     return true
 end
@@ -669,6 +765,12 @@ G.GR33D.Toggle = function(name, value)
 end
 
 installAntiCheatHook()
+
+-- Initial sync hook install
+task.spawn(function()
+    task.wait(2)
+    pcall(reinstallSyncHooks)
+end)
 
 -- ========== ANTI-AFK ==========
 player.Idled:Connect(function()
@@ -1107,30 +1209,16 @@ end
 G.TeleportToSaved = function()
     if not savedMapCFrame then warn("⚠️ No saved location"); return end
     if isTeleporting then warn("⚠️ Already teleporting"); return end
-    -- Use ZONE variant in case the saved spot is inside a restricted area
-    if proZoneTeleport(savedMapCFrame) then print("✓ Teleported to saved (zone bypass)") end
+    if proZoneTeleport(savedMapCFrame) then print("✓ Teleported to saved") end
 end
 
 G.TeleportToSpawn = function()
     if not InitialSpawnCFrame then warn("⚠️ No spawn cached"); return end
     if isTeleporting then warn("⚠️ Already teleporting"); return end
-    if proZoneTeleport(InitialSpawnCFrame) then print("✓ Teleported to spawn (zone bypass)") end
+    if proZoneTeleport(InitialSpawnCFrame) then print("✓ Teleported to spawn") end
 end
 
--- ============================================================
--- ========== STEAL & RETURN — CORE FEATURE ==================
--- ============================================================
--- Workflow:
---   1. Save current position (your "safe spot")
---   2. Zone-bypass TP to the highest-value brainrot/egg
---   3. Wait 1s (anti-snap hold)
---   4. Fire the prompt to grab the item
---   5. Wait for grab to register
---   6. Zone-bypass TP back to saved spot WITH the item
--- ============================================================
-
 G.TeleportToHighestValue = function()
-    -- Non-returning version (just goes to target)
     print("🔍 Scanning for highest value...")
     local item, part, prompt, value = findHighestValue()
     if not item or not part then warn("⚠️ No value item"); return end
@@ -1146,34 +1234,25 @@ G.TeleportToHighestValue = function()
         end
         task.wait(0.3)
         if prompt and fireproximityprompt then pcall(fireproximityprompt, prompt) end
-        print("✓ Done (zone bypass)")
+        print("✓ Done")
     end
 end
 
 G.StealAndReturn = function()
-    -- Full workflow: TP to target → grab → return to saved spot
     if not rootPart then warn("⚠️ No character"); return end
     if isTeleporting then warn("⚠️ Already teleporting"); return end
-
-    -- Step 1: Save current position
     preStealCFrame = rootPart.CFrame
     print("📍 Saved pre-steal position")
-
-    -- Step 2: Scan for highest value
     print("🔍 Scanning for highest value...")
     local item, part, prompt, value = findHighestValue()
-    if not item or not part then warn("⚠️ No value item found"); return end
+    if not item or not part then warn("⚠️ No value item"); return end
     print(string.format("✓ Target: %s ($%s)", item.Name, tostring(value)))
-
-    -- Step 3: Zone-bypass TP to target
     local targetPos = part.CFrame + Vector3.new(0, 5, 0)
     if not proZoneTeleport(targetPos) then
         warn("⚠️ Failed to teleport to target")
         return
     end
     print("✓ Arrived at target")
-
-    -- Step 4: Fire prompt to grab
     task.wait(0.2)
     if prompt and fireproximityprompt then
         pcall(fireproximityprompt, prompt)
@@ -1183,22 +1262,16 @@ G.StealAndReturn = function()
         pcall(firetouchinterest, rootPart, part, 0)
         pcall(firetouchinterest, rootPart, part, 1)
     end
-
-    -- Step 5: Wait for the grab to register on the server
     task.wait(STEAL_RETURN_DELAY)
-
-    -- Retry grab once more (some games need 2 attempts)
     if prompt and fireproximityprompt then
         pcall(fireproximityprompt, prompt)
     end
     task.wait(0.3)
-
-    -- Step 6: Zone-bypass TP back to saved spot WITH the item
     print("🔙 Returning to saved position...")
     if proZoneTeleport(preStealCFrame) then
         print("✓ Returned with the item!")
     else
-        warn("⚠️ Failed to return — you're stuck at target")
+        warn("⚠️ Failed to return")
     end
 end
 
@@ -1300,7 +1373,7 @@ function monitorTool(tool)
     end)
 end
 
--- ========== BULLET FOLLOW PROJECTILE TRACKING ==========
+-- ========== BULLET FOLLOW PROJECTILES ==========
 local trackedProjectiles = {}
 
 local function shouldTrackProjectile(part)
@@ -1394,12 +1467,10 @@ local function setupCharacter(char)
     rootPart  = char:WaitForChild("HumanoidRootPart")
     humanoid  = char:WaitForChild("Humanoid")
     rootPart.Anchored = false
-
     if humanoid then
         defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
         defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
     end
-
     if rootPart:FindFirstChild("Gr33dFlightAtt") then rootPart.Gr33dFlightAtt:Destroy() end
     if rootPart:FindFirstChild("Gr33dFlightVel") then rootPart.Gr33dFlightVel:Destroy() end
     if rootPart:FindFirstChild("Gr33dSpeedAtt") then rootPart.Gr33dSpeedAtt:Destroy() end
@@ -1411,21 +1482,17 @@ local function setupCharacter(char)
     lastSpeedCFrame = nil
     jumpImpulseApplied = false
     jumpImpulseTime = 0
-
     char.ChildAdded:Connect(function(child) monitorTool(child) end)
     for _, child in ipairs(char:GetChildren()) do monitorTool(child) end
-
     humanoid.Jumping:Connect(function(isActive)
         if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
             local currentVel = rootPart.AssemblyLinearVelocity
             rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
         end
     end)
-
     task.defer(function()
         if rootPart then originalRootSize = Vector3.new(2, 2, 1) end
     end)
-
     reapplyAllStates(char)
 end
 
@@ -1439,33 +1506,28 @@ player.CharacterAdded:Connect(function(newChar)
             print("✓ Spawn captured")
         end
     end
-
     isFlying = false
     flyDebounceUntil = 0
     jumpImpulseApplied = false
     jumpImpulseTime = 0
     isTeleporting = false
-
     if flyVelocity then
         pcall(function()
             flyVelocity.MaxForce = 0
             flyVelocity.VectorVelocity = Vector3.zero
         end)
     end
-
     teardownSpeedVelocity()
-
     for tool, conn in pairs(toolConnections) do
         if conn then conn:Disconnect() end
         toolConnections[tool] = nil
     end
-
     originalCharacterTransparencies = {}
     if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
-
     trackedProjectiles = {}
-
     setupCharacter(newChar)
+    task.wait(1)
+    pcall(reinstallSyncHooks)
 end)
 
 do
@@ -1730,7 +1792,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.18"
+titleLabel.Text = "GR33D Scripts V5.19"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -1936,7 +1998,6 @@ createToggle(utilities, "Egg Name ESP",   0,  function(s) G.GR33D.Toggle("EggESP
 createToggle(utilities, "Prompt Extender", 28, function(s) G.GR33D.Toggle("PromptExtender", s) end)
 createToggle(utilities, "Anti-AFK",        56, function(s) G.GR33D.Toggle("AntiAFK", s) end)
 
--- MAIN TP GROUP with Steal & Return
 local tpGroup = createCollapsibleGroup(rightGroupFrame, "Teleport (Pro)", 324, 234)
 createButton(tpGroup, "Save Location",          0,   Color3.fromRGB(142, 68, 173), function() G.SaveLocation() end)
 createButton(tpGroup, "TP to Saved",            28,  Color3.fromRGB(39, 174, 96),  function() G.TeleportToSaved() end)
@@ -2008,9 +2069,9 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.18 loaded")
-print("✓ Zone-bypass TP with 1s position lock")
-print("✓ Noclip active during warp (barrier bypass)")
-print("✓ STEAL & RETURN: TP → grab → TP back with item")
-print("✓ Speed + Jump use velocity/impulse techniques")
+print("✓ GR33D Scripts V5.19 loaded")
+print("✓ State Sync Interceptor installed (blocks zone reset payloads)")
+print("✓ Zone-bypass TP with position hold")
+print("✓ Steal & Return workflow")
+print("✓ Speed (velocity), Jump (impulse) techniques")
 print("✓ All other features preserved")
