@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.10
--- SPLIT AIMBOT & BULLET FOLLOW — NARROWED BLOCKLIST
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.11
+-- NON-INTRUSIVE METATABLE HOOKS
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -18,187 +18,6 @@ local hookmetamethod     = hookmetamethod     or function() end
 if type(getgenv()) ~= "table" then
     getgenv = function() return _G end
 end
-
--- ========== STEALTH CONFIG ==========
-local STEALTH = {
-    UseVelocityMovement = true,
-    TeleportChunks      = 2,
-    TeleportJitter      = 2,
-    TeleportChunkTime   = 0.02,
-    RemoteMaxPerSecond  = 12,
-    RemoteJitter        = 0.02,
-    MaskHumanoidState   = true,
-    GodModeHealthStep   = 0.15,
-    LoopJitter          = 0.2,
-    ArgJitter           = 0.01,
-    BlockReports        = true,
-}
-
-local remoteCallTimes = {}
-
-local function jitter(base)
-    base = base or 1
-    return base + (math.random() * STEALTH.LoopJitter * 2 - STEALTH.LoopJitter)
-end
-
--- ========== COMBAT ARBITRATION ==========
-local COMBAT = {
-    AimbotEnabled      = false,
-    BulletFollowEnabled= false,
-}
-
-local function getActiveCombatFeature()
-    if COMBAT.BulletFollowEnabled then return "BulletFollow" end
-    if COMBAT.AimbotEnabled      then return "Aimbot" end
-    return nil
-end
-
--- ========== STEALTH METATABLE LAYER ==========
-pcall(function()
-    local mt = getrawmetatable and getrawmetatable(game)
-    if not mt then return end
-    setreadonly(mt, false)
-
-    local oldNamecall = mt.__namecall
-    local oldNewIndex = mt.__newindex
-    local oldIndex    = mt.__index
-
-    -- FIX: Narrowed blocklist — only true anti-cheat names.
-    -- Removed ambiguous words like "log", "flag", "trace", "verify",
-    -- "audit", "ss", "detect", "kick", "ban", "report", "moderation"
-    -- because those match legitimate game remotes (PetClient, Water,
-    -- GrappleHook, Timer, CharacterActions, etc.) and break the game.
-    local BLOCKED_PATTERNS = {
-        "anticheat", "anti_cheat",
-        "exploit", "violation",
-        "admincheck",
-        "suspicious",
-        "invalidmove", "speedcheck", "teleportcheck",
-        "cheatdetection", "hackdetection",
-    }
-    local SAFE_REMOTES = {
-        ["UpdateCharacter"] = true, ["Movement"] = true,
-        ["Emote"] = true, ["Chat"] = true, ["Health"] = true,
-    }
-
-    local function getInstanceName(inst)
-        if typeof(inst) == "Instance" then return inst.Name:lower() end
-        return tostring(inst):lower()
-    end
-
-    local function isSuspiciousRemote(inst)
-        local name = getInstanceName(inst)
-        if SAFE_REMOTES[name] then return false end
-        for _, pattern in ipairs(BLOCKED_PATTERNS) do
-            if name:find(pattern, 1, true) then return true end
-        end
-        return false
-    end
-
-    local function isThrottled(remote)
-        local now = os.clock()
-        local key = tostring(remote)
-        remoteCallTimes[key] = remoteCallTimes[key] or {}
-        local calls = remoteCallTimes[key]
-        local cutoff = now - 1
-        for i = #calls, 1, -1 do
-            if calls[i] < cutoff then table.remove(calls, i) end
-        end
-        if #calls >= STEALTH.RemoteMaxPerSecond then return true end
-        table.insert(calls, now + math.random() * STEALTH.RemoteJitter)
-        return false
-    end
-
-    local function jitterArgs(...)
-        local args = { ... }
-        local mutated = false
-        for i, arg in ipairs(args) do
-            if typeof(arg) == "Vector3" then
-                local j = STEALTH.ArgJitter
-                args[i] = arg + Vector3.new(
-                    (math.random() * 2 - 1) * j,
-                    (math.random() * 2 - 1) * j,
-                    (math.random() * 2 - 1) * j
-                )
-                mutated = true
-            end
-        end
-        if mutated then return args end
-        return nil
-    end
-
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-
-        if (method == "Kick" or method == "kick") and self == game.Players.LocalPlayer then
-            return nil
-        end
-        if STEALTH.BlockReports and (method == "ReportAbuse" or method == "reportAbuse") then
-            if self == game.Players then return nil end
-        end
-
-        if not checkcaller() then
-            if method == "FireServer" or method == "InvokeServer" then
-                if isSuspiciousRemote(self) then return nil end
-                if isThrottled(self) then return nil end
-                local jitteredArgs = jitterArgs(...)
-                if jitteredArgs then
-                    return oldNamecall(self, table.unpack(jitteredArgs))
-                end
-            end
-        end
-
-        return oldNamecall(self, ...)
-    end)
-
-    mt.__newindex = newcclosure(function(t, k, v)
-        if not checkcaller() and typeof(t) == "Instance" then
-            if t:IsA("Humanoid") then
-                local char = game.Players.LocalPlayer.Character
-                if char and t:IsDescendantOf(char) then
-                    if k == "MaxHealth" and getgenv().MegaHealthActive and v < 900000000 then
-                        return
-                    end
-                    if k == "Health" and (getgenv().MegaHealthActive or getgenv().GodModeActive) then
-                        return
-                    end
-                end
-            end
-        end
-        return oldNewIndex(t, k, v)
-    end)
-
-    mt.__index = newcclosure(function(t, k)
-        if typeof(t) == "Instance" then
-            if k == "DevPanelGui" and not checkcaller() then return nil end
-        end
-        return oldIndex(t, k)
-    end)
-
-    setreadonly(mt, true)
-    print("✓ Stealth metatable layer initialized")
-end)
-
--- ========== SERVICES ==========
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local Players          = game:GetService("Players")
-local Workspace        = game:GetService("Workspace")
-local TeleportService  = game:GetService("TeleportService")
-local HttpService      = game:GetService("HttpService")
-local VirtualUser      = game:GetService("VirtualUser")
-local TweenService     = game:GetService("TweenService")
-local CoreGui          = game:GetService("CoreGui")
-
-local player = Players.LocalPlayer
-local protectedParent = player:WaitForChild("PlayerGui")
-
-if protectedParent:FindFirstChild("DevPanelGui") then
-    protectedParent.DevPanelGui:Destroy()
-end
-
-local camera  = Workspace.CurrentCamera
-local PlaceId = game.PlaceId
 
 -- ========== CONFIG ==========
 local FLY_SPEED           = 50
@@ -264,16 +83,128 @@ local trackedEggTags        = {}
 local godModeConnection       = nil
 local toolConnections         = {}
 
-local setFlying
-local setupGodMode
-local makeInvisible
-local makeVisible
-local monitorTool
-local getBulletFollowTarget
-local getAimbotTarget
-local reapplyAllStates
+-- ========== COMBAT ARBITRATION ==========
+local COMBAT = {
+    AimbotEnabled      = false,
+    BulletFollowEnabled= false,
+}
 
--- ========== SHARED TARGET ACQUISITION ==========
+local function getActiveCombatFeature()
+    if COMBAT.BulletFollowEnabled then return "BulletFollow" end
+    if COMBAT.AimbotEnabled      then return "Aimbot" end
+    return nil
+end
+
+-- ========== MINIMAL STEALTH METATABLE LAYER ==========
+-- Only blocks Kick on self, ReportAbuse, and a tiny set of malicious
+-- remote names. NO throttling, NO arg jitter — those broke the game.
+pcall(function()
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+    setreadonly(mt, false)
+
+    local oldNamecall = mt.__namecall
+    local oldNewIndex = mt.__newindex
+    local oldIndex    = mt.__index
+
+    -- Only block names that are 100% confirmed anti-cheat specific.
+    -- Removed EVERY ambiguous word that could match a legit game remote.
+    local BLOCKED_PATTERNS = {
+        "anticheat", "anti_cheat",
+        "cheatdetection", "hackdetection",
+    }
+
+    local function isSuspiciousRemote(inst)
+        if typeof(inst) ~= "Instance" then return false end
+        local name = inst.Name:lower()
+        for _, pattern in ipairs(BLOCKED_PATTERNS) do
+            if name:find(pattern, 1, true) then return true end
+        end
+        return false
+    end
+
+    -- No throttling, no arg jitter, no namecall interception of
+    -- legitimate traffic. The hook is a pass-through in almost all cases.
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+
+        -- Block kick on self
+        if (method == "Kick" or method == "kick") and self == game.Players.LocalPlayer then
+            return nil
+        end
+
+        -- Block ReportAbuse
+        if (method == "ReportAbuse" or method == "reportAbuse") and self == game.Players then
+            return nil
+        end
+
+        -- Block ONLY explicitly named anti-cheat remotes (very rare)
+        if not checkcaller() and (method == "FireServer" or method == "InvokeServer") then
+            if isSuspiciousRemote(self) then
+                return nil
+            end
+        end
+
+        return oldNamecall(self, ...)
+    end)
+
+    -- Health-blocking hook (only when we want to protect HP)
+    mt.__newindex = newcclosure(function(t, k, v)
+        if not checkcaller() and typeof(t) == "Instance" then
+            if t:IsA("Humanoid") then
+                local char = game.Players.LocalPlayer.Character
+                if char and t:IsDescendantOf(char) then
+                    if k == "MaxHealth" and getgenv().MegaHealthActive and v < 900000000 then
+                        return
+                    end
+                    if k == "Health" and (getgenv().MegaHealthActive or getgenv().GodModeActive) then
+                        return
+                    end
+                end
+            end
+        end
+        return oldNewIndex(t, k, v)
+    end)
+
+    -- Hide our GUI from scans
+    mt.__index = newcclosure(function(t, k)
+        if typeof(t) == "Instance" then
+            if k == "DevPanelGui" and not checkcaller() then return nil end
+        end
+        return oldIndex(t, k)
+    end)
+
+    setreadonly(mt, true)
+    print("✓ Minimal metatable layer installed (non-intrusive)")
+end)
+
+-- ========== SERVICES ==========
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local TeleportService  = game:GetService("TeleportService")
+local HttpService      = game:GetService("HttpService")
+local VirtualUser      = game:GetService("VirtualUser")
+local TweenService     = game:GetService("TweenService")
+local CoreGui          = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local protectedParent = player:WaitForChild("PlayerGui")
+
+if protectedParent:FindFirstChild("DevPanelGui") then
+    protectedParent.DevPanelGui:Destroy()
+end
+
+local camera  = Workspace.CurrentCamera
+local PlaceId = game.PlaceId
+
+-- ========== HELPERS ==========
+local function jitter(base)
+    base = base or 1
+    return base + (math.random() * 0.4 - 0.2)
+end
+
 local function isTeammate(p)
     if player.Team and p.Team and (p.Team == player.Team or p.TeamColor == player.TeamColor) then
         return true
@@ -287,24 +218,20 @@ end
 
 local function findTargetInRange(originPosition, maxRange)
     local bestTarget, bestDist = nil, maxRange
-
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and p.Character then
-            if not isTeammate(p) then
-                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-                local hum = p.Character:FindFirstChildOfClass("Humanoid")
-                if hrp and hum and hum.Health > 0
-                   and not p.Character:FindFirstChildOfClass("ForceField") then
-                    local dist = (hrp.Position - originPosition).Magnitude
-                    if dist < bestDist then
-                        bestDist = dist
-                        bestTarget = hrp
-                    end
+        if p ~= player and p.Character and not isTeammate(p) then
+            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+            local hum = p.Character:FindFirstChildOfClass("Humanoid")
+            if hrp and hum and hum.Health > 0
+               and not p.Character:FindFirstChildOfClass("ForceField") then
+                local dist = (hrp.Position - originPosition).Magnitude
+                if dist < bestDist then
+                    bestDist = dist
+                    bestTarget = hrp
                 end
             end
         end
     end
-
     for _, hrp in ipairs(cachedMonsters) do
         if hrp and hrp.Parent then
             local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
@@ -317,18 +244,17 @@ local function findTargetInRange(originPosition, maxRange)
             end
         end
     end
-
     return bestTarget, bestDist
 end
 
-getBulletFollowTarget = function(originPosition)
-    if not originPosition then originPosition = camera.CFrame.Position end
-    return findTargetInRange(originPosition, BULLET_FOLLOW_RANGE)
+local function getBulletFollowTarget(pos)
+    if not pos then pos = camera.CFrame.Position end
+    return findTargetInRange(pos, BULLET_FOLLOW_RANGE)
 end
 
-getAimbotTarget = function(originPosition)
-    if not originPosition then originPosition = camera.CFrame.Position end
-    return findTargetInRange(originPosition, AIMBOT_RANGE)
+local function getAimbotTarget(pos)
+    if not pos then pos = camera.CFrame.Position end
+    return findTargetInRange(pos, AIMBOT_RANGE)
 end
 
 -- ========== UI HOOKS ==========
@@ -352,8 +278,6 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "SlimHitbox" then
         slimHitboxEnabled = value
         G.SlimHitboxActive = value
-    elseif name == "NoSpeedLimit" then
-        G.NoSpeedLimitActive = value
     elseif name == "AutoGrab" then
         G.AutoGrabActive = value
     elseif name == "Fly" then
@@ -404,7 +328,7 @@ player.Idled:Connect(function()
     if antiAfkEnabled then
         pcall(function()
             VirtualUser:Button2Down(Vector2.new(0, 0), camera.CFrame)
-            task.wait(jitter(1))
+            task.wait(1)
             VirtualUser:Button2Up(Vector2.new(0, 0), camera.CFrame)
         end)
     end
@@ -471,7 +395,6 @@ local function parseWeightValue(input)
     return num
 end
 
--- ========== GRAB PROMPT ==========
 local function isValidGrabPrompt(prompt)
     if not prompt or not prompt.Enabled or not prompt.Parent then return false end
     local parentObj = prompt.Parent
@@ -780,16 +703,16 @@ local function stealthTeleport(targetCFrame)
     root.AssemblyAngularVelocity = Vector3.zero
 
     local startCFrame = root.CFrame
-    for i = 1, STEALTH.TeleportChunks do
-        local alpha = i / STEALTH.TeleportChunks
+    for i = 1, 2 do
+        local alpha = i / 2
         local base = startCFrame:Lerp(targetCFrame, alpha)
-        local j = STEALTH.TeleportJitter
+        local j = 2
         root.CFrame = base + Vector3.new(
             (math.random() * 2 - 1) * j * alpha,
             (math.random() * 2 - 1) * j * alpha,
             (math.random() * 2 - 1) * j * alpha
         )
-        task.wait(STEALTH.TeleportChunkTime)
+        task.wait(0.02)
     end
     root.CFrame = targetCFrame
 
@@ -853,8 +776,7 @@ local function findHighestValue()
     local highestItem, highestPrompt, highestValue = nil, nil, -1
     local highestPart = nil
     for _, obj in ipairs(Workspace:GetDescendants()) do
-        local model = nil
-        local prompt = nil
+        local model, prompt
         if obj:IsA("Model") then
             model = obj
         elseif obj:IsA("ProximityPrompt") then
@@ -896,7 +818,7 @@ end
 
 G.TeleportToSaved = function()
     if not savedMapCFrame then warn("⚠️ No saved location"); return end
-    if stealthTeleport(savedMapCFrame) then print("✓ Teleported") end
+    if stealthTeleport(savedMapCFrame) then print("✓ Teleported to saved") end
 end
 
 G.TeleportToSpawn = function()
@@ -910,7 +832,7 @@ G.TeleportToHighestValue = function()
     if not item or not part then warn("⚠️ No value item"); return end
     print(string.format("✓ Highest: %s ($%s)", item.Name, tostring(value)))
     if stealthTeleport(part.CFrame + Vector3.new(0, 3, 0)) then
-        task.wait(jitter(0.15))
+        task.wait(0.15)
         if prompt and fireproximityprompt then pcall(fireproximityprompt, prompt) end
         if firetouchinterest and rootPart then
             pcall(firetouchinterest, rootPart, part, 0)
@@ -929,7 +851,6 @@ G.GR33D.TeleportToHighestValue = G.TeleportToHighestValue
 function setFlying(state)
     if not rootPart or not humanoid then return end
     isFlying = state
-
     if not flyVelocity and rootPart then
         flyVelocity = Instance.new("LinearVelocity")
         flyVelocity.Name = "Gr33dFlightVel"
@@ -941,23 +862,14 @@ function setFlying(state)
         flyVelocity.MaxForce = 0
         flyVelocity.Parent = rootPart
     end
-
     if isFlying then
-        if STEALTH.MaskHumanoidState then
-            pcall(function()
-                humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false)
-            end)
-        end
+        pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) end)
         flyVelocity.MaxForce = 9e4
         humanoid:ChangeState(Enum.HumanoidStateType.Running)
     else
         flyVelocity.MaxForce = 0
         flyVelocity.VectorVelocity = Vector3.zero
-        if STEALTH.MaskHumanoidState then
-            pcall(function()
-                humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true)
-            end)
-        end
+        pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true) end)
     end
 end
 
@@ -1105,22 +1017,18 @@ local function runAimbotFrame()
     if not COMBAT.AimbotEnabled then return end
     if COMBAT.BulletFollowEnabled then return end
     if not rootPart or not camera then return end
-
     local target = getAimbotTarget(camera.CFrame.Position)
     if not target then return end
-
     local targetPart = target
     if AIMBOT_TARGET_PART == "Head" then
         local head = target.Parent and target.Parent:FindFirstChild("Head")
         if head then targetPart = head end
     end
-
     local camToTarget = (targetPart.Position - camera.CFrame.Position).Unit
     local camLook     = camera.CFrame.LookVector
     local dot = camToTarget:Dot(camLook)
     local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
     if angle > AIMBOT_FOV then return end
-
     local goalCFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
     camera.CFrame = camera.CFrame:Lerp(goalCFrame, AIMBOT_SMOOTHNESS)
 end
@@ -1156,7 +1064,6 @@ end
 local function tryRedirectFireArgs(args, originPos)
     if not COMBAT.BulletFollowEnabled then return nil end
     if not args or #args == 0 then return nil end
-
     local origin = originPos
     if not origin then
         for _, a in ipairs(args) do
@@ -1169,26 +1076,20 @@ local function tryRedirectFireArgs(args, originPos)
     if not origin then
         origin = (rootPart and rootPart.Position) or camera.CFrame.Position
     end
-
     local targetPart = getBulletFollowTarget(origin)
     if not targetPart then return nil end
-
     local aimPoint = targetPart.Position + Vector3.new(0, 1, 0)
     local head = targetPart.Parent and targetPart.Parent:FindFirstChild("Head")
     if head then aimPoint = head.Position end
-
     local newDir = aimPoint - origin
-
     local function deepCopy(t)
         if type(t) ~= "table" then return t end
         local c = {}
         for k, v in pairs(t) do c[k] = deepCopy(v) end
         return c
     end
-
     local newArgs = {}
     for i = 1, #args do newArgs[i] = deepCopy(args[i]) end
-
     for i, arg in ipairs(newArgs) do
         local newVal, changed = findAndReplaceDir(arg, newDir)
         if changed then
@@ -1196,14 +1097,12 @@ local function tryRedirectFireArgs(args, originPos)
             return newArgs, targetPart
         end
     end
-
     for i, arg in ipairs(newArgs) do
         if typeof(arg) == "Vector3" and arg.Magnitude > 5 then
             table.insert(newArgs, i + 1, newDir.Unit)
             return newArgs, targetPart
         end
     end
-
     return nil
 end
 
@@ -1216,10 +1115,7 @@ end
 
 local function registerProjectile(part)
     if trackedProjectiles[part] then return end
-    trackedProjectiles[part] = {
-        spawnTime = os.clock(),
-        maxAge = 5,
-    }
+    trackedProjectiles[part] = { spawnTime = os.clock(), maxAge = 5 }
 end
 
 task.spawn(function()
@@ -1260,24 +1156,7 @@ Workspace.DescendantAdded:Connect(function(desc)
     end
 end)
 
-local lastBulletState = false
-task.spawn(function()
-    while true do
-        task.wait(0.5)
-        if COMBAT.BulletFollowEnabled and not lastBulletState then
-            for _, obj in ipairs(Workspace:GetDescendants()) do
-                if shouldTrackProjectile(obj) then
-                    local v = obj.AssemblyLinearVelocity
-                    if v and v.Magnitude > 20 then
-                        registerProjectile(obj)
-                    end
-                end
-            end
-        end
-        lastBulletState = COMBAT.BulletFollowEnabled
-    end
-end)
-
+-- Bullet follow namecall hook — PASS-THROUGH when OFF
 pcall(function()
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
@@ -1286,11 +1165,14 @@ pcall(function()
     mt.__namecall = newcclosure(function(self, ...)
         local method = getnamecallmethod()
 
+        -- If feature is OFF, immediately pass through. No side effects.
+        if not COMBAT.BulletFollowEnabled then
+            return oldNamecall(self, ...)
+        end
+
         if (method == "FireServer" or method == "InvokeServer")
            and typeof(self) == "Instance" then
-
             local active = getActiveCombatFeature()
-
             if active == "BulletFollow" then
                 local nameLower = self.Name:lower()
                 local isFireRemote = nameLower:find("fire")
@@ -1321,10 +1203,14 @@ pcall(function()
     setreadonly(mt, true)
 end)
 
+-- Raycast hook (Bullet Follow only, pass-through when OFF)
 pcall(function()
     local oldRaycast = hookmetamethod(workspace, "__namecall", function(self, ...)
+        if not COMBAT.BulletFollowEnabled then
+            return oldRaycast(self, ...)
+        end
         local method = getnamecallmethod()
-        if COMBAT.BulletFollowEnabled and (method == "Raycast" or method == "raycast") then
+        if (method == "Raycast" or method == "raycast") then
             local args = { ... }
             if args[1] and args[2] and typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
                 local origin = args[1]
@@ -1341,12 +1227,12 @@ pcall(function()
 end)
 
 -- ========== STATE REAPPLICATION ==========
+local reapplyAllStates
 reapplyAllStates = function(char)
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
-
     if flyToggleEnabled then
         task.defer(function() setFlying(true) end)
     end
@@ -1424,20 +1310,16 @@ player.CharacterAdded:Connect(function(newChar)
             print("✓ Spawn captured")
         end
     end
-
     isFlying = false
-
     for tool, conn in pairs(toolConnections) do
         if conn then conn:Disconnect() end
         toolConnections[tool] = nil
     end
-
     originalCharacterTransparencies = {}
     if godModeConnection then
         godModeConnection:Disconnect()
         godModeConnection = nil
     end
-
     setupCharacter(newChar)
 end)
 
@@ -1483,7 +1365,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
 
     if godModeEnabled and humanoid and humanoid.Health > 0 then
         if humanoid.Health >= humanoid.MaxHealth then
-            humanoid.Health = humanoid.MaxHealth - STEALTH.GodModeHealthStep
+            humanoid.Health = humanoid.MaxHealth - 0.15
         end
     end
 
@@ -1582,12 +1464,6 @@ RunService.RenderStepped:Connect(function(dt)
                 humanoid.JumpPower = jumpPowerValue
                 humanoid.JumpHeight = 0
             end)
-        else
-            pcall(function()
-                if humanoid.UseJumpPower and humanoid.JumpPower ~= defaultJumpPower then
-                    humanoid.JumpPower = defaultJumpPower
-                end
-            end)
         end
     end
 end)
@@ -1598,7 +1474,7 @@ task.spawn(function()
         if G.AutoGrabActive then
             executeAutoGrabRoutine()
         end
-        task.wait(jitter(0.2))
+        task.wait(0.2)
     end
 end)
 
@@ -1631,7 +1507,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.10"
+titleLabel.Text = "GR33D Scripts V5.11"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -1932,7 +1808,8 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.10 loaded")
-print("✓ Anti-cheat blocklist narrowed — game scripts no longer break")
-print("✓ Aimbot & Bullet Follow still separate toggles")
+print("✓ GR33D Scripts V5.11 loaded")
+print("✓ Non-intrusive metatable — game scripts won't crash")
+print("✓ No throttling, no arg jitter on game remotes")
+print("✓ Bullet Follow and Aimbot still fully functional")
 print("✓ All features survive respawn")
