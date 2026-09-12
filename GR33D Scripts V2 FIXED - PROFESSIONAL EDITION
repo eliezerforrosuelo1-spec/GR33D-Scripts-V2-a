@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.19
--- STATE SYNC INTERCEPTOR — ZONE RESET BYPASS
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.20
+-- FIXED UI DRAG/MINIMIZE + STATE SYNC BYPASS
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -136,18 +136,11 @@ local isTeleporting         = false
 -- ============================================================
 -- ========== STATE SYNC INTERCEPTOR =========================
 -- ============================================================
--- The game pushes State_SyncPrivate / State_SyncShared every tick.
--- When we go out of bounds, the server puts reset flags in the
--- payload. This module STRIPS those flags so the client never
--- sees the reset command.
-
 local SYNC_REMOTES = {
     ["State_SyncPrivate"] = true,
     ["State_SyncShared"]  = true,
 }
 
--- Keys commonly used for reset / warp / zone-violation payloads.
--- Any key matching these gets removed before the game reads it.
 local BLOCKED_SYNC_KEYS = {
     "reset", "Reset", "RESET",
     "resetPosition", "ResetPosition",
@@ -173,7 +166,6 @@ local function shouldStripKey(key)
     if type(key) ~= "string" then return false end
     for _, blocked in ipairs(BLOCKED_SYNC_KEYS) do
         if key == blocked then return true end
-        -- Also strip anything containing "reset" / "violation" etc.
         if key:lower():find("reset") then return true end
         if key:lower():find("violation") then return true end
         if key:lower():find("outofbounds") then return true end
@@ -190,7 +182,7 @@ local function sanitizeSyncPayload(value, depth)
     local cleaned = {}
     for k, v in pairs(value) do
         if shouldStripKey(k) then
-            -- Skip this entry entirely
+            -- skip
         else
             cleaned[k] = sanitizeSyncPayload(v, depth + 1)
         end
@@ -198,7 +190,6 @@ local function sanitizeSyncPayload(value, depth)
     return cleaned
 end
 
--- Also strip blocked STRING VALUES (some games pass "reset" as a value)
 local function sanitizeValue(v)
     if type(v) == "string" then
         local lower = v:lower()
@@ -214,7 +205,6 @@ local function sanitizeValue(v)
     return v
 end
 
--- Install interceptor via getconnections replacement
 local syncInstalled = {}
 local function reinstallSyncHooks()
     for _, obj in ipairs(game:GetDescendants()) do
@@ -227,20 +217,15 @@ local function reinstallSyncHooks()
                     table.insert(existingFns, conn.Function)
                 end
             end
-
-            -- Disconnect all current handlers
             for _, conn in ipairs(existingConns) do
                 pcall(function() conn:Disconnect() end)
             end
-
-            -- Reconnect with sanitizer wrapper
             for _, fn in ipairs(existingFns) do
                 signal:Connect(function(...)
                     local args = {...}
                     for i, arg in ipairs(args) do
                         args[i] = sanitizeValue(arg)
                     end
-                    -- Remove nil-holes from args
                     local cleanArgs = {}
                     for i = 1, select("#", ...) do
                         cleanArgs[i] = args[i]
@@ -248,14 +233,12 @@ local function reinstallSyncHooks()
                     pcall(fn, table.unpack(cleanArgs, 1, select("#", ...)))
                 end)
             end
-
             syncInstalled[obj] = true
             print("[GR33D] ✓ Hooked " .. obj.Name .. " (" .. #existingFns .. " handlers wrapped)")
         end
     end
 end
 
--- Also auto-hook newly added State_Sync remotes
 game.DescendantAdded:Connect(function(desc)
     if desc:IsA("RemoteEvent") and SYNC_REMOTES[desc.Name] then
         task.wait(0.5)
@@ -263,9 +246,7 @@ game.DescendantAdded:Connect(function(desc)
     end
 end)
 
--- ============================================================
--- ========== LAZY HOOK MANAGERS =============================
--- ============================================================
+-- ========== LAZY HOOK MANAGERS ==========
 local hooks = {
     anticheat    = nil,
     bulletFollow = nil,
@@ -766,7 +747,6 @@ end
 
 installAntiCheatHook()
 
--- Initial sync hook install
 task.spawn(function()
     task.wait(2)
     pcall(reinstallSyncHooks)
@@ -1766,11 +1746,15 @@ task.spawn(function()
     end
 end)
 
--- ========== UI ==========
+-- ============================================================
+-- ========== USER INTERFACE (FIXED DRAG/MINIMIZE) ===========
+-- ============================================================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "DevPanelGui"
 screenGui.ResetOnSpawn = false
 screenGui.Parent = protectedParent
+screenGui.DisplayOrder = 999
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
@@ -1778,25 +1762,36 @@ mainFrame.Size = UDim2.new(0, 360, 0, 520)
 mainFrame.Position = UDim2.new(0.5, -180, 0.5, -260)
 mainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
 mainFrame.Active = true
+mainFrame.Selectable = true
+mainFrame.Draggable = false
+mainFrame.ClipsDescendants = false
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+
 local stroke = Instance.new("UIStroke", mainFrame)
 stroke.Color = Color3.fromRGB(50, 50, 65)
 stroke.Thickness = 1.5
 
 local topBar = Instance.new("Frame", mainFrame)
+topBar.Name = "TopBar"
 topBar.Size = UDim2.new(1, 0, 0, 38)
+topBar.Position = UDim2.new(0, 0, 0, 0)
 topBar.BackgroundTransparency = 1
 topBar.Active = true
+topBar.Selectable = true
+topBar.ZIndex = 10
 
 local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.19"
+titleLabel.Text = "GR33D Scripts V5.20"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Active = false
+titleLabel.Selectable = false
+titleLabel.ZIndex = 11
 
 local minimizeButton = Instance.new("TextButton", topBar)
 minimizeButton.Size = UDim2.new(0, 26, 0, 26)
@@ -1806,6 +1801,9 @@ minimizeButton.Text = "-"
 minimizeButton.TextColor3 = Color3.fromRGB(220, 220, 230)
 minimizeButton.Font = Enum.Font.GothamBold
 minimizeButton.TextSize = 16
+minimizeButton.Active = true
+minimizeButton.Selectable = true
+minimizeButton.ZIndex = 12
 Instance.new("UICorner", minimizeButton).CornerRadius = UDim.new(0, 6)
 
 local toggleContainer = Instance.new("ScrollingFrame", mainFrame)
@@ -1815,6 +1813,7 @@ toggleContainer.BackgroundTransparency = 1
 toggleContainer.BorderSizePixel = 0
 toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 1000)
 toggleContainer.ScrollBarThickness = 4
+toggleContainer.Active = true
 
 local leftGroupFrame = Instance.new("Frame", toggleContainer)
 leftGroupFrame.Size = UDim2.new(0.48, 0, 1, -8)
@@ -1864,6 +1863,7 @@ local function createToggle(parent, text, y, callback)
     label.Font = Enum.Font.GothamMedium
     label.TextSize = 10
     label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Active = false
     local switch = Instance.new("TextButton", row)
     switch.Size = UDim2.new(0, 32, 0, 16)
     switch.Position = UDim2.new(1, -32, 0.5, -8)
@@ -1901,6 +1901,7 @@ local function createInput(parent, text, y, default, callback)
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
     label.ClipsDescendants = false
+    label.Active = false
     local box = Instance.new("TextBox", row)
     box.Size = UDim2.new(0, 38, 0, 20)
     box.Position = UDim2.new(1, -42, 0.5, -10)
@@ -1966,6 +1967,7 @@ infoLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
 infoLabel.Font = Enum.Font.GothamMedium
 infoLabel.TextSize = 9
 infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.Active = false
 
 local function updateCombatInfo()
     if COMBAT.BulletFollowEnabled then
@@ -2024,9 +2026,21 @@ createButton(tpGroup, "Rejoin Server",          168, Color3.fromRGB(52, 73, 94),
     TeleportService:TeleportToPlaceInstance(PlaceId, game.JobId, player)
 end)
 
-local dragging, dragStart, startPosition
+-- ============================================================
+-- ========== FIXED DRAG & MINIMIZE ==========================
+-- ============================================================
+
+-- Reset position so it's never off-screen
+mainFrame.Position = UDim2.new(0.5, -180, 0.5, -260)
+
+-- Drag state
+local dragging = false
+local dragStart = nil
+local startPosition = nil
+
 topBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPosition = mainFrame.Position
@@ -2034,18 +2048,41 @@ topBar.InputBegan:Connect(function(input)
 end)
 
 UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-        local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X, startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+    if not dragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+       and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
     end
+    if not dragStart or not startPosition then return end
+
+    local delta = input.Position - dragStart
+    mainFrame.Position = UDim2.new(
+        startPosition.X.Scale,
+        startPosition.X.Offset + delta.X,
+        startPosition.Y.Scale,
+        startPosition.Y.Offset + delta.Y
+    )
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false
+        dragStart = nil
+        startPosition = nil
     end
 end)
 
+-- Failsafe: release drag if window loses focus
+pcall(function()
+    UserInputService.WindowFocusReleased:Connect(function()
+        dragging = false
+        dragStart = nil
+        startPosition = nil
+    end)
+end)
+
+-- Minimize toggle
 minimizeButton.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
     if isMinimized then
@@ -2057,6 +2094,7 @@ minimizeButton.MouseButton1Click:Connect(function()
         minimizeButton.Size = UDim2.new(1, 0, 1, 0)
         minimizeButton.Position = UDim2.new(0, 0, 0, 0)
         minimizeButton.Text = "+"
+        minimizeButton.TextSize = 20
     else
         mainFrame.Size = UDim2.new(0, 360, 0, 520)
         mainFrame.BackgroundTransparency = 0
@@ -2066,12 +2104,13 @@ minimizeButton.MouseButton1Click:Connect(function()
         minimizeButton.Size = UDim2.new(0, 26, 0, 26)
         minimizeButton.Position = UDim2.new(1, -34, 0.5, -13)
         minimizeButton.Text = "-"
+        minimizeButton.TextSize = 16
     end
 end)
 
-print("✓ GR33D Scripts V5.19 loaded")
-print("✓ State Sync Interceptor installed (blocks zone reset payloads)")
-print("✓ Zone-bypass TP with position hold")
+print("✓ GR33D Scripts V5.20 loaded")
+print("✓ Fixed UI drag & minimize")
+print("✓ State Sync Interceptor active")
 print("✓ Steal & Return workflow")
 print("✓ Speed (velocity), Jump (impulse) techniques")
-print("✓ All other features preserved")
+print("✓ All features preserved")
