@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.09
--- SPLIT AIMBOT & BULLET FOLLOW — NO CONFLICT
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.10
+-- SPLIT AIMBOT & BULLET FOLLOW — NARROWED BLOCKLIST
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -63,11 +63,18 @@ pcall(function()
     local oldNewIndex = mt.__newindex
     local oldIndex    = mt.__index
 
+    -- FIX: Narrowed blocklist — only true anti-cheat names.
+    -- Removed ambiguous words like "log", "flag", "trace", "verify",
+    -- "audit", "ss", "detect", "kick", "ban", "report", "moderation"
+    -- because those match legitimate game remotes (PetClient, Water,
+    -- GrappleHook, Timer, CharacterActions, etc.) and break the game.
     local BLOCKED_PATTERNS = {
-        "anticheat", "anti_cheat", "ban", "report", "detect", "cheat",
-        "exploit", "kick", "moderation", "log", "flag", "violation",
-        "screenshot", "ss", "admincheck", "verify", "audit", "trace",
-        "suspicious", "abnormal", "invalidmove", "speedcheck", "teleportcheck",
+        "anticheat", "anti_cheat",
+        "exploit", "violation",
+        "admincheck",
+        "suspicious",
+        "invalidmove", "speedcheck", "teleportcheck",
+        "cheatdetection", "hackdetection",
     }
     local SAFE_REMOTES = {
         ["UpdateCharacter"] = true, ["Movement"] = true,
@@ -830,7 +837,8 @@ local function parseMoneyFromModel(model)
                 if num then
                     local v = tonumber(num) or 0
                     if suffix == "K" then v = v * 1e3
-                    elseif suffix == "M" then v = v * 1e6                    elseif suffix == "B" then v = v * 1e9
+                    elseif suffix == "M" then v = v * 1e6
+                    elseif suffix == "B" then v = v * 1e9
                     elseif suffix == "T" then v = v * 1e12
                     end
                     if v > best then best = v end
@@ -1623,7 +1631,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.09"
+titleLabel.Text = "GR33D Scripts V5.10"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -1924,10 +1932,7 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.09 loaded")
-print("✓ Aimbot & Bullet Follow now SEPARATE toggles")
-print("✓ Arbitration: Bullet Follow > Aimbot when both on")
-print("✓ Single shared namecall hook — no double-hook conflict")
-print("✓ Bullet Follow: deep-search args (Vector3/CFrame/tables)")
-print("✓ Bullet Follow: per-frame projectile steering")
-print("✓ Bullet Follow: Raycast redirection for hitscan")
+print("✓ GR33D Scripts V5.10 loaded")
+print("✓ Anti-cheat blocklist narrowed — game scripts no longer break")
+print("✓ Aimbot & Bullet Follow still separate toggles")
+print("✓ All features survive respawn")
