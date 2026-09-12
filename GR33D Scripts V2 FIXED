@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.11
--- NON-INTRUSIVE METATABLE HOOKS
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.12
+-- ADAPTIVE HOOK ROUTING — ZERO OVERHEAD WHEN OFF
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -13,11 +13,31 @@ local getnamecallmethod  = getnamecallmethod  or function() return "" end
 local fireproximityprompt= fireproximityprompt or function() end
 local firetouchinterest  = firetouchinterest  or function() end
 local typeof             = typeof             or type
-local hookmetamethod     = hookmetamethod     or function() end
 
 if type(getgenv()) ~= "table" then
     getgenv = function() return _G end
 end
+
+-- ========== SERVICES ==========
+local UserInputService = game:GetService("UserInputService")
+local RunService       = game:GetService("RunService")
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local TeleportService  = game:GetService("TeleportService")
+local HttpService      = game:GetService("HttpService")
+local VirtualUser      = game:GetService("VirtualUser")
+local TweenService     = game:GetService("TweenService")
+local CoreGui          = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local protectedParent = player:WaitForChild("PlayerGui")
+
+if protectedParent:FindFirstChild("DevPanelGui") then
+    protectedParent.DevPanelGui:Destroy()
+end
+
+local camera  = Workspace.CurrentCamera
+local PlaceId = game.PlaceId
 
 -- ========== CONFIG ==========
 local FLY_SPEED           = 50
@@ -68,6 +88,13 @@ local antiAfkEnabled        = false
 local antiMeleeEnabled      = false
 local isMinimized           = false
 
+-- Combat arbitration
+local COMBAT = {
+    AimbotEnabled      = false,
+    BulletFollowEnabled= false,
+}
+
+-- Per-character runtime state
 local isFlying              = false
 local lastJumpTapTime       = 0
 local lastJumpReqTime       = 0
@@ -83,151 +110,81 @@ local trackedEggTags        = {}
 local godModeConnection       = nil
 local toolConnections         = {}
 
--- ========== COMBAT ARBITRATION ==========
-local COMBAT = {
-    AimbotEnabled      = false,
-    BulletFollowEnabled= false,
+-- ========== LAZY HOOK MANAGERS ==========
+-- Smart solution: install hooks ONLY when the feature needs them.
+-- Result: zero overhead when features are off.
+
+local hooks = {
+    anticheat   = nil,  -- namecall hook for anti-cheat blocking
+    bulletFollow= nil,  -- namecall hook for redirecting fire args
+    raycast     = nil,  -- namecall hook on Workspace for raycast redirection
 }
 
-local function getActiveCombatFeature()
-    if COMBAT.BulletFollowEnabled then return "BulletFollow" end
-    if COMBAT.AimbotEnabled      then return "Aimbot" end
-    return nil
-end
-
--- ========== MINIMAL STEALTH METATABLE LAYER ==========
--- Only blocks Kick on self, ReportAbuse, and a tiny set of malicious
--- remote names. NO throttling, NO arg jitter — those broke the game.
-pcall(function()
+-- Anti-cheat namecall hook
+local function installAntiCheatHook()
+    if hooks.anticheat then return end
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
     setreadonly(mt, false)
-
     local oldNamecall = mt.__namecall
-    local oldNewIndex = mt.__newindex
-    local oldIndex    = mt.__index
-
-    -- Only block names that are 100% confirmed anti-cheat specific.
-    -- Removed EVERY ambiguous word that could match a legit game remote.
-    local BLOCKED_PATTERNS = {
-        "anticheat", "anti_cheat",
-        "cheatdetection", "hackdetection",
-    }
-
-    local function isSuspiciousRemote(inst)
-        if typeof(inst) ~= "Instance" then return false end
-        local name = inst.Name:lower()
-        for _, pattern in ipairs(BLOCKED_PATTERNS) do
-            if name:find(pattern, 1, true) then return true end
-        end
-        return false
-    end
-
-    -- No throttling, no arg jitter, no namecall interception of
-    -- legitimate traffic. The hook is a pass-through in almost all cases.
     mt.__namecall = newcclosure(function(self, ...)
         local method = getnamecallmethod()
-
-        -- Block kick on self
         if (method == "Kick" or method == "kick") and self == game.Players.LocalPlayer then
             return nil
         end
-
-        -- Block ReportAbuse
         if (method == "ReportAbuse" or method == "reportAbuse") and self == game.Players then
             return nil
         end
-
-        -- Block ONLY explicitly named anti-cheat remotes (very rare)
         if not checkcaller() and (method == "FireServer" or method == "InvokeServer") then
-            if isSuspiciousRemote(self) then
-                return nil
-            end
-        end
-
-        return oldNamecall(self, ...)
-    end)
-
-    -- Health-blocking hook (only when we want to protect HP)
-    mt.__newindex = newcclosure(function(t, k, v)
-        if not checkcaller() and typeof(t) == "Instance" then
-            if t:IsA("Humanoid") then
-                local char = game.Players.LocalPlayer.Character
-                if char and t:IsDescendantOf(char) then
-                    if k == "MaxHealth" and getgenv().MegaHealthActive and v < 900000000 then
-                        return
-                    end
-                    if k == "Health" and (getgenv().MegaHealthActive or getgenv().GodModeActive) then
-                        return
-                    end
+            if typeof(self) == "Instance" then
+                local name = self.Name:lower()
+                if name:find("anticheat", 1, true)
+                   or name:find("anti_cheat", 1, true)
+                   or name:find("cheatdetection", 1, true)
+                   or name:find("hackdetection", 1, true) then
+                    return nil
                 end
             end
         end
-        return oldNewIndex(t, k, v)
+        return oldNamecall(self, ...)
     end)
-
-    -- Hide our GUI from scans
-    mt.__index = newcclosure(function(t, k)
-        if typeof(t) == "Instance" then
-            if k == "DevPanelGui" and not checkcaller() then return nil end
-        end
-        return oldIndex(t, k)
-    end)
-
     setreadonly(mt, true)
-    print("✓ Minimal metatable layer installed (non-intrusive)")
-end)
-
--- ========== SERVICES ==========
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local Players          = game:GetService("Players")
-local Workspace        = game:GetService("Workspace")
-local TeleportService  = game:GetService("TeleportService")
-local HttpService      = game:GetService("HttpService")
-local VirtualUser      = game:GetService("VirtualUser")
-local TweenService     = game:GetService("TweenService")
-local CoreGui          = game:GetService("CoreGui")
-
-local player = Players.LocalPlayer
-local protectedParent = player:WaitForChild("PlayerGui")
-
-if protectedParent:FindFirstChild("DevPanelGui") then
-    protectedParent.DevPanelGui:Destroy()
+    hooks.anticheat = oldNamecall
+    print("[GR33D] ✓ Anti-cheat hook installed")
 end
 
-local camera  = Workspace.CurrentCamera
-local PlaceId = game.PlaceId
-
--- ========== HELPERS ==========
-local function jitter(base)
-    base = base or 1
-    return base + (math.random() * 0.4 - 0.2)
+local function removeAntiCheatHook()
+    if not hooks.anticheat then return end
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+    setreadonly(mt, false)
+    mt.__namecall = hooks.anticheat
+    setreadonly(mt, true)
+    hooks.anticheat = nil
+    print("[GR33D] Anti-cheat hook removed")
 end
 
-local function isTeammate(p)
-    if player.Team and p.Team and (p.Team == player.Team or p.TeamColor == player.TeamColor) then
-        return true
-    end
-    if p:GetAttribute("Team") and player:GetAttribute("Team")
-       and p:GetAttribute("Team") == player:GetAttribute("Team") then
-        return true
-    end
-    return false
-end
-
-local function findTargetInRange(originPosition, maxRange)
-    local bestTarget, bestDist = nil, maxRange
+-- Bullet follow namecall hook — ONLY installs when bullet follow is ON
+local function getBulletFollowTarget(pos)
+    if not pos then pos = camera.CFrame.Position end
+    local bestTarget, bestDist = nil, BULLET_FOLLOW_RANGE
     for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= player and p.Character and not isTeammate(p) then
-            local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-            local hum = p.Character:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0
-               and not p.Character:FindFirstChildOfClass("ForceField") then
-                local dist = (hrp.Position - originPosition).Magnitude
-                if dist < bestDist then
-                    bestDist = dist
-                    bestTarget = hrp
+        if p ~= player and p.Character then
+            local isTeammate = false
+            if player.Team and p.Team and (p.Team == player.Team or p.TeamColor == player.TeamColor) then
+                isTeammate = true
+            end
+            if p:GetAttribute("Team") and player:GetAttribute("Team")
+               and p:GetAttribute("Team") == player:GetAttribute("Team") then
+                isTeammate = true
+            end
+            if not isTeammate then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart")
+                local hum = p.Character:FindFirstChildOfClass("Humanoid")
+                if hrp and hum and hum.Health > 0
+                   and not p.Character:FindFirstChildOfClass("ForceField") then
+                    local dist = (hrp.Position - pos).Magnitude
+                    if dist < bestDist then bestDist = dist bestTarget = hrp end
                 end
             end
         end
@@ -236,25 +193,106 @@ local function findTargetInRange(originPosition, maxRange)
         if hrp and hrp.Parent then
             local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
             if hum and hum.Health > 0 then
-                local dist = (hrp.Position - originPosition).Magnitude
-                if dist < bestDist then
-                    bestDist = dist
-                    bestTarget = hrp
-                end
+                local dist = (hrp.Position - pos).Magnitude
+                if dist < bestDist then bestDist = dist bestTarget = hrp end
             end
         end
     end
     return bestTarget, bestDist
 end
 
-local function getBulletFollowTarget(pos)
-    if not pos then pos = camera.CFrame.Position end
-    return findTargetInRange(pos, BULLET_FOLLOW_RANGE)
+local function findAndReplaceDir(value, newDir)
+    if typeof(value) == "Vector3" then
+        local mag = value.Magnitude
+        if mag > 0.3 and mag < 5 then return newDir.Unit, true end
+        return value, false
+    elseif typeof(value) == "CFrame" then
+        local pos = value.Position
+        return CFrame.new(pos, pos + newDir.Unit), true
+    elseif type(value) == "table" then
+        for k, v in pairs(value) do
+            local newV, changed = findAndReplaceDir(v, newDir)
+            if changed then value[k] = newV return value, true end
+        end
+    end
+    return value, false
 end
 
-local function getAimbotTarget(pos)
-    if not pos then pos = camera.CFrame.Position end
-    return findTargetInRange(pos, AIMBOT_RANGE)
+local function tryRedirectFireArgs(args)
+    if not COMBAT.BulletFollowEnabled then return nil end
+    if not args or #args == 0 then return nil end
+    local origin = (rootPart and rootPart.Position) or camera.CFrame.Position
+    local targetPart = getBulletFollowTarget(origin)
+    if not targetPart then return nil end
+    local aimPoint = targetPart.Position + Vector3.new(0, 1, 0)
+    local head = targetPart.Parent and targetPart.Parent:FindFirstChild("Head")
+    if head then aimPoint = head.Position end
+    local newDir = aimPoint - origin
+    local function deepCopy(t)
+        if type(t) ~= "table" then return t end
+        local c = {}
+        for k, v in pairs(t) do c[k] = deepCopy(v) end
+        return c
+    end
+    local newArgs = {}
+    for i = 1, #args do newArgs[i] = deepCopy(args[i]) end
+    for i, arg in ipairs(newArgs) do
+        local newVal, changed = findAndReplaceDir(arg, newDir)
+        if changed then newArgs[i] = newVal return newArgs, targetPart end
+    end
+    return nil
+end
+
+local function installBulletFollowHook()
+    if hooks.bulletFollow then return end
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+    setreadonly(mt, false)
+    local oldNamecall = mt.__namecall
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        if not COMBAT.BulletFollowEnabled then
+            return oldNamecall(self, ...)
+        end
+        if (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" then
+            local nameLower = self.Name:lower()
+            local isFireRemote = nameLower:find("fire")
+                                 or nameLower:find("shoot")
+                                 or nameLower:find("attack")
+                                 or nameLower:find("hit")
+                                 or nameLower:find("damage")
+                                 or nameLower:find("cast")
+                                 or nameLower:find("projectile")
+                                 or nameLower:find("bullet")
+                                 or nameLower:find("weapon")
+                                 or nameLower:find("gun")
+                                 or nameLower:find("ray")
+            if isFireRemote then
+                local args = {}
+                local count = select("#", ...)
+                for i = 1, count do args[i] = select(i, ...) end
+                local newArgs, targetPart = tryRedirectFireArgs(args)
+                if newArgs and targetPart then
+                    return oldNamecall(self, table.unpack(newArgs))
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    setreadonly(mt, true)
+    hooks.bulletFollow = oldNamecall
+    print("[GR33D] ✓ Bullet Follow hook installed")
+end
+
+local function removeBulletFollowHook()
+    if not hooks.bulletFollow then return end
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+    setreadonly(mt, false)
+    mt.__namecall = hooks.bulletFollow
+    setreadonly(mt, true)
+    hooks.bulletFollow = nil
+    print("[GR33D] Bullet Follow hook removed")
 end
 
 -- ========== UI HOOKS ==========
@@ -278,18 +316,13 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "SlimHitbox" then
         slimHitboxEnabled = value
         G.SlimHitboxActive = value
+    elseif name == "NoSpeedLimit" then
+        G.NoSpeedLimitActive = value
     elseif name == "AutoGrab" then
         G.AutoGrabActive = value
     elseif name == "Fly" then
         flyToggleEnabled = value
-        if not value then
-            setFlying(false)
-        else
-            if humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
-                             or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
-                setFlying(true)
-            end
-        end
+        if not value then setFlying(false) end
     elseif name == "RapidHealing" then
         rapidHealingEnabled = value
     elseif name == "NoFallDamage" then
@@ -305,6 +338,12 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "BulletFollow" then
         COMBAT.BulletFollowEnabled = value
         G.BulletFollowActive = value
+        -- *** LAZY HOOK: install/remove bullet follow hook based on toggle ***
+        if value then
+            installBulletFollowHook()
+        else
+            removeBulletFollowHook()
+        end
     elseif name == "RapidFire" then
         rapidFireEnabled = value
         for _, tool in ipairs(player.Character and player.Character:GetChildren() or {}) do
@@ -321,7 +360,8 @@ G.GR33D.Toggle = function(name, value)
     end
 end
 
-G.GR33D.GetActiveCombatFeature = getActiveCombatFeature
+-- Install anti-cheat hook immediately (lightweight, always useful)
+installAntiCheatHook()
 
 -- ========== ANTI-AFK ==========
 player.Idled:Connect(function()
@@ -395,6 +435,7 @@ local function parseWeightValue(input)
     return num
 end
 
+-- ========== GRAB PROMPT VALIDATION ==========
 local function isValidGrabPrompt(prompt)
     if not prompt or not prompt.Enabled or not prompt.Parent then return false end
     local parentObj = prompt.Parent
@@ -424,7 +465,7 @@ local function isValidGrabPrompt(prompt)
     return true
 end
 
--- ========== CACHING ==========
+-- ========== CACHING (only 4 loops) ==========
 task.spawn(function()
     while true do
         if G.AutoGrabActive then
@@ -440,7 +481,7 @@ task.spawn(function()
             end
             cachedPrompts = cache
         end
-        task.wait(jitter(1))
+        task.wait(1)
     end
 end)
 
@@ -464,7 +505,7 @@ task.spawn(function()
             end
         end
         cachedMonsters = list
-        task.wait(jitter(1))
+        task.wait(1)
     end
 end)
 
@@ -499,7 +540,7 @@ task.spawn(function()
                 originalPromptValues = {}
             end
         end
-        task.wait(jitter(1))
+        task.wait(1)
     end
 end)
 
@@ -540,7 +581,7 @@ task.spawn(function()
                 end
             end
         end
-        task.wait(jitter(2))
+        task.wait(2)
     end
 end)
 
@@ -677,7 +718,6 @@ local function stealthTeleport(targetCFrame)
     local root = char:FindFirstChild("HumanoidRootPart")
     local hum  = char:FindFirstChildOfClass("Humanoid")
     if not root then return false end
-
     if hum then
         pcall(function()
             hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
@@ -690,7 +730,6 @@ local function stealthTeleport(targetCFrame)
             newFF.Parent = char
         end
     end
-
     local anchoredParts = {}
     for _, p in ipairs(char:GetDescendants()) do
         if p:IsA("BasePart") then
@@ -698,10 +737,8 @@ local function stealthTeleport(targetCFrame)
             p.Anchored = true
         end
     end
-
     root.AssemblyLinearVelocity  = Vector3.zero
     root.AssemblyAngularVelocity = Vector3.zero
-
     local startCFrame = root.CFrame
     for i = 1, 2 do
         local alpha = i / 2
@@ -715,7 +752,6 @@ local function stealthTeleport(targetCFrame)
         task.wait(0.02)
     end
     root.CFrame = targetCFrame
-
     for part, wasAnchored in pairs(anchoredParts) do
         if part and part.Parent then part.Anchored = wasAnchored end
     end
@@ -742,8 +778,7 @@ local function parseMoneyFromModel(model)
         for name, val in pairs(attrs) do
             local n = tostring(name):lower()
             if n:find("value") or n:find("price") or n:find("cash") or n:find("worth") then
-                if type(val) == "number" and val > best then
-                    best = val
+                if type(val) == "number" and val > best then best = val
                 elseif type(val) == "string" then
                     local num = tonumber((val:gsub("[^%d%.]", "")))
                     if num and num > best then best = num end
@@ -777,8 +812,7 @@ local function findHighestValue()
     local highestPart = nil
     for _, obj in ipairs(Workspace:GetDescendants()) do
         local model, prompt
-        if obj:IsA("Model") then
-            model = obj
+        if obj:IsA("Model") then model = obj
         elseif obj:IsA("ProximityPrompt") then
             prompt = obj
             model = obj:FindFirstAncestorOfClass("Model") or obj.Parent
@@ -798,8 +832,8 @@ local function findHighestValue()
                                  or model:FindFirstChildWhichIsA("BasePart")
                     if part then
                         highestValue = value
-                        highestItem   = model
-                        highestPart   = part
+                        highestItem = model
+                        highestPart = part
                         highestPrompt = prompt or model:FindFirstChildWhichIsA("ProximityPrompt", true)
                     end
                 end
@@ -847,7 +881,7 @@ G.GR33D.TeleportToSaved        = G.TeleportToSaved
 G.GR33D.TeleportToSpawn        = G.TeleportToSpawn
 G.GR33D.TeleportToHighestValue = G.TeleportToHighestValue
 
--- ========== STEALTH FLIGHT ==========
+-- ========== FLIGHT ==========
 function setFlying(state)
     if not rootPart or not humanoid then return end
     isFlying = state
@@ -863,13 +897,11 @@ function setFlying(state)
         flyVelocity.Parent = rootPart
     end
     if isFlying then
-        pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, false) end)
         flyVelocity.MaxForce = 9e4
         humanoid:ChangeState(Enum.HumanoidStateType.Running)
     else
         flyVelocity.MaxForce = 0
         flyVelocity.VectorVelocity = Vector3.zero
-        pcall(function() humanoid:SetStateEnabled(Enum.HumanoidStateType.Freefall, true) end)
     end
 end
 
@@ -892,9 +924,7 @@ end
 
 UserInputService.JumpRequest:Connect(function()
     local currentTime = os.clock()
-    if (currentTime - lastJumpReqTime) > 0.1 then
-        handleJumpTap()
-    end
+    if (currentTime - lastJumpReqTime) > 0.1 then handleJumpTap() end
     lastJumpReqTime = currentTime
 end)
 
@@ -923,10 +953,7 @@ function makeInvisible(char)
             part.Transparency = 1
         end
     end
-    if godModeConnection then
-        godModeConnection:Disconnect()
-        godModeConnection = nil
-    end
+    if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
     godModeConnection = char.DescendantAdded:Connect(function(desc)
         if godModeEnabled then
             if desc:IsA("BasePart") then
@@ -948,14 +975,7 @@ function makeVisible(char)
         end
     end
     originalCharacterTransparencies = {}
-    if godModeConnection then
-        godModeConnection:Disconnect()
-        godModeConnection = nil
-    end
-end
-
-function setupGodMode(char)
-    if godModeEnabled then makeInvisible(char) end
+    if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
 end
 
 -- ========== RAPID FIRE ==========
@@ -970,15 +990,10 @@ local function applyRapidFire(tool)
             local n = v.Name:lower()
             local isCooldown = false
             for _, keyword in ipairs(COOLDOWN_KEYWORDS) do
-                if n:find(keyword, 1, true) then
-                    isCooldown = true
-                    break
-                end
+                if n:find(keyword, 1, true) then isCooldown = true break end
             end
             if isCooldown then
-                if originalToolValues[v] == nil then
-                    originalToolValues[v] = v.Value
-                end
+                if originalToolValues[v] == nil then originalToolValues[v] = v.Value end
                 v.Value = math.max(0.01, originalToolValues[v] * 0.1)
             end
         end
@@ -996,15 +1011,8 @@ end
 
 function monitorTool(tool)
     if not tool or not tool:IsA("Tool") then return end
-    if rapidFireEnabled then
-        applyRapidFire(tool)
-    else
-        disableRapidFire(tool)
-    end
-    if toolConnections[tool] then
-        toolConnections[tool]:Disconnect()
-        toolConnections[tool] = nil
-    end
+    if rapidFireEnabled then applyRapidFire(tool) else disableRapidFire(tool) end
+    if toolConnections[tool] then toolConnections[tool]:Disconnect() toolConnections[tool] = nil end
     toolConnections[tool] = tool.DescendantAdded:Connect(function(v)
         if rapidFireEnabled and (v:IsA("NumberValue") or v:IsA("IntValue")) then
             applyRapidFire(tool)
@@ -1012,110 +1020,14 @@ function monitorTool(tool)
     end)
 end
 
--- ========== COMBAT: AIMBOT ==========
-local function runAimbotFrame()
-    if not COMBAT.AimbotEnabled then return end
-    if COMBAT.BulletFollowEnabled then return end
-    if not rootPart or not camera then return end
-    local target = getAimbotTarget(camera.CFrame.Position)
-    if not target then return end
-    local targetPart = target
-    if AIMBOT_TARGET_PART == "Head" then
-        local head = target.Parent and target.Parent:FindFirstChild("Head")
-        if head then targetPart = head end
-    end
-    local camToTarget = (targetPart.Position - camera.CFrame.Position).Unit
-    local camLook     = camera.CFrame.LookVector
-    local dot = camToTarget:Dot(camLook)
-    local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
-    if angle > AIMBOT_FOV then return end
-    local goalCFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
-    camera.CFrame = camera.CFrame:Lerp(goalCFrame, AIMBOT_SMOOTHNESS)
-end
-
--- ========== COMBAT: BULLET FOLLOW ==========
+-- ========== BULLET FOLLOW PROJECTILE TRACKING ==========
 local trackedProjectiles = {}
-
-local function findAndReplaceDir(value, newDir)
-    if typeof(value) == "Vector3" then
-        local mag = value.Magnitude
-        if mag > 0.3 and mag < 5 then
-            return newDir.Unit, true
-        end
-        return value, false
-    elseif typeof(value) == "CFrame" then
-        local pos = value.Position
-        return CFrame.new(pos, pos + newDir.Unit), true
-    elseif type(value) == "table" then
-        local mutated = false
-        for k, v in pairs(value) do
-            local newV, changed = findAndReplaceDir(v, newDir)
-            if changed then
-                value[k] = newV
-                mutated = true
-                break
-            end
-        end
-        return value, mutated
-    end
-    return value, false
-end
-
-local function tryRedirectFireArgs(args, originPos)
-    if not COMBAT.BulletFollowEnabled then return nil end
-    if not args or #args == 0 then return nil end
-    local origin = originPos
-    if not origin then
-        for _, a in ipairs(args) do
-            if typeof(a) == "Vector3" and a.Magnitude > 5 then
-                origin = a
-                break
-            end
-        end
-    end
-    if not origin then
-        origin = (rootPart and rootPart.Position) or camera.CFrame.Position
-    end
-    local targetPart = getBulletFollowTarget(origin)
-    if not targetPart then return nil end
-    local aimPoint = targetPart.Position + Vector3.new(0, 1, 0)
-    local head = targetPart.Parent and targetPart.Parent:FindFirstChild("Head")
-    if head then aimPoint = head.Position end
-    local newDir = aimPoint - origin
-    local function deepCopy(t)
-        if type(t) ~= "table" then return t end
-        local c = {}
-        for k, v in pairs(t) do c[k] = deepCopy(v) end
-        return c
-    end
-    local newArgs = {}
-    for i = 1, #args do newArgs[i] = deepCopy(args[i]) end
-    for i, arg in ipairs(newArgs) do
-        local newVal, changed = findAndReplaceDir(arg, newDir)
-        if changed then
-            newArgs[i] = newVal
-            return newArgs, targetPart
-        end
-    end
-    for i, arg in ipairs(newArgs) do
-        if typeof(arg) == "Vector3" and arg.Magnitude > 5 then
-            table.insert(newArgs, i + 1, newDir.Unit)
-            return newArgs, targetPart
-        end
-    end
-    return nil
-end
 
 local function shouldTrackProjectile(part)
     if not part or not part:IsA("BasePart") then return false end
     if character and part:IsDescendantOf(character) then return false end
     if part.Size.Magnitude > 8 then return false end
     return true
-end
-
-local function registerProjectile(part)
-    if trackedProjectiles[part] then return end
-    trackedProjectiles[part] = { spawnTime = os.clock(), maxAge = 5 }
 end
 
 task.spawn(function()
@@ -1152,93 +1064,20 @@ end)
 Workspace.DescendantAdded:Connect(function(desc)
     if not COMBAT.BulletFollowEnabled then return end
     if shouldTrackProjectile(desc) then
-        registerProjectile(desc)
+        if not trackedProjectiles[desc] then
+            trackedProjectiles[desc] = { spawnTime = os.clock(), maxAge = 5 }
+        end
     end
 end)
 
--- Bullet follow namecall hook — PASS-THROUGH when OFF
-pcall(function()
-    local mt = getrawmetatable and getrawmetatable(game)
-    if not mt then return end
-    local oldNamecall = mt.__namecall
-    setreadonly(mt, false)
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-
-        -- If feature is OFF, immediately pass through. No side effects.
-        if not COMBAT.BulletFollowEnabled then
-            return oldNamecall(self, ...)
-        end
-
-        if (method == "FireServer" or method == "InvokeServer")
-           and typeof(self) == "Instance" then
-            local active = getActiveCombatFeature()
-            if active == "BulletFollow" then
-                local nameLower = self.Name:lower()
-                local isFireRemote = nameLower:find("fire")
-                                     or nameLower:find("shoot")
-                                     or nameLower:find("attack")
-                                     or nameLower:find("hit")
-                                     or nameLower:find("damage")
-                                     or nameLower:find("cast")
-                                     or nameLower:find("projectile")
-                                     or nameLower:find("bullet")
-                                     or nameLower:find("weapon")
-                                     or nameLower:find("gun")
-                                     or nameLower:find("ray")
-                if isFireRemote then
-                    local args = {}
-                    local count = select("#", ...)
-                    for i = 1, count do args[i] = select(i, ...) end
-                    local newArgs, targetPart = tryRedirectFireArgs(args)
-                    if newArgs and targetPart then
-                        return oldNamecall(self, table.unpack(newArgs))
-                    end
-                end
-            end
-        end
-
-        return oldNamecall(self, ...)
-    end)
-    setreadonly(mt, true)
-end)
-
--- Raycast hook (Bullet Follow only, pass-through when OFF)
-pcall(function()
-    local oldRaycast = hookmetamethod(workspace, "__namecall", function(self, ...)
-        if not COMBAT.BulletFollowEnabled then
-            return oldRaycast(self, ...)
-        end
-        local method = getnamecallmethod()
-        if (method == "Raycast" or method == "raycast") then
-            local args = { ... }
-            if args[1] and args[2] and typeof(args[1]) == "Vector3" and typeof(args[2]) == "Vector3" then
-                local origin = args[1]
-                local target = getBulletFollowTarget(origin)
-                if target then
-                    local newDir = (target.Position - origin)
-                    args[2] = newDir.Unit * args[2].Magnitude
-                    return oldRaycast(self, table.unpack(args))
-                end
-            end
-        end
-        return oldRaycast(self, ...)
-    end)
-end)
-
 -- ========== STATE REAPPLICATION ==========
-local reapplyAllStates
-reapplyAllStates = function(char)
+local function reapplyAllStates(char)
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then return end
-    if flyToggleEnabled then
-        task.defer(function() setFlying(true) end)
-    end
-    if godModeEnabled then
-        task.defer(function() makeInvisible(char) end)
-    end
+    if flyToggleEnabled then task.defer(function() setFlying(true) end) end
+    if godModeEnabled then task.defer(function() makeInvisible(char) end) end
     if megaHealthEnabled then
         task.defer(function()
             if hum and hum.Parent then
@@ -1273,30 +1112,24 @@ local function setupCharacter(char)
     rootPart  = char:WaitForChild("HumanoidRootPart")
     humanoid  = char:WaitForChild("Humanoid")
     rootPart.Anchored = false
-
     if humanoid then
         defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
         defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
     end
-
     if rootPart:FindFirstChild("Gr33dFlightAtt") then rootPart.Gr33dFlightAtt:Destroy() end
     if rootPart:FindFirstChild("Gr33dFlightVel") then rootPart.Gr33dFlightVel:Destroy() end
     flyVelocity = nil
-
     char.ChildAdded:Connect(function(child) monitorTool(child) end)
     for _, child in ipairs(char:GetChildren()) do monitorTool(child) end
-
     humanoid.Jumping:Connect(function(isActive)
         if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
             local currentVel = rootPart.AssemblyLinearVelocity
             rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
         end
     end)
-
     task.defer(function()
         if rootPart then originalRootSize = Vector3.new(2, 2, 1) end
     end)
-
     reapplyAllStates(char)
 end
 
@@ -1311,15 +1144,17 @@ player.CharacterAdded:Connect(function(newChar)
         end
     end
     isFlying = false
+    if flyVelocity then
+        flyVelocity.MaxForce = 0
+        flyVelocity.VectorVelocity = Vector3.zero
+    end
     for tool, conn in pairs(toolConnections) do
         if conn then conn:Disconnect() end
         toolConnections[tool] = nil
     end
     originalCharacterTransparencies = {}
-    if godModeConnection then
-        godModeConnection:Disconnect()
-        godModeConnection = nil
-    end
+    if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
+    trackedProjectiles = {}
     setupCharacter(newChar)
 end)
 
@@ -1343,9 +1178,7 @@ end
 
 -- ========== MAIN LOOPS ==========
 RunService.Heartbeat:Connect(function(deltaTime)
-    if not camera or not camera.Parent then
-        camera = Workspace.CurrentCamera
-    end
+    if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
 
     if humanoid and humanoid.Health > 0 then
         if runSpeedEnabled then
@@ -1426,9 +1259,25 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    runAimbotFrame()
-
-    if not COMBAT.AimbotEnabled and not COMBAT.BulletFollowEnabled then
+    if COMBAT.AimbotEnabled and rootPart and camera then
+        local target = getBulletFollowTarget(camera.CFrame.Position)
+        if target then
+            local targetPart = target
+            if AIMBOT_TARGET_PART == "Head" then
+                local head = target.Parent and target.Parent:FindFirstChild("Head")
+                if head then targetPart = head end
+            end
+            local camToTarget = (targetPart.Position - camera.CFrame.Position).Unit
+            local camLook = camera.CFrame.LookVector
+            local dot = camToTarget:Dot(camLook)
+            local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
+            if angle <= AIMBOT_FOV then
+                local goalCFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
+                camera.CFrame = camera.CFrame:Lerp(goalCFrame, AIMBOT_SMOOTHNESS)
+                camera.CameraType = Enum.CameraType.Scriptable
+            end
+        end
+    elseif not COMBAT.AimbotEnabled and not COMBAT.BulletFollowEnabled then
         if camera.CameraType == Enum.CameraType.Scriptable then
             camera.CameraType = Enum.CameraType.Custom
         end
@@ -1437,14 +1286,9 @@ end)
 
 -- ========== FLIGHT RENDER ==========
 RunService.RenderStepped:Connect(function(dt)
-    if not camera or not camera.Parent then
-        camera = Workspace.CurrentCamera
-    end
-
+    if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
     if isFlying and flyVelocity and humanoid and rootPart then
-        if flyVelocity.MaxForce < 9e4 then
-            flyVelocity.MaxForce = 9e4
-        end
+        if flyVelocity.MaxForce < 9e4 then flyVelocity.MaxForce = 9e4 end
         if controls then
             local moveVector = controls:GetMoveVector()
             if moveVector.Magnitude > 0 then
@@ -1456,7 +1300,6 @@ RunService.RenderStepped:Connect(function(dt)
             end
         end
     end
-
     if humanoid then
         if jumpEnabled then
             pcall(function()
@@ -1471,16 +1314,12 @@ end)
 -- ========== AUTO-GRAB LOOP ==========
 task.spawn(function()
     while true do
-        if G.AutoGrabActive then
-            executeAutoGrabRoutine()
-        end
+        if G.AutoGrabActive then executeAutoGrabRoutine() end
         task.wait(0.2)
     end
 end)
 
--- ============================================================
--- ============ USER INTERFACE ===============================
--- ============================================================
+-- ========== UI ==========
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "DevPanelGui"
 screenGui.ResetOnSpawn = false
@@ -1492,7 +1331,6 @@ mainFrame.Size = UDim2.new(0, 360, 0, 490)
 mainFrame.Position = UDim2.new(0.5, -180, 0.5, -245)
 mainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
 mainFrame.Active = true
-
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 local stroke = Instance.new("UIStroke", mainFrame)
 stroke.Color = Color3.fromRGB(50, 50, 65)
@@ -1507,7 +1345,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.11"
+titleLabel.Text = "GR33D Scripts V5.12"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -1552,12 +1390,10 @@ local function createCollapsibleGroup(parent, title, y, height)
     header.TextSize = 11
     header.TextXAlignment = Enum.TextXAlignment.Left
     Instance.new("UICorner", header).CornerRadius = UDim.new(0, 5)
-
     local content = Instance.new("Frame", parent)
     content.Size = UDim2.new(1, 0, 0, height)
     content.Position = UDim2.new(0, 0, 0, y + 28)
     content.BackgroundTransparency = 1
-
     local open = true
     header.MouseButton1Click:Connect(function()
         open = not open
@@ -1572,7 +1408,6 @@ local function createToggle(parent, text, y, callback)
     row.Size = UDim2.new(1, 0, 0, 26)
     row.Position = UDim2.new(0, 0, 0, y)
     row.BackgroundTransparency = 1
-
     local label = Instance.new("TextLabel", row)
     label.Size = UDim2.new(0.62, 0, 1, 0)
     label.BackgroundTransparency = 1
@@ -1581,20 +1416,17 @@ local function createToggle(parent, text, y, callback)
     label.Font = Enum.Font.GothamMedium
     label.TextSize = 10
     label.TextXAlignment = Enum.TextXAlignment.Left
-
     local switch = Instance.new("TextButton", row)
     switch.Size = UDim2.new(0, 32, 0, 16)
     switch.Position = UDim2.new(1, -32, 0.5, -8)
     switch.BackgroundColor3 = Color3.fromRGB(40, 40, 52)
     switch.Text = ""
     Instance.new("UICorner", switch).CornerRadius = UDim.new(1, 0)
-
     local knob = Instance.new("Frame", switch)
     knob.Size = UDim2.new(0, 12, 0, 12)
     knob.Position = UDim2.new(0, 2, 0.5, -6)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 215)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-
     local enabled = false
     switch.MouseButton1Click:Connect(function()
         enabled = not enabled
@@ -1609,7 +1441,6 @@ local function createInput(parent, text, y, default, callback)
     row.Size = UDim2.new(1, 0, 0, 26)
     row.Position = UDim2.new(0, 0, 0, y)
     row.BackgroundTransparency = 1
-
     local label = Instance.new("TextLabel", row)
     label.Size = UDim2.new(0.55, 0, 1, 0)
     label.BackgroundTransparency = 1
@@ -1619,7 +1450,6 @@ local function createInput(parent, text, y, default, callback)
     label.TextSize = 10
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextTruncate = Enum.TextTruncate.AtEnd
-
     local box = Instance.new("TextBox", row)
     box.Size = UDim2.new(0, 44, 0, 20)
     box.Position = UDim2.new(1, -48, 0.5, -10)
@@ -1630,11 +1460,7 @@ local function createInput(parent, text, y, default, callback)
     box.TextSize = 10
     box.ClearTextOnFocus = false
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
-
     box:GetPropertyChangedSignal("Text"):Connect(function()
-        if callback then callback(box.Text) end
-    end)
-    box.FocusLost:Connect(function()
         if callback then callback(box.Text) end
     end)
 end
@@ -1693,7 +1519,6 @@ createInput(grab,  "Target Luck",      56, 0, function(v) G.TargetLuck  = parseS
 createInput(grab,  "Target Size",      84, 0, function(v) G.TargetSize  = parseStatValue(v) end)
 
 local combat = createCollapsibleGroup(rightGroupFrame, "Combat", 0, 200)
-
 local infoLabel = Instance.new("TextLabel", combat)
 infoLabel.Size = UDim2.new(1, 0, 0, 18)
 infoLabel.Position = UDim2.new(0, 0, 0, 0)
@@ -1705,11 +1530,10 @@ infoLabel.TextSize = 9
 infoLabel.TextXAlignment = Enum.TextXAlignment.Left
 
 local function updateCombatInfo()
-    local active = getActiveCombatFeature()
-    if active == "BulletFollow" then
-        infoLabel.Text = "▸ Bullet Follow active (Aimbot paused)"
+    if COMBAT.BulletFollowEnabled then
+        infoLabel.Text = "▸ Bullet Follow active"
         infoLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
-    elseif active == "Aimbot" then
+    elseif COMBAT.AimbotEnabled then
         infoLabel.Text = "▸ Aimbot active"
         infoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
     else
@@ -1808,8 +1632,8 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.11 loaded")
-print("✓ Non-intrusive metatable — game scripts won't crash")
-print("✓ No throttling, no arg jitter on game remotes")
-print("✓ Bullet Follow and Aimbot still fully functional")
+print("✓ GR33D Scripts V5.12 loaded — Adaptive Hook Routing")
+print("✓ Anti-cheat hook installed (lightweight)")
+print("✓ Bullet Follow hook installs only when toggled ON")
+print("✓ Zero overhead when features are OFF")
 print("✓ All features survive respawn")
