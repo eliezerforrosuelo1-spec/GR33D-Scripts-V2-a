@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.20
--- FIXED UI DRAG/MINIMIZE + STATE SYNC BYPASS
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.21
+-- MOBILE-HARDENED DRAG + ALL FEATURES
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -1747,7 +1747,7 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- ========== USER INTERFACE (FIXED DRAG/MINIMIZE) ===========
+-- ========== USER INTERFACE =================================
 -- ============================================================
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "DevPanelGui"
@@ -1755,6 +1755,8 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = protectedParent
 screenGui.DisplayOrder = 999
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.IgnoreGuiInset = true
+pcall(function() screenGui.ClipToDeviceSafeArea = false end)
 
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
@@ -1784,7 +1786,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.20"
+titleLabel.Text = "GR33D Scripts V5.21"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -2027,58 +2029,91 @@ createButton(tpGroup, "Rejoin Server",          168, Color3.fromRGB(52, 73, 94),
 end)
 
 -- ============================================================
--- ========== FIXED DRAG & MINIMIZE ==========================
+-- ========== MOBILE-HARDENED DRAG SYSTEM ====================
 -- ============================================================
 
--- Reset position so it's never off-screen
+-- Reset to center so it's never off-screen
 mainFrame.Position = UDim2.new(0.5, -180, 0.5, -260)
 
--- Drag state
 local dragging = false
-local dragStart = nil
-local startPosition = nil
+local dragTouch = nil
+local dragOffset = nil
 
 topBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-       or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true
-        dragStart = input.Position
-        startPosition = mainFrame.Position
+    local isMouse = input.UserInputType == Enum.UserInputType.MouseButton1
+    local isTouch = input.UserInputType == Enum.UserInputType.Touch
+    if not (isMouse or isTouch) then return end
+
+    dragging = true
+
+    -- Calculate offset between touch and frame top-left corner
+    local touchPos = input.Position
+    local framePos = mainFrame.AbsolutePosition
+    dragOffset = Vector2.new(touchPos.X - framePos.X, touchPos.Y - framePos.Y)
+
+    if isTouch then
+        dragTouch = input
+    else
+        dragTouch = nil
     end
 end)
 
 UserInputService.InputChanged:Connect(function(input)
     if not dragging then return end
-    if input.UserInputType ~= Enum.UserInputType.MouseMovement
-       and input.UserInputType ~= Enum.UserInputType.Touch then
-        return
-    end
-    if not dragStart or not startPosition then return end
 
-    local delta = input.Position - dragStart
-    mainFrame.Position = UDim2.new(
-        startPosition.X.Scale,
-        startPosition.X.Offset + delta.X,
-        startPosition.Y.Scale,
-        startPosition.Y.Offset + delta.Y
-    )
+    local isMouseMove = input.UserInputType == Enum.UserInputType.MouseMovement
+    local isTouchMove = input.UserInputType == Enum.UserInputType.Touch
+    if not (isMouseMove or isTouchMove) then return end
+
+    -- On mobile, only respond to the SAME touch that started the drag
+    if isTouchMove and dragTouch then
+        if input ~= dragTouch then
+            local dx = math.abs(input.Position.X - dragTouch.Position.X)
+            local dy = math.abs(input.Position.Y - dragTouch.Position.Y)
+            if dx > 50 or dy > 50 then
+                return
+            end
+        end
+    end
+
+    if not dragOffset then return end
+
+    local newX = input.Position.X - dragOffset.X
+    local newY = input.Position.Y - dragOffset.Y
+    mainFrame.Position = UDim2.new(0, newX, 0, newY)
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-       or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = false
-        dragStart = nil
-        startPosition = nil
+    local isMouseEnd = input.UserInputType == Enum.UserInputType.MouseButton1
+    local isTouchEnd = input.UserInputType == Enum.UserInputType.Touch
+    if not (isMouseEnd or isTouchEnd) then return end
+
+    if isTouchEnd and dragTouch and input ~= dragTouch then
+        return
     end
+
+    dragging = false
+    dragTouch = nil
+    dragOffset = nil
 end)
 
--- Failsafe: release drag if window loses focus
+-- Mobile failsafe: TouchEnded catches interrupted touches
+pcall(function()
+    UserInputService.TouchEnded:Connect(function(touch, _)
+        if dragTouch and touch == dragTouch then
+            dragging = false
+            dragTouch = nil
+            dragOffset = nil
+        end
+    end)
+end)
+
+-- Desktop failsafe: window losing focus releases drag
 pcall(function()
     UserInputService.WindowFocusReleased:Connect(function()
         dragging = false
-        dragStart = nil
-        startPosition = nil
+        dragTouch = nil
+        dragOffset = nil
     end)
 end)
 
@@ -2108,8 +2143,9 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.20 loaded")
-print("✓ Fixed UI drag & minimize")
+print("✓ GR33D Scripts V5.21 loaded")
+print("✓ Mobile-hardened drag (works on phones)")
+print("✓ Fixed minimize toggle")
 print("✓ State Sync Interceptor active")
 print("✓ Steal & Return workflow")
 print("✓ Speed (velocity), Jump (impulse) techniques")
