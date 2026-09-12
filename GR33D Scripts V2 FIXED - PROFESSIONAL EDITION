@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.21
--- MOBILE-HARDENED DRAG + ALL FEATURES
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.22
+-- MOBILE-FIT UI + HARDENED DRAG + ALL FEATURES
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -1747,8 +1747,17 @@ task.spawn(function()
 end)
 
 -- ============================================================
--- ========== USER INTERFACE =================================
+-- ========== USER INTERFACE (MOBILE-FIT) ====================
 -- ============================================================
+
+-- Detect screen + auto-fit panel
+local viewport = workspace.CurrentCamera.ViewportSize
+local isMobileScreen = viewport.X < 700
+local PANEL_W = isMobileScreen and math.min(320, math.max(220, viewport.X - 40)) or 360
+local PANEL_H = isMobileScreen and math.min(440, math.max(320, viewport.Y - 120)) or 520
+local PANEL_X = math.clamp((viewport.X - PANEL_W) / 2, 10, math.max(10, viewport.X - PANEL_W - 10))
+local PANEL_Y = isMobileScreen and 80 or math.clamp((viewport.Y - PANEL_H) / 2, 60, math.max(60, viewport.Y - PANEL_H - 10))
+
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "DevPanelGui"
 screenGui.ResetOnSpawn = false
@@ -1760,8 +1769,8 @@ pcall(function() screenGui.ClipToDeviceSafeArea = false end)
 
 local mainFrame = Instance.new("Frame", screenGui)
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 360, 0, 520)
-mainFrame.Position = UDim2.new(0.5, -180, 0.5, -260)
+mainFrame.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+mainFrame.Position = UDim2.new(0, PANEL_X, 0, PANEL_Y)
 mainFrame.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
 mainFrame.Active = true
 mainFrame.Selectable = true
@@ -1786,10 +1795,10 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.21"
+titleLabel.Text = "GR33D Scripts V5.22"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 13
+titleLabel.TextSize = isMobileScreen and 12 or 13
 titleLabel.TextXAlignment = Enum.TextXAlignment.Left
 titleLabel.Active = false
 titleLabel.Selectable = false
@@ -2032,9 +2041,6 @@ end)
 -- ========== MOBILE-HARDENED DRAG SYSTEM ====================
 -- ============================================================
 
--- Reset to center so it's never off-screen
-mainFrame.Position = UDim2.new(0.5, -180, 0.5, -260)
-
 local dragging = false
 local dragTouch = nil
 local dragOffset = nil
@@ -2046,7 +2052,6 @@ topBar.InputBegan:Connect(function(input)
 
     dragging = true
 
-    -- Calculate offset between touch and frame top-left corner
     local touchPos = input.Position
     local framePos = mainFrame.AbsolutePosition
     dragOffset = Vector2.new(touchPos.X - framePos.X, touchPos.Y - framePos.Y)
@@ -2065,14 +2070,11 @@ UserInputService.InputChanged:Connect(function(input)
     local isTouchMove = input.UserInputType == Enum.UserInputType.Touch
     if not (isMouseMove or isTouchMove) then return end
 
-    -- On mobile, only respond to the SAME touch that started the drag
-    if isTouchMove and dragTouch then
-        if input ~= dragTouch then
-            local dx = math.abs(input.Position.X - dragTouch.Position.X)
-            local dy = math.abs(input.Position.Y - dragTouch.Position.Y)
-            if dx > 50 or dy > 50 then
-                return
-            end
+    if isTouchMove and dragTouch and input ~= dragTouch then
+        local dx = math.abs(input.Position.X - dragTouch.Position.X)
+        local dy = math.abs(input.Position.Y - dragTouch.Position.Y)
+        if dx > 50 or dy > 50 then
+            return
         end
     end
 
@@ -2080,6 +2082,12 @@ UserInputService.InputChanged:Connect(function(input)
 
     local newX = input.Position.X - dragOffset.X
     local newY = input.Position.Y - dragOffset.Y
+
+    -- Clamp to keep at least 40 pixels visible on screen
+    local vp = workspace.CurrentCamera.ViewportSize
+    newX = math.clamp(newX, -mainFrame.AbsoluteSize.X + 40, vp.X - 40)
+    newY = math.clamp(newY, 0, vp.Y - 40)
+
     mainFrame.Position = UDim2.new(0, newX, 0, newY)
 end)
 
@@ -2097,7 +2105,6 @@ UserInputService.InputEnded:Connect(function(input)
     dragOffset = nil
 end)
 
--- Mobile failsafe: TouchEnded catches interrupted touches
 pcall(function()
     UserInputService.TouchEnded:Connect(function(touch, _)
         if dragTouch and touch == dragTouch then
@@ -2108,7 +2115,6 @@ pcall(function()
     end)
 end)
 
--- Desktop failsafe: window losing focus releases drag
 pcall(function()
     UserInputService.WindowFocusReleased:Connect(function()
         dragging = false
@@ -2117,7 +2123,6 @@ pcall(function()
     end)
 end)
 
--- Minimize toggle
 minimizeButton.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
     if isMinimized then
@@ -2131,7 +2136,7 @@ minimizeButton.MouseButton1Click:Connect(function()
         minimizeButton.Text = "+"
         minimizeButton.TextSize = 20
     else
-        mainFrame.Size = UDim2.new(0, 360, 0, 520)
+        mainFrame.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
         mainFrame.BackgroundTransparency = 0
         toggleContainer.Visible = true
         titleLabel.Visible = true
@@ -2143,9 +2148,21 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
-print("✓ GR33D Scripts V5.21 loaded")
-print("✓ Mobile-hardened drag (works on phones)")
-print("✓ Fixed minimize toggle")
+-- Emergency reset: exposes a global function to re-center the UI
+-- Run this from Delta console any time: getgenv().ResetUI()
+getgenv().ResetUI = function()
+    local vp = workspace.CurrentCamera.ViewportSize
+    local w = math.min(320, vp.X - 40)
+    local h = math.min(440, vp.Y - 120)
+    mainFrame.Size = UDim2.new(0, w, 0, h)
+    mainFrame.Position = UDim2.new(0, (vp.X - w) / 2, 0, 80)
+    print("✓ UI re-centered")
+end
+
+print("✓ GR33D Scripts V5.22 loaded")
+print("✓ Mobile-fit UI (auto-sized to your screen)")
+print("✓ Mobile-hardened drag with clamping")
+print("✓ Type getgenv().ResetUI() to re-center if lost")
 print("✓ State Sync Interceptor active")
 print("✓ Steal & Return workflow")
 print("✓ Speed (velocity), Jump (impulse) techniques")
