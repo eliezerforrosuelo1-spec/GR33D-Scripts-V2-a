@@ -41,20 +41,12 @@ local function jitter(base)
     return base + (math.random() * STEALTH.LoopJitter * 2 - STEALTH.LoopJitter)
 end
 
--- ============================================================
--- ========== FEATURE ARBITRATION SYSTEM =====================
--- ============================================================
--- Only ONE combat feature can be "primary" at a time.
--- When both Aimbot & BulletFollow are toggled on, BulletFollow wins
--- (it's more powerful and the user should know which one is doing work).
--- The UI reflects this by dimming the secondary feature.
--- ============================================================
+-- ========== COMBAT ARBITRATION ==========
 local COMBAT = {
     AimbotEnabled      = false,
     BulletFollowEnabled= false,
 }
 
--- Returns which feature is currently controlling fire behavior
 local function getActiveCombatFeature()
     if COMBAT.BulletFollowEnabled then return "BulletFollow" end
     if COMBAT.AimbotEnabled      then return "Aimbot" end
@@ -211,8 +203,8 @@ local DOUBLE_TAP_WINDOW   = 0.35
 local BULLET_FOLLOW_RANGE = 500
 local AIMBOT_RANGE        = 300
 local AIMBOT_SMOOTHNESS   = 0.15
-local AIMBOT_FOV          = 60    -- degrees
-local AIMBOT_TARGET_PART  = "Head" -- "Head" or "HumanoidRootPart"
+local AIMBOT_FOV          = 60
+local AIMBOT_TARGET_PART  = "Head"
 
 local cachedPrompts  = {}
 local cachedMonsters = {}
@@ -275,8 +267,6 @@ local getAimbotTarget
 local reapplyAllStates
 
 -- ========== SHARED TARGET ACQUISITION ==========
--- Both Aimbot and Bullet Follow use this, but with different ranges.
--- Aimbot uses closer range (AIMBOT_RANGE), Bullet Follow uses farther range.
 local function isTeammate(p)
     if player.Team and p.Team and (p.Team == player.Team or p.TeamColor == player.TeamColor) then
         return true
@@ -291,7 +281,6 @@ end
 local function findTargetInRange(originPosition, maxRange)
     local bestTarget, bestDist = nil, maxRange
 
-    -- Player priority
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and p.Character then
             if not isTeammate(p) then
@@ -309,7 +298,6 @@ local function findTargetInRange(originPosition, maxRange)
         end
     end
 
-    -- Monsters / NPCs
     for _, hrp in ipairs(cachedMonsters) do
         if hrp and hrp.Parent then
             local hum = hrp.Parent:FindFirstChildOfClass("Humanoid")
@@ -326,7 +314,6 @@ local function findTargetInRange(originPosition, maxRange)
     return bestTarget, bestDist
 end
 
--- Public API: different ranges for each feature
 getBulletFollowTarget = function(originPosition)
     if not originPosition then originPosition = camera.CFrame.Position end
     return findTargetInRange(originPosition, BULLET_FOLLOW_RANGE)
@@ -403,7 +390,6 @@ G.GR33D.Toggle = function(name, value)
     end
 end
 
--- Expose the arbitration state so UI can query it
 G.GR33D.GetActiveCombatFeature = getActiveCombatFeature
 
 -- ========== ANTI-AFK ==========
@@ -754,9 +740,7 @@ local function executeAutoGrabRoutine()
     end
 end
 
--- ============================================================
--- ========== STEALTH TELEPORT ===============================
--- ============================================================
+-- ========== STEALTH TELEPORT ==========
 local function stealthTeleport(targetCFrame)
     local char = character or player.Character
     if not char then return false end
@@ -846,8 +830,7 @@ local function parseMoneyFromModel(model)
                 if num then
                     local v = tonumber(num) or 0
                     if suffix == "K" then v = v * 1e3
-                    elseif suffix == "M" then v = v * 1e6
-                    elseif suffix == "B" then v = v * 1e9
+                    elseif suffix == "M" then v = v * 1e6                    elseif suffix == "B" then v = v * 1e9
                     elseif suffix == "T" then v = v * 1e12
                     end
                     if v > best then best = v end
@@ -934,9 +917,7 @@ G.GR33D.TeleportToSaved        = G.TeleportToSaved
 G.GR33D.TeleportToSpawn        = G.TeleportToSpawn
 G.GR33D.TeleportToHighestValue = G.TeleportToHighestValue
 
--- ============================================================
--- ========== STEALTH FLIGHT =================================
--- ============================================================
+-- ========== STEALTH FLIGHT ==========
 function setFlying(state)
     if not rootPart or not humanoid then return end
     isFlying = state
@@ -1111,25 +1092,15 @@ function monitorTool(tool)
     end)
 end
 
--- ============================================================
--- ========== COMBAT: AIMBOT + BULLET FOLLOW =================
--- ============================================================
--- Both features share a SINGLE namecall hook. Inside the hook,
--- we check `getActiveCombatFeature()` to determine which one
--- runs. Only ONE can act on any given FireServer call.
--- ============================================================
-
--- ---------- AIMBOT: camera lock (runs every frame) ----------
+-- ========== COMBAT: AIMBOT ==========
 local function runAimbotFrame()
     if not COMBAT.AimbotEnabled then return end
-    -- If Bullet Follow is also enabled, Aimbot is a no-op
     if COMBAT.BulletFollowEnabled then return end
     if not rootPart or not camera then return end
 
     local target = getAimbotTarget(camera.CFrame.Position)
     if not target then return end
 
-    -- FOV check — only lock if target is within visible cone
     local targetPart = target
     if AIMBOT_TARGET_PART == "Head" then
         local head = target.Parent and target.Parent:FindFirstChild("Head")
@@ -1142,15 +1113,13 @@ local function runAimbotFrame()
     local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
     if angle > AIMBOT_FOV then return end
 
-    -- Smooth camera lock
     local goalCFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
     camera.CFrame = camera.CFrame:Lerp(goalCFrame, AIMBOT_SMOOTHNESS)
 end
 
--- ---------- BULLET FOLLOW: projectile + remote redirect ----------
+-- ========== COMBAT: BULLET FOLLOW ==========
 local trackedProjectiles = {}
 
--- Deep-search a value for a "direction-like" Vector3 and replace it
 local function findAndReplaceDir(value, newDir)
     if typeof(value) == "Vector3" then
         local mag = value.Magnitude
@@ -1301,10 +1270,6 @@ task.spawn(function()
     end
 end)
 
--- ---------- SINGLE SHARED NAMECALL HOOK ----------
--- Both Aimbot and Bullet Follow use this ONE hook. The hook
--- dispatches to whichever feature is active. This eliminates
--- the double-hook conflict entirely.
 pcall(function()
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
@@ -1318,9 +1283,6 @@ pcall(function()
 
             local active = getActiveCombatFeature()
 
-            -- Only Bullet Follow modifies args.
-            -- Aimbot does NOT modify args — it only moves the camera.
-            -- So if Aimbot is active alone, args pass through unchanged.
             if active == "BulletFollow" then
                 local nameLower = self.Name:lower()
                 local isFireRemote = nameLower:find("fire")
@@ -1351,7 +1313,6 @@ pcall(function()
     setreadonly(mt, true)
 end)
 
--- Raycast hook — used by Bullet Follow only (not Aimbot)
 pcall(function()
     local oldRaycast = hookmetamethod(workspace, "__namecall", function(self, ...)
         local method = getnamecallmethod()
@@ -1575,10 +1536,8 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- AIMBOT: run each frame (no-op if BulletFollow is active)
     runAimbotFrame()
 
-    -- Restore camera if NO combat feature is active
     if not COMBAT.AimbotEnabled and not COMBAT.BulletFollowEnabled then
         if camera.CameraType == Enum.CameraType.Scriptable then
             camera.CameraType = Enum.CameraType.Custom
@@ -1849,10 +1808,8 @@ createInput(grab,  "Target Val",       28, 0, function(v) G.TargetValue = parseS
 createInput(grab,  "Target Luck",      56, 0, function(v) G.TargetLuck  = parseStatValue(v) end)
 createInput(grab,  "Target Size",      84, 0, function(v) G.TargetSize  = parseStatValue(v) end)
 
--- COMBAT GROUP — split into two separate toggles
 local combat = createCollapsibleGroup(rightGroupFrame, "Combat", 0, 200)
 
--- Info label to show arbitration status
 local infoLabel = Instance.new("TextLabel", combat)
 infoLabel.Size = UDim2.new(1, 0, 0, 18)
 infoLabel.Position = UDim2.new(0, 0, 0, 0)
@@ -1862,6 +1819,20 @@ infoLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
 infoLabel.Font = Enum.Font.GothamMedium
 infoLabel.TextSize = 9
 infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local function updateCombatInfo()
+    local active = getActiveCombatFeature()
+    if active == "BulletFollow" then
+        infoLabel.Text = "▸ Bullet Follow active (Aimbot paused)"
+        infoLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
+    elseif active == "Aimbot" then
+        infoLabel.Text = "▸ Aimbot active"
+        infoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+    else
+        infoLabel.Text = "Only one active at a time"
+        infoLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
+    end
+end
 
 createToggle(combat, "Advanced Aimbot",        22, function(s)
     G.GR33D.Toggle("Aimbot", s)
@@ -1878,7 +1849,6 @@ createToggle(combat, "Slim Hitbox",            106, function(s) G.GR33D.Toggle("
 createToggle(combat, "Anti-Knockback",         134, function(s) G.GR33D.Toggle("AntiMelee", s) end)
 createToggle(combat, "Rapid Fire",             162, function(s) G.GR33D.Toggle("RapidFire", s) end)
 
--- Utilities moved to their own group
 local utilities = createCollapsibleGroup(rightGroupFrame, "Utilities", 208, 108)
 createToggle(utilities, "Egg Name ESP",   0,  function(s) G.GR33D.Toggle("EggESP", s) end)
 createToggle(utilities, "Prompt Extender", 28, function(s) G.GR33D.Toggle("PromptExtender", s) end)
@@ -1908,21 +1878,6 @@ end)
 createButton(tpGroup, "Rejoin Server",        140, Color3.fromRGB(52, 73, 94),  function()
     TeleportService:TeleportToPlaceInstance(PlaceId, game.JobId, player)
 end)
-
--- Combat arbitration status updater
-function updateCombatInfo()
-    local active = getActiveCombatFeature()
-    if active == "BulletFollow" then
-        infoLabel.Text = "▸ Bullet Follow active (Aimbot paused)"
-        infoLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
-    elseif active == "Aimbot" then
-        infoLabel.Text = "▸ Aimbot active"
-        infoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
-    else
-        infoLabel.Text = "Only one active at a time"
-        infoLabel.TextColor3 = Color3.fromRGB(150, 150, 170)
-    end
-end
 
 local dragging, dragStart, startPosition
 topBar.InputBegan:Connect(function(input)
