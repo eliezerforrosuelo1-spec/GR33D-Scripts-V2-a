@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V6.01
--- STEALTH-HARDENED — ALL FEATURES REBUILT
+-- GR33D SCRIPTS: SILENT LOAD EDITION V6.02
+-- ZERO HOOKS AT LOAD — NOTHING TO DETECT
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -29,7 +29,6 @@ local TeleportService  = game:GetService("TeleportService")
 local HttpService      = game:GetService("HttpService")
 local VirtualUser      = game:GetService("VirtualUser")
 local TweenService     = game:GetService("TweenService")
-local StarterGui       = game:GetService("StarterGui")
 local CoreGui          = game:GetService("CoreGui")
 
 local player = Players.LocalPlayer
@@ -42,25 +41,20 @@ end
 local camera  = Workspace.CurrentCamera
 local PlaceId = game.PlaceId
 
--- ============================================================
--- ========== CONFIG =========================================
--- ============================================================
+-- ========== CONFIG ==========
 local CONFIG = {
-    -- Movement
     FLY_SPEED             = 50,
     runSpeedValue         = 64,
     jumpPowerValue        = 100,
     TRAVEL_SPEED          = 40,
     BURST_MODE            = false,
 
-    -- Combat
     BULLET_FOLLOW_RANGE   = 500,
     AIMBOT_RANGE          = 300,
     AIMBOT_SMOOTHNESS     = 0.15,
     AIMBOT_FOV            = 60,
     AIMBOT_TARGET_PART    = "Head",
 
-    -- Teleport
     TP_CHUNKS             = 6,
     TP_CHUNK_DELAY        = 0.03,
     TP_JITTER             = 1.5,
@@ -71,31 +65,23 @@ local CONFIG = {
     USE_FAST_TELEPORT     = false,
     AUTO_STEAL_ENABLED    = false,
 
-    -- Anti-knockback dampener
-    KNOCKBACK_FACTOR      = 0.7,   -- reduce to 70% per frame (30% per frame loss)
-    KNOCKBACK_FRAMES      = 4,     -- over 4 frames
-    KNOCKBACK_DELAY       = 0.03,  -- wait 2 frames before starting
-    KNOCKBACK_THRESHOLD   = 35,    -- only trigger if speed > 35
-    KNOCKBACK_IDLE_MAX    = 25,    -- previous speed must be < 25 (we were idle)
+    KNOCKBACK_FACTOR      = 0.7,
+    KNOCKBACK_FRAMES      = 4,
+    KNOCKBACK_DELAY       = 0.03,
+    KNOCKBACK_THRESHOLD   = 35,
+    KNOCKBACK_IDLE_MAX    = 25,
 
-    -- Jump
     JUMP_BOOST_DURATION   = 0.5,
     DOUBLE_TAP_WINDOW     = 0.35,
     FLY_DEBOUNCE          = 0.3,
 
-    -- Anti-cheat
-    AC_HOOK_ENABLED       = true,
-    SYNC_INTERCEPT        = true,
-    NOTIFICATION_WATCH    = true,
-    SILENCE_GAME_ERRORS   = true,
+    KICK_GUARD_ENABLED    = false,  -- OPT-IN, off by default
 }
 
 local defaultJumpPower    = 50
 local defaultWalkSpeed    = 16
 
--- ============================================================
--- ========== STATE ==========================================
--- ============================================================
+-- ========== STATE ==========
 local cachedPrompts  = {}
 local cachedMonsters = {}
 local notificationLog = {}
@@ -129,7 +115,7 @@ local rapidFireEnabled      = false
 local eggEspEnabled         = false
 local promptExtenderEnabled = false
 local antiAfkEnabled        = false
-local antiMeleeEnabled      = false   -- now = anti-knockback dampener
+local antiMeleeEnabled      = false
 local isMinimized           = false
 
 local COMBAT = {
@@ -165,257 +151,91 @@ local jumpImpulseTime       = 0
 
 local isTeleporting         = false
 
--- Anti-knockback dampener state
 local lastHorizontalSpeed   = 0
 local knockbackInProgress   = false
 
 -- ============================================================
--- ========== ANTI-CHEAT HOOK (STEALTH-HARDENED) =============
+-- ========== NO HOOKS AT LOAD ===============================
 -- ============================================================
--- Improvements over V6.00:
---   1. Never blocks remotes that might be legit (empty blocklist)
---   2. Instead of blocking, silently lets suspicious calls through
---      but logs them (so we don't arouse suspicion by returning nil)
---   3. Only blocks kick/ban/report on self (safe targets)
---   4. Hide hook traces from scanners by masking closure env
+-- V6.02 has NO hooks installed at startup.
+-- The metatable hook is opt-in via "Kick Guard" toggle.
+-- The state sync bypass is REMOVED (it was the biggest flag).
+-- The StarterGui.__index notification hook is REMOVED.
+-- The ScriptContext.Error listener is REMOVED.
 -- ============================================================
 
 local hooks = {
-    anticheat    = nil,
-    bulletFollow = nil,
+    anticheat = nil,
 }
 
-local function installAntiCheatHook()
+-- Opt-in kick guard (OFF by default)
+local function installKickGuard()
     if hooks.anticheat then return end
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
     setreadonly(mt, false)
-
     local oldNamecall = mt.__namecall
-    local oldNewIndex = mt.__newindex
-    local oldIndex = mt.__index
-
     mt.__namecall = newcclosure(function(self, ...)
         local method = getnamecallmethod()
-
-        -- Block ONLY safe-target methods (self-targeting only)
         if (method == "Kick" or method == "kick") and self == player then
-            return nil
-        end
-        if method:lower():find("ban") and self == player then
             return nil
         end
         if (method == "ReportAbuse" or method == "reportAbuse") and self == game.Players then
             return nil
         end
-        if method == "SaveInstance" then
-            return nil
-        end
-
-        -- Everything else passes through normally.
-        -- We do NOT block anti-cheat remotes anymore — that was risky.
-        -- Blocking a legit remote returns nil → downstream code errors
-        -- → suspicious. Letting it through is safer.
         return oldNamecall(self, ...)
     end)
-
-    -- Protect our character's humanoid from external writes
-    mt.__newindex = newcclosure(function(t, k, v)
-        if not checkcaller() and typeof(t) == "Instance" then
-            if t:IsA("Humanoid") then
-                local char = player.Character
-                if char and t:IsDescendantOf(char) then
-                    if k == "MaxHealth" and megaHealthEnabled and v < 900000000 then
-                        return
-                    end
-                    if k == "Health" and (megaHealthEnabled or godModeEnabled) then
-                        return
-                    end
-                end
-            end
-        end
-        return oldNewIndex(t, k, v)
-    end)
-
-    -- Hide our GUI from scans
-    mt.__index = newcclosure(function(t, k)
-        if typeof(t) == "Instance" then
-            if k == "DevPanelGui" and not checkcaller() then
-                return nil
-            end
-        end
-        return oldIndex(t, k)
-    end)
-
     setreadonly(mt, true)
     hooks.anticheat = oldNamecall
-    print("[GR33D] ✓ Anti-cheat hook installed (non-intrusive mode)")
+    print("[GR33D] ⚠️ Kick Guard ON — this installs a metatable hook")
 end
 
--- ============================================================
--- ========== GAME ERROR SILENCER ============================
--- ============================================================
-local silencedErrors = {}
-
-local function installErrorSilencer()
-    if not CONFIG.SILENCE_GAME_ERRORS then return end
-    pcall(function()
-        local ScriptContext = game:GetService("ScriptContext")
-        ScriptContext.Error:Connect(function(message, stackTrace, script)
-            if not script then return end
-            local scriptName = tostring(script)
-            if scriptName:find("GR33D") or scriptName:find("DevPanel") then
-                return
-            end
-            if message:find("attempt to compare number <= nil")
-               or message:find("attempt to index nil")
-               or message:find("attempt to call a nil value")
-               or message:find("HeartbeatUpdate")
-               or message:find("attempt to perform arithmetic") then
-                if not silencedErrors[message] then
-                    silencedErrors[message] = true
-                end
-            end
-        end)
-        print("[GR33D] ✓ Game error silencer installed")
-    end)
-end
-
--- ============================================================
--- ========== STATE SYNC INTERCEPTOR =========================
--- ============================================================
-local SYNC_REMOTES = {
-    ["State_SyncPrivate"] = true,
-    ["State_SyncShared"]  = true,
-}
-
-local BLOCKED_SYNC_KEYS = {
-    "reset", "resetPosition", "warpToSpawn", "warptospawn",
-    "restoreWalls", "restorewalls", "restore",
-    "outOfBounds", "outofbounds", "oosync", "syncReset",
-    "teleport", "kick", "ban", "flag", "violation",
-    "restrict", "deny", "invalid",
-    "antiCheat", "anticheat", "acFlag", "acReset",
-}
-
-local function shouldStripKey(key)
-    if type(key) ~= "string" then return false end
-    local lower = key:lower()
-    for _, blocked in ipairs(BLOCKED_SYNC_KEYS) do
-        if key == blocked then return true end
-    end
-    if lower:find("reset") or lower:find("violation")
-       or lower:find("outofbounds") or lower:find("warptospawn") then
-        return true
-    end
-    return false
-end
-
-local function sanitizeSyncPayload(value, depth)
-    depth = depth or 0
-    if depth > 12 then return value end
-    if type(value) ~= "table" then return value end
-    local cleaned = {}
-    for k, v in pairs(value) do
-        if not shouldStripKey(k) then
-            cleaned[k] = sanitizeSyncPayload(v, depth + 1)
-        end
-    end
-    return cleaned
-end
-
-local function sanitizeValue(v)
-    if type(v) == "string" then
-        local lower = v:lower()
-        if lower == "reset" or lower == "violation"
-           or lower == "outofbounds" or lower == "warptospawn"
-           or lower == "restorewalls" then
-            return nil
-        end
-        return v
-    elseif type(v) == "table" then
-        return sanitizeSyncPayload(v)
-    end
-    return v
-end
-
-local function reinstallSyncHooks()
-    if not CONFIG.SYNC_INTERCEPT then return end
-    for _, obj in ipairs(game:GetDescendants()) do
-        if obj:IsA("RemoteEvent") and SYNC_REMOTES[obj.Name] then
-            local signal = obj.OnClientEvent
-            local existingFns = {}
-            local existingConns = getconnections(signal)
-            for _, conn in ipairs(existingConns) do
-                if conn.Function then
-                    table.insert(existingFns, conn.Function)
-                end
-            end
-            for _, conn in ipairs(existingConns) do
-                pcall(function() conn:Disconnect() end)
-            end
-            for _, fn in ipairs(existingFns) do
-                signal:Connect(function(...)
-                    local args = {...}
-                    for i, arg in ipairs(args) do
-                        args[i] = sanitizeValue(arg)
-                    end
-                    local cleanArgs = {}
-                    for i = 1, select("#", ...) do
-                        cleanArgs[i] = args[i]
-                    end
-                    pcall(fn, table.unpack(cleanArgs, 1, select("#", ...)))
-                end)
-            end
-            print("[GR33D] ✓ Hooked " .. obj.Name .. " (" .. #existingFns .. " handlers)")
-        end
-    end
-end
-
--- ============================================================
--- ========== NOTIFICATION WATCHER ===========================
--- ============================================================
-local function installNotificationWatcher()
-    if not CONFIG.NOTIFICATION_WATCH then return end
-    local mt = getrawmetatable and getrawmetatable(StarterGui)
+local function removeKickGuard()
+    if not hooks.anticheat then return end
+    local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
-    pcall(function()
-        setreadonly(mt, false)
-        local oldIndex = mt.__index
-        mt.__index = newcclosure(function(t, k)
-            if k == "SetCore" then
-                return function(_, coreName, args)
-                    if coreName == "SendNotification" and type(args) == "table" then
-                        local title = tostring(args.Title or "")
-                        local text = tostring(args.Text or "")
-                        local combined = (title .. " " .. text):lower()
-                        table.insert(notificationLog, {time = tick(), title = title, text = text})
+    setreadonly(mt, false)
+    mt.__namecall = hooks.anticheat
+    setreadonly(mt, true)
+    hooks.anticheat = nil
+    print("[GR33D] Kick Guard OFF")
+end
 
-                        if combined:find("egg") or combined:find("spawn")
-                           or combined:find("divine") or combined:find("secret")
-                           or combined:find("brainrot") then
-                            print("[NOTIFY] " .. title .. " | " .. text)
-                            if CONFIG.AUTO_STEAL_ENABLED then
-                                task.spawn(function()
-                                    task.wait(0.5)
-                                    G.StealAndReturn()
-                                end)
-                            end
+-- ============================================================
+-- ========== PASSIVE NOTIFICATION SCAN =====================
+-- ============================================================
+-- Instead of hooking StarterGui.__index (detectable),
+-- we scan for egg notifications passively.
+-- ============================================================
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if CONFIG.AUTO_STEAL_ENABLED then
+            for _, obj in ipairs(protectedParent:GetDescendants()) do
+                if obj:IsA("TextLabel") then
+                    local text = (obj.Text or ""):lower()
+                    if text:find("egg") and (text:find("spawn") or text:find("secret") or text:find("divine")) then
+                        if not notificationLog[text] or (tick() - notificationLog[text]) > 30 then
+                            notificationLog[text] = tick()
+                            print("[NOTIFY] " .. obj.Text)
+                            task.spawn(function()
+                                task.wait(0.5)
+                                G.StealAndReturn()
+                            end)
                         end
                     end
-                    return oldIndex(t, k)(t, coreName, args)
                 end
             end
-            return oldIndex(t, k)
-        end)
-        setreadonly(mt, true)
-        print("[GR33D] ✓ Notification watcher installed")
-    end)
-end
+        end
+    end
+end)
 
 -- ============================================================
 -- ========== BULLET FOLLOW (LAZY HOOK) ======================
 -- ============================================================
+local hooks_bulletFollow = nil
+
 local function getBulletFollowTarget(pos)
     if not pos then pos = camera.CFrame.Position end
     local bestTarget, bestDist = nil, CONFIG.BULLET_FOLLOW_RANGE
@@ -495,7 +315,7 @@ local function tryRedirectFireArgs(args)
 end
 
 local function installBulletFollowHook()
-    if hooks.bulletFollow then return end
+    if hooks_bulletFollow then return end
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
     setreadonly(mt, false)
@@ -531,31 +351,22 @@ local function installBulletFollowHook()
         return oldNamecall(self, ...)
     end)
     setreadonly(mt, true)
-    hooks.bulletFollow = oldNamecall
-    print("[GR33D] ✓ Bullet Follow hook installed")
+    hooks_bulletFollow = oldNamecall
 end
 
 local function removeBulletFollowHook()
-    if not hooks.bulletFollow then return end
+    if not hooks_bulletFollow then return end
     local mt = getrawmetatable and getrawmetatable(game)
     if not mt then return end
     setreadonly(mt, false)
-    mt.__namecall = hooks.bulletFollow
+    mt.__namecall = hooks_bulletFollow
     setreadonly(mt, true)
-    hooks.bulletFollow = nil
-    print("[GR33D] Bullet Follow hook removed")
+    hooks_bulletFollow = nil
 end
 
 -- ============================================================
--- ========== PRO ANTI-KNOCKBACK (DELAYED DAMPENER) ==========
+-- ========== ANTI-KNOCKBACK DAMPENER ========================
 -- ============================================================
--- This is the technique the "amazing script" used:
---   1. Detect sudden velocity spike (knockback)
---   2. Wait 2 frames (server registers the initial velocity)
---   3. Reduce velocity over 4 frames (looks like friction decay)
---   4. Server sees normal momentum loss, not manipulation
--- ============================================================
-
 local function runKnockbackDampener()
     if knockbackInProgress then return end
     if not rootPart or not humanoid then return end
@@ -565,18 +376,13 @@ local function runKnockbackDampener()
     local vel = rootPart.AssemblyLinearVelocity
     local horizontalSpeed = math.sqrt(vel.X * vel.X + vel.Z * vel.Z)
 
-    -- Detect spike: speed went from low (walking/idle) to high (knockback)
     local isSpike = horizontalSpeed > CONFIG.KNOCKBACK_THRESHOLD
                     and lastHorizontalSpeed < CONFIG.KNOCKBACK_IDLE_MAX
     local isIdle = humanoid.MoveDirection.Magnitude < 0.1
 
     if isIdle and isSpike then
         knockbackInProgress = true
-
-        -- Step 1: wait for server to see the initial knockback
         task.wait(CONFIG.KNOCKBACK_DELAY)
-
-        -- Step 2: reduce gradually
         task.spawn(function()
             for frame = 1, CONFIG.KNOCKBACK_FRAMES do
                 task.wait()
@@ -612,9 +418,7 @@ local function isGrounded()
     return result ~= nil
 end
 
--- ============================================================
--- ========== FLY ============================================
--- ============================================================
+-- ========== FLY ==========
 function setFlying(state)
     if not rootPart or not humanoid then return end
     if not state then flyDebounceUntil = tick() + CONFIG.FLY_DEBOUNCE end
@@ -677,9 +481,7 @@ UserInputService.JumpRequest:Connect(function()
     lastJumpReqTime = currentTime
 end)
 
--- ============================================================
--- ========== PRO STEALTH SPEED ==============================
--- ============================================================
+-- ========== PRO SPEED ==========
 local function setupSpeedVelocity()
     if not rootPart then return end
     if rootPart:FindFirstChild("Gr33dSpeedAtt") then rootPart.Gr33dSpeedAtt:Destroy() end
@@ -715,9 +517,7 @@ local function teardownSpeedVelocity()
     lastSpeedCFrame = nil
 end
 
--- ============================================================
--- ========== PRO TRAVEL TWEEN ===============================
--- ============================================================
+-- ========== TRAVEL TWEEN ==========
 local function travelTween(targetCFrame)
     if not rootPart or not character or not humanoid then return false end
     local startCFrame = rootPart.CFrame
@@ -785,9 +585,7 @@ local function travelTween(targetCFrame)
     return true
 end
 
--- ============================================================
--- ========== PRO TELEPORT ===================================
--- ============================================================
+-- ========== PRO TELEPORT ==========
 local function proZoneTeleport(targetCFrame)
     if isTeleporting then return false end
     if not character or not rootPart or not humanoid then return false end
@@ -882,9 +680,7 @@ local function smartMove(targetCFrame)
     end
 end
 
--- ============================================================
--- ========== UI HOOKS =======================================
--- ============================================================
+-- ========== UI HOOKS ==========
 G.GR33D = G.GR33D or {}
 G.GR33D.Toggle = function(name, value)
     if name == "Noclip" then G.NoclipActive = value
@@ -947,7 +743,6 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "AntiAFK" then antiAfkEnabled = value
     elseif name == "AntiMelee" then
         antiMeleeEnabled = value
-        -- Reset dampener state
         if not value then
             lastHorizontalSpeed = 0
             knockbackInProgress = false
@@ -955,19 +750,11 @@ G.GR33D.Toggle = function(name, value)
     end
 end
 
-installAntiCheatHook()
-installErrorSilencer()
+G.GR33D.ToggleKickGuard = function(state)
+    if state then installKickGuard() else removeKickGuard() end
+end
 
-task.spawn(function()
-    task.wait(2)
-    pcall(reinstallSyncHooks)
-end)
-
-installNotificationWatcher()
-
--- ============================================================
--- ========== ANTI-AFK =======================================
--- ============================================================
+-- ========== ANTI-AFK ==========
 player.Idled:Connect(function()
     if antiAfkEnabled then
         pcall(function()
@@ -989,9 +776,7 @@ pcall(function()
     end
 end)
 
--- ============================================================
--- ========== STATS PARSING ==================================
--- ============================================================
+-- ========== STATS PARSING ==========
 local function parseStatValue(input)
     if type(input) == "number" then return input end
     if type(input) ~= "string" then return 0 end
@@ -1033,8 +818,7 @@ local function parseWeightValue(input)
     elseif upperInput:find("M") then multiplier = 1e6
     elseif upperInput:find("K") then multiplier = 1e3
     end
-    num = num * multiplier
-    if upperInput:find("TON") then return num * 1000
+    num = num * multiplier    if upperInput:find("TON") then return num * 1000
     elseif upperInput:find("KG") then return num
     elseif upperInput:find("G") and not upperInput:find("KG") then return num / 1000
     end
@@ -1070,9 +854,7 @@ local function isValidGrabPrompt(prompt)
     return true
 end
 
--- ============================================================
--- ========== CACHING LOOPS ==================================
--- ============================================================
+-- ========== CACHING LOOPS ==========
 task.spawn(function()
     while true do
         if COMBAT.AimbotEnabled or COMBAT.BulletFollowEnabled then
@@ -1198,9 +980,7 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- ========== STAT SCANNING ==================================
--- ============================================================
+-- ========== STAT SCANNING ==========
 local function scanAndExtractStats(targetObj)
     local statData = { Value = 0, Luck = 0, Size = 0, Weight = 0, RarityScore = 0 }
     if not targetObj then return statData end
@@ -1266,9 +1046,7 @@ local function scanAndExtractStats(targetObj)
     return statData
 end
 
--- ============================================================
--- ========== AUTO-GRAB ======================================
--- ============================================================
+-- ========== AUTO-GRAB ==========
 local function cleanupPromptCache()
     for i = #cachedPrompts, 1, -1 do
         if not cachedPrompts[i] or not cachedPrompts[i].Parent then
@@ -1296,9 +1074,7 @@ local function executeAutoGrabRoutine()
     end
 end
 
--- ============================================================
--- ========== HIGHEST VALUE FINDER ===========================
--- ============================================================
+-- ========== HIGHEST VALUE FINDER ==========
 local function parseMoneyFromModel(model)
     if not model then return 0 end
     local best = 0
@@ -1372,9 +1148,7 @@ local function findHighestValue()
     return highestItem, highestPart, highestPrompt, highestValue
 end
 
--- ============================================================
--- ========== TP FUNCTIONS ===================================
--- ============================================================
+-- ========== TP FUNCTIONS ==========
 G.SaveLocation = function()
     if rootPart then
         savedMapCFrame = rootPart.CFrame
@@ -1414,9 +1188,7 @@ G.TeleportToHighestValue = function()
     end
 end
 
--- ============================================================
--- ========== STEAL & RETURN =================================
--- ============================================================
+-- ========== STEAL & RETURN ==========
 G.StealAndReturn = function()
     if not rootPart then warn("⚠️ No character"); return end
     if isTeleporting then warn("⚠️ Already busy"); return end
@@ -1503,9 +1275,7 @@ G.GR33D.TeleportToSpawn        = G.TeleportToSpawn
 G.GR33D.TeleportToHighestValue = G.TeleportToHighestValue
 G.GR33D.StealAndReturn         = G.StealAndReturn
 
--- ============================================================
--- ========== NOCLIP =========================================
--- ============================================================
+-- ========== NOCLIP ==========
 RunService.Stepped:Connect(function()
     if not G.NoclipActive then return end
     local char = character or player.Character
@@ -1517,9 +1287,7 @@ RunService.Stepped:Connect(function()
     end
 end)
 
--- ============================================================
--- ========== GOD MODE =======================================
--- ============================================================
+-- ========== GOD MODE ==========
 function makeInvisible(char)
     if not char then return end
     originalCharacterTransparencies = {}
@@ -1557,9 +1325,7 @@ function makeVisible(char)
     if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
 end
 
--- ============================================================
--- ========== RAPID FIRE =====================================
--- ============================================================
+-- ========== RAPID FIRE ==========
 local COOLDOWN_KEYWORDS = {
     "cooldown", "delay", "fire", "rate", "speed", "mine", "dig",
     "swing", "hit", "reload", "firedelay"
@@ -1601,9 +1367,7 @@ function monitorTool(tool)
     end)
 end
 
--- ============================================================
--- ========== BULLET FOLLOW PROJECTILES ======================
--- ============================================================
+-- ========== BULLET FOLLOW PROJECTILES ==========
 local trackedProjectiles = {}
 
 local function shouldTrackProjectile(part)
@@ -1653,9 +1417,7 @@ Workspace.DescendantAdded:Connect(function(desc)
     end
 end)
 
--- ============================================================
--- ========== STATE REAPPLICATION ============================
--- ============================================================
+-- ========== STATE REAPPLICATION ==========
 local function reapplyAllStates(char)
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -1693,9 +1455,7 @@ local function reapplyAllStates(char)
     jumpImpulseTime = 0
 end
 
--- ============================================================
--- ========== CHARACTER SETUP ================================
--- ============================================================
+-- ========== CHARACTER SETUP ==========
 local function setupCharacter(char)
     character = char
     rootPart  = char:WaitForChild("HumanoidRootPart")
@@ -1764,8 +1524,6 @@ player.CharacterAdded:Connect(function(newChar)
     if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
     trackedProjectiles = {}
     setupCharacter(newChar)
-    task.wait(1)
-    pcall(reinstallSyncHooks)
 end)
 
 do
@@ -1786,19 +1544,15 @@ if backpack then
     backpack.ChildAdded:Connect(function(child) monitorTool(child) end)
 end
 
--- ============================================================
--- ========== MAIN HEARTBEAT LOOP ============================
--- ============================================================
+-- ========== MAIN LOOPS ==========
 RunService.Heartbeat:Connect(function(deltaTime)
     if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
     if isTeleporting then return end
 
-    -- Anti-knockback dampener
     if antiMeleeEnabled and rootPart and humanoid then
         runKnockbackDampener()
     end
 
-    -- Pro Speed
     if humanoid and humanoid.Health > 0 then
         if runSpeedEnabled and not isFlying then
             if humanoid.WalkSpeed ~= defaultWalkSpeed then
@@ -1885,7 +1639,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Pro Jump
     if humanoid and humanoid.Health > 0 and rootPart then
         if jumpEnabled then
             if humanoid.UseJumpPower and humanoid.JumpPower ~= defaultJumpPower then
@@ -1925,7 +1678,6 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
-    -- Passive features
     if rapidHealingEnabled and humanoid and humanoid.Health > 0
        and humanoid.Health < humanoid.MaxHealth then
         local healAmount = humanoid.MaxHealth * 3 * deltaTime
@@ -2011,9 +1763,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
     end
 end)
 
--- ============================================================
--- ========== FLIGHT RENDER ==================================
--- ============================================================
+-- ========== FLIGHT RENDER ==========
 RunService.RenderStepped:Connect(function(dt)
     if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
     if isTeleporting then return end
@@ -2047,9 +1797,7 @@ task.spawn(function()
     end
 end)
 
--- ============================================================
--- ========== USER INTERFACE =================================
--- ============================================================
+-- ========== USER INTERFACE ==========
 local viewport = workspace.CurrentCamera.ViewportSize
 local isMobileScreen = viewport.X < 700
 local PANEL_W = isMobileScreen and math.min(320, math.max(220, viewport.X - 40)) or 360
@@ -2094,7 +1842,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V6.01"
+titleLabel.Text = "GR33D Scripts V6.02"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -2458,27 +2206,23 @@ getgenv().GetConfig = function() return CONFIG end
 
 print("")
 print("╔══════════════════════════════════════════════╗")
-print("║  GR33D Scripts V6.01 — STEALTH-HARDENED       ║")
-print("║  All features audited for detection risk     ║")
+print("║  GR33D Scripts V6.02 — SILENT LOAD            ║")
+print("║  ZERO hooks installed at load                 ║")
 print("╚══════════════════════════════════════════════╝")
 print("")
-print("✓ Non-intrusive anti-cheat hook")
-print("  - Blocks ONLY kick/ban/report on self")
-print("  - Doesn't block game remotes (was causing kicks)")
-print("✓ Game error silencer")
-print("✓ Notification watcher")
-print("✓ State sync interceptor")
-print("✓ Pro Speed: 5-layer humanization")
-print("✓ Anti-Knockback: DELAYED DAMPENER (server-safe)")
-print("  - Detects spike → waits 2 frames → reduces over 4 frames")
-print("  - Server sees friction decay, not manipulation")
-print("✓ Travel Tween: server-safe movement")
-print("✓ Steal & Return with hold-grab")
-print("✓ Mobile-fit UI + hardened drag")
+print("✓ NO metatable hooks at load")
+print("✓ NO getconnections at load")
+print("✓ NO StarterGui.__index hook")
+print("✓ NO ScriptContext.Error listener")
+print("")
+print("✓ All features work — hooks install on toggle only")
+print("")
+print("⚠️ Kick Guard is OPT-IN — metatable hook = detectable")
+print("⚠️ State Sync bypass REMOVED (was the biggest detection)")
 print("")
 print("Commands:")
 print("  getgenv().ResetUI()          - re-center UI")
+print("  getgenv().ToggleKickGuard(true) - enable kick block (risky)")
 print("  getgenv().SetMode(true)      - fast teleport mode")
-print("  getgenv().SetTravelSpeed(60) - 60 studs/s travel")
-print("  getgenv().GetConfig()        - view config")
+print("  getgenv().SetTravelSpeed(60) - travel speed")
 print("")
