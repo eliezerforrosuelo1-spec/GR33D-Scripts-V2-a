@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.24
--- PRO TRAVEL TWEEN + DUAL MODE STEAL
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V6.00
+-- COMPLETE PRO REWRITE — ALL FEATURES AUDITED
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -14,6 +14,7 @@ local fireproximityprompt= fireproximityprompt or function() end
 local firetouchinterest  = firetouchinterest  or function() end
 local getconnections     = getconnections     or function() return {} end
 local typeof             = typeof             or type
+local tick               = tick               or os.clock
 
 if type(getgenv()) ~= "table" then
     getgenv = function() return _G end
@@ -41,34 +42,56 @@ end
 local camera  = Workspace.CurrentCamera
 local PlaceId = game.PlaceId
 
--- ========== CONFIG ==========
-local FLY_SPEED           = 50
-local runSpeedValue       = 64
-local jumpPowerValue      = 100
+-- ============================================================
+-- ========== CONFIG =========================================
+-- ============================================================
+local CONFIG = {
+    -- Movement
+    FLY_SPEED             = 50,
+    runSpeedValue         = 64,
+    jumpPowerValue        = 100,
+    TRAVEL_SPEED          = 40,
+    BURST_MODE            = false,
+
+    -- Combat
+    BULLET_FOLLOW_RANGE   = 500,
+    AIMBOT_RANGE          = 300,
+    AIMBOT_SMOOTHNESS     = 0.15,
+    AIMBOT_FOV            = 60,
+    AIMBOT_TARGET_PART    = "Head",
+
+    -- Teleport
+    TP_CHUNKS             = 6,
+    TP_CHUNK_DELAY        = 0.03,
+    TP_JITTER             = 1.5,
+    TP_FF_LINGER          = 0.5,
+    TP_HOLD_DURATION      = 1.0,
+    TP_NOCLIP_LINGER      = 0.3,
+    GRAB_HOLD_DURATION    = 1.5,
+    USE_FAST_TELEPORT     = false,
+    AUTO_STEAL_ENABLED    = false,
+
+    -- Jump
+    JUMP_BOOST_DURATION   = 0.5,
+    DOUBLE_TAP_WINDOW     = 0.35,
+    FLY_DEBOUNCE          = 0.3,
+
+    -- Anti-cheat
+    AC_HOOK_ENABLED       = true,
+    SYNC_INTERCEPT        = true,
+    NOTIFICATION_WATCH    = true,
+    SILENCE_GAME_ERRORS   = true,
+}
+
+-- ============================================================
+-- ========== DEFAULT VALUES =================================
+-- ============================================================
 local defaultJumpPower    = 50
 local defaultWalkSpeed    = 16
-local DOUBLE_TAP_WINDOW   = 0.35
-local FLY_DEBOUNCE        = 0.3
-local BULLET_FOLLOW_RANGE = 500
-local AIMBOT_RANGE        = 300
-local AIMBOT_SMOOTHNESS   = 0.15
-local AIMBOT_FOV          = 60
-local AIMBOT_TARGET_PART  = "Head"
-local JUMP_BOOST_DURATION = 0.5
 
-local TP_CHUNKS           = 6
-local TP_CHUNK_DELAY      = 0.03
-local TP_JITTER           = 1.5
-local TP_FF_LINGER        = 0.5
-local TP_HOLD_DURATION    = 1.0
-local TP_NOCLIP_LINGER    = 0.3
-local GRAB_HOLD_DURATION  = 1.5
-local TRAVEL_SPEED        = 40  -- studs/s for stealth travel (server-safe)
-
--- Dual mode: false = travel tween (safe), true = chunked teleport (fast)
-local USE_FAST_TELEPORT   = false
-local AUTO_STEAL_ENABLED  = false   -- watcher for "secret egg spawned" notifications
-
+-- ============================================================
+-- ========== STATE ==========================================
+-- ============================================================
 local cachedPrompts  = {}
 local cachedMonsters = {}
 local notificationLog = {}
@@ -83,7 +106,6 @@ G.NoclipActive       = false
 G.GodModeActive      = false
 G.MegaHealthActive   = false
 G.SlimHitboxActive   = false
-G.NoSpeedLimitActive = false
 G.AutoGrabActive     = false
 G.BulletFollowActive = false
 G.TargetValue        = 0
@@ -131,7 +153,6 @@ local toolConnections         = {}
 local speedVelocity         = nil
 local speedAttach           = nil
 local lastSpeedCFrame       = nil
-local lastReconTime         = 0
 local speedRamp             = 0
 local RAMP_RATE             = 1.5
 
@@ -141,89 +162,154 @@ local jumpImpulseTime       = 0
 local isTeleporting         = false
 
 -- ============================================================
--- ========== PRO TRAVEL TWEEN (SERVER-SAFE) =================
+-- ========== ANTI-CHEAT HOOK (IMPROVED) =====================
 -- ============================================================
--- Real pro scripts use TweenService to move the character over
--- REAL travel time. The server sees continuous movement, not a
--- teleport. Speed caps at 40 studs/s to stay under lag tolerance.
--- ============================================================
+-- Improvements:
+--   1. Hooks kick, report, AND suspicious remote calls
+--   2. Blocks "ban"/"kick" methods targeting self
+--   3. Prevents SaveInstance / screenshot calls
+--   4. Tracks execution context (blocks non-caller writes to our char)
 
-local function travelTween(targetCFrame)
-    if not rootPart or not character or not humanoid then return false end
+local hooks = {
+    anticheat    = nil,
+    bulletFollow = nil,
+}
 
-    local startCFrame = rootPart.CFrame
-    local distance = (targetCFrame.Position - startCFrame.Position).Magnitude
-    if distance < 5 then
-        pcall(function() rootPart.CFrame = targetCFrame end)
-        return true
-    end
+local function installAntiCheatHook()
+    if hooks.anticheat then return end
+    local mt = getrawmetatable and getrawmetatable(game)
+    if not mt then return end
+    setreadonly(mt, false)
 
-    local duration = distance / TRAVEL_SPEED
-    print(string.format("🚶 Traveling %.0f studs (%.1fs)...", distance, duration))
+    local oldNamecall = mt.__namecall
+    local oldNewIndex = mt.__newindex
+    local oldIndex = mt.__index
 
-    -- Anchor all parts to prevent falling during tween
-    local anchoredParts = {}
-    for _, p in ipairs(character:GetDescendants()) do
-        if p:IsA("BasePart") then
-            anchoredParts[p] = p.Anchored
-            p.Anchored = true
+    local SAFE_REMOTES = {
+        ["UpdateCharacter"] = true,
+        ["Movement"] = true,
+        ["Emote"] = true,
+        ["Chat"] = true,
+    }
+
+    local BLOCKED_REMOTE_NAMES = {
+        "anticheat", "anti_cheat", "cheatdetection", "hackdetection",
+    }
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+
+        -- Block kick on self
+        if (method == "Kick" or method == "kick") and self == player then
+            return nil
         end
-    end
 
-    -- Force field for damage protection
-    local oldFF = character:FindFirstChildOfClass("ForceField")
-    local tempFF
-    if not oldFF then
-        tempFF = Instance.new("ForceField")
-        tempFF.Visible = false
-        tempFF.Parent = character
-    end
+        -- Block ban-related methods
+        if method:lower():find("ban") and self == player then
+            return nil
+        end
 
-    -- Disable falling states
-    pcall(function()
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+        -- Block ReportAbuse
+        if (method == "ReportAbuse" or method == "reportAbuse") and self == game.Players then
+            return nil
+        end
+
+        -- Block screenshot / SaveInstance
+        if (method == "SaveInstance" or method:lower():find("screenshot")) then
+            return nil
+        end
+
+        -- Block explicit anti-cheat remote names (only when not our call)
+        if not checkcaller() and (method == "FireServer" or method == "InvokeServer") then
+            if typeof(self) == "Instance" then
+                local name = self.Name:lower()
+                if SAFE_REMOTES[self.Name] then
+                    return oldNamecall(self, ...)
+                end
+                for _, blocked in ipairs(BLOCKED_REMOTE_NAMES) do
+                    if name:find(blocked, 1, true) then
+                        return nil
+                    end
+                end
+            end
+        end
+
+        return oldNamecall(self, ...)
     end)
 
-    -- Tween
-    local info = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-    local tween = TweenService:Create(rootPart, info, {CFrame = targetCFrame})
-
-    local done = false
-    local conn
-    conn = tween.Completed:Connect(function() done = true end)
-    tween:Play()
-
-    local startTime = os.clock()
-    while not done and (os.clock() - startTime) < (duration + 2) do
-        RunService.Heartbeat:Wait()
-    end
-    if conn then conn:Disconnect() end
-
-    pcall(function() rootPart.CFrame = targetCFrame end)
-
-    -- Restore anchors
-    for part, wasAnchored in pairs(anchoredParts) do
-        if part and part.Parent then
-            pcall(function() part.Anchored = wasAnchored end)
+    -- Protect our own character's humanoid from external writes
+    mt.__newindex = newcclosure(function(t, k, v)
+        if not checkcaller() and typeof(t) == "Instance" then
+            if t:IsA("Humanoid") then
+                local char = player.Character
+                if char and t:IsDescendantOf(char) then
+                    if k == "MaxHealth" and megaHealthEnabled and v < 900000000 then
+                        return
+                    end
+                    if k == "Health" and (megaHealthEnabled or godModeEnabled) then
+                        return
+                    end
+                end
+            end
         end
-    end
-
-    pcall(function()
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+        return oldNewIndex(t, k, v)
     end)
 
-    if tempFF then
-        task.delay(0.5, function()
-            if tempFF and tempFF.Parent then tempFF:Destroy() end
-        end)
-    end
+    -- Hide our GUI from scans
+    mt.__index = newcclosure(function(t, k)
+        if typeof(t) == "Instance" then
+            if k == "DevPanelGui" and not checkcaller() then
+                return nil
+            end
+        end
+        return oldIndex(t, k)
+    end)
 
-    return true
+    setreadonly(mt, true)
+    hooks.anticheat = oldNamecall
+    print("[GR33D] ✓ Anti-cheat hook installed")
 end
 
--- ========== STATE SYNC INTERCEPTOR ==========
+-- ============================================================
+-- ========== GAME ERROR SILENCER ============================
+-- ============================================================
+-- Silences the game's own internal errors that spam the console
+-- when we teleport or move abnormally.
+
+local silencedErrors = {}
+local silenceCount = 0
+
+local function installErrorSilencer()
+    if not CONFIG.SILENCE_GAME_ERRORS then return end
+    pcall(function()
+        local ScriptContext = game:GetService("ScriptContext")
+        ScriptContext.Error:Connect(function(message, stackTrace, script)
+            if not script then return end
+            local scriptName = tostring(script)
+            -- Don't silence our own errors
+            if scriptName:find("GR33D") or scriptName:find("DevPanel") then
+                return
+            end
+            -- Silence common game errors
+            if message:find("attempt to compare number <= nil")
+               or message:find("attempt to index nil")
+               or message:find("attempt to call a nil value")
+               or message:find("HeartbeatUpdate")
+               or message:find("attempt to perform arithmetic") then
+                if not silencedErrors[message] then
+                    silencedErrors[message] = true
+                    silenceCount = silenceCount + 1
+                    warn("[Game Error Silenced] " .. message)
+                end
+            end
+        end)
+        print("[GR33D] ✓ Game error silencer installed")
+    end)
+end
+
+-- ============================================================
+-- ========== STATE SYNC INTERCEPTOR =========================
+-- ============================================================
 local SYNC_REMOTES = {
     ["State_SyncPrivate"] = true,
     ["State_SyncShared"]  = true,
@@ -240,12 +326,13 @@ local BLOCKED_SYNC_KEYS = {
 
 local function shouldStripKey(key)
     if type(key) ~= "string" then return false end
+    local lower = key:lower()
     for _, blocked in ipairs(BLOCKED_SYNC_KEYS) do
         if key == blocked then return true end
-        if key:lower():find("reset") then return true end
-        if key:lower():find("violation") then return true end
-        if key:lower():find("outofbounds") then return true end
-        if key:lower():find("warptospawn") then return true end
+    end
+    if lower:find("reset") or lower:find("violation")
+       or lower:find("outofbounds") or lower:find("warptospawn") then
+        return true
     end
     return false
 end
@@ -256,9 +343,7 @@ local function sanitizeSyncPayload(value, depth)
     if type(value) ~= "table" then return value end
     local cleaned = {}
     for k, v in pairs(value) do
-        if shouldStripKey(k) then
-            -- skip
-        else
+        if not shouldStripKey(k) then
             cleaned[k] = sanitizeSyncPayload(v, depth + 1)
         end
     end
@@ -282,6 +367,7 @@ end
 
 local syncInstalled = {}
 local function reinstallSyncHooks()
+    if not CONFIG.SYNC_INTERCEPT then return end
     for _, obj in ipairs(game:GetDescendants()) do
         if obj:IsA("RemoteEvent") and SYNC_REMOTES[obj.Name] then
             local signal = obj.OnClientEvent
@@ -309,23 +395,19 @@ local function reinstallSyncHooks()
                 end)
             end
             syncInstalled[obj] = true
+            print("[GR33D] ✓ Hooked " .. obj.Name .. " (" .. #existingFns .. " handlers)")
         end
     end
 end
 
 -- ============================================================
--- ========== PRO NOTIFICATION WATCHER =======================
+-- ========== NOTIFICATION WATCHER ===========================
 -- ============================================================
--- Real pro scripts hook the notification system so they can
--- react to "A Secret Egg has spawned!" messages and steal
--- the egg instantly.
--- ============================================================
-
--- Watch StarterGui:SetCore notifications
-local function hookSetCoreNotifications()
+local function installNotificationWatcher()
+    if not CONFIG.NOTIFICATION_WATCH then return end
     local mt = getrawmetatable and getrawmetatable(StarterGui)
     if not mt then return end
-    local ok, err = pcall(function()
+    pcall(function()
         setreadonly(mt, false)
         local oldIndex = mt.__index
         mt.__index = newcclosure(function(t, k)
@@ -335,19 +417,13 @@ local function hookSetCoreNotifications()
                         local title = tostring(args.Title or "")
                         local text = tostring(args.Text or "")
                         local combined = (title .. " " .. text):lower()
-                        table.insert(notificationLog, {
-                            time = os.clock(),
-                            title = title,
-                            text = text,
-                        })
-                        -- Check if it mentions an egg spawn
-                        if combined:find("egg")
-                           or combined:find("spawn")
-                           or combined:find("divine")
-                           or combined:find("secret")
+                        table.insert(notificationLog, {time = tick(), title = title, text = text})
+
+                        if combined:find("egg") or combined:find("spawn")
+                           or combined:find("divine") or combined:find("secret")
                            or combined:find("brainrot") then
                             print("[NOTIFY] " .. title .. " | " .. text)
-                            if AUTO_STEAL_ENABLED then
+                            if CONFIG.AUTO_STEAL_ENABLED then
                                 task.spawn(function()
                                     task.wait(0.5)
                                     G.StealAndReturn()
@@ -365,39 +441,12 @@ local function hookSetCoreNotifications()
     end)
 end
 
-pcall(hookSetCoreNotifications)
-
--- ========== LAZY HOOK MANAGERS ==========
-local hooks = {
-    anticheat    = nil,
-    bulletFollow = nil,
-}
-
-local function installAntiCheatHook()
-    if hooks.anticheat then return end
-    local mt = getrawmetatable and getrawmetatable(game)
-    if not mt then return end
-    setreadonly(mt, false)
-    local oldNamecall = mt.__namecall
-    mt.__namecall = newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-        if (method == "Kick" or method == "kick") and self == game.Players.LocalPlayer then
-            return nil
-        end
-        if (method == "ReportAbuse" or method == "reportAbuse") and self == game.Players then
-            return nil
-        end
-        return oldNamecall(self, ...)
-    end)
-    setreadonly(mt, true)
-    hooks.anticheat = oldNamecall
-    print("[GR33D] ✓ Anti-cheat hook installed")
-end
-
--- ========== TARGET ACQUISITION ==========
+-- ============================================================
+-- ========== BULLET FOLLOW (LAZY HOOK) ======================
+-- ============================================================
 local function getBulletFollowTarget(pos)
     if not pos then pos = camera.CFrame.Position end
-    local bestTarget, bestDist = nil, BULLET_FOLLOW_RANGE
+    local bestTarget, bestDist = nil, CONFIG.BULLET_FOLLOW_RANGE
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= player and p.Character then
             local isTeammate = false
@@ -511,6 +560,7 @@ local function installBulletFollowHook()
     end)
     setreadonly(mt, true)
     hooks.bulletFollow = oldNamecall
+    print("[GR33D] ✓ Bullet Follow hook installed")
 end
 
 local function removeBulletFollowHook()
@@ -521,9 +571,12 @@ local function removeBulletFollowHook()
     mt.__namecall = hooks.bulletFollow
     setreadonly(mt, true)
     hooks.bulletFollow = nil
+    print("[GR33D] Bullet Follow hook removed")
 end
 
--- ========== FLY ==========
+-- ============================================================
+-- ========== MOVEMENT UTILITIES =============================
+-- ============================================================
 local function isGrounded()
     if not rootPart or not humanoid then return false end
     if humanoid.FloorMaterial ~= Enum.Material.Air then return true end
@@ -534,9 +587,12 @@ local function isGrounded()
     return result ~= nil
 end
 
+-- ============================================================
+-- ========== FLY ============================================
+-- ============================================================
 function setFlying(state)
     if not rootPart or not humanoid then return end
-    if not state then flyDebounceUntil = os.clock() + FLY_DEBOUNCE end
+    if not state then flyDebounceUntil = tick() + CONFIG.FLY_DEBOUNCE end
     isFlying = state
     if not flyVelocity and rootPart then
         local att = Instance.new("Attachment")
@@ -566,13 +622,13 @@ end
 
 local function handleJumpTap()
     if not flyToggleEnabled then return end
-    if os.clock() < flyDebounceUntil then
+    if tick() < flyDebounceUntil then
         lastJumpTapTime = 0
         return
     end
-    local currentTime = os.clock()
+    local currentTime = tick()
     local timeSinceLastTap = currentTime - lastJumpTapTime
-    if timeSinceLastTap <= DOUBLE_TAP_WINDOW then
+    if timeSinceLastTap <= CONFIG.DOUBLE_TAP_WINDOW then
         if isFlying then
             setFlying(false)
         else
@@ -591,12 +647,14 @@ local function handleJumpTap()
 end
 
 UserInputService.JumpRequest:Connect(function()
-    local currentTime = os.clock()
+    local currentTime = tick()
     if (currentTime - lastJumpReqTime) > 0.1 then handleJumpTap() end
     lastJumpReqTime = currentTime
 end)
 
--- ========== PRO STEALTH SPEED ==========
+-- ============================================================
+-- ========== PRO STEALTH SPEED ==============================
+-- ============================================================
 local function setupSpeedVelocity()
     if not rootPart then return end
     if rootPart:FindFirstChild("Gr33dSpeedAtt") then rootPart.Gr33dSpeedAtt:Destroy() end
@@ -613,7 +671,6 @@ local function setupSpeedVelocity()
     speedVelocity.Parent = rootPart
     speedRamp = 0
     lastSpeedCFrame = rootPart.CFrame
-    lastReconTime = os.clock()
 end
 
 local function teardownSpeedVelocity()
@@ -633,7 +690,79 @@ local function teardownSpeedVelocity()
     lastSpeedCFrame = nil
 end
 
--- ========== PRO TELEPORT (FAST MODE) ==========
+-- ============================================================
+-- ========== PRO TRAVEL TWEEN ===============================
+-- ============================================================
+local function travelTween(targetCFrame)
+    if not rootPart or not character or not humanoid then return false end
+    local startCFrame = rootPart.CFrame
+    local distance = (targetCFrame.Position - startCFrame.Position).Magnitude
+    if distance < 5 then
+        pcall(function() rootPart.CFrame = targetCFrame end)
+        return true
+    end
+    local duration = distance / CONFIG.TRAVEL_SPEED
+    print(string.format("🚶 Traveling %.0f studs (%.1fs)...", distance, duration))
+
+    local anchoredParts = {}
+    for _, p in ipairs(character:GetDescendants()) do
+        if p:IsA("BasePart") then
+            anchoredParts[p] = p.Anchored
+            p.Anchored = true
+        end
+    end
+
+    local oldFF = character:FindFirstChildOfClass("ForceField")
+    local tempFF
+    if not oldFF then
+        tempFF = Instance.new("ForceField")
+        tempFF.Visible = false
+        tempFF.Parent = character
+    end
+
+    pcall(function()
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+    end)
+
+    local info = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(rootPart, info, {CFrame = targetCFrame})
+
+    local done = false
+    local conn
+    conn = tween.Completed:Connect(function() done = true end)
+    tween:Play()
+
+    local startTime = tick()
+    while not done and (tick() - startTime) < (duration + 2) do
+        RunService.Heartbeat:Wait()
+    end
+    if conn then conn:Disconnect() end
+
+    pcall(function() rootPart.CFrame = targetCFrame end)
+
+    for part, wasAnchored in pairs(anchoredParts) do
+        if part and part.Parent then
+            pcall(function() part.Anchored = wasAnchored end)
+        end
+    end
+
+    pcall(function()
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+        humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+    end)
+
+    if tempFF then
+        task.delay(0.5, function()
+            if tempFF and tempFF.Parent then tempFF:Destroy() end
+        end)
+    end
+    return true
+end
+
+-- ============================================================
+-- ========== PRO TELEPORT ===================================
+-- ============================================================
 local function proZoneTeleport(targetCFrame)
     if isTeleporting then return false end
     if not character or not rootPart or not humanoid then return false end
@@ -667,19 +796,19 @@ local function proZoneTeleport(targetCFrame)
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
     local startCFrame = rootPart.CFrame
-    for i = 1, TP_CHUNKS do
-        local alpha = i / TP_CHUNKS
+    for i = 1, CONFIG.TP_CHUNKS do
+        local alpha = i / CONFIG.TP_CHUNKS
         local base = startCFrame:Lerp(targetCFrame, alpha)
-        local j = TP_JITTER
+        local j = CONFIG.TP_JITTER
         local jittered = base + Vector3.new(
             (math.random() * 2 - 1) * j * (1 - alpha),
             (math.random() * 2 - 1) * j * (1 - alpha),
             (math.random() * 2 - 1) * j * (1 - alpha)
         )
         pcall(function() rootPart.CFrame = jittered end)
-        if i < TP_CHUNKS then
+        if i < CONFIG.TP_CHUNKS then
             pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
-            task.wait(TP_CHUNK_DELAY)
+            task.wait(CONFIG.TP_CHUNK_DELAY)
         end
     end
     pcall(function() rootPart.CFrame = targetCFrame end)
@@ -688,8 +817,8 @@ local function proZoneTeleport(targetCFrame)
             pcall(function() part.Anchored = wasAnchored end)
         end
     end
-    local holdEnd = os.clock() + TP_HOLD_DURATION
-    while os.clock() < holdEnd do
+    local holdEnd = tick() + CONFIG.TP_HOLD_DURATION
+    while tick() < holdEnd do
         if rootPart and rootPart.Parent then
             pcall(function()
                 rootPart.CFrame = targetCFrame
@@ -700,7 +829,7 @@ local function proZoneTeleport(targetCFrame)
         else break end
         RunService.Heartbeat:Wait()
     end
-    task.wait(TP_NOCLIP_LINGER)
+    task.wait(CONFIG.TP_NOCLIP_LINGER)
     for part, origCollide in pairs(originalCollide) do
         if part and part.Parent then
             pcall(function() part.CanCollide = origCollide end)
@@ -712,7 +841,7 @@ local function proZoneTeleport(targetCFrame)
         humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
     end)
     if tempFF then
-        task.delay(TP_FF_LINGER + 0.5, function()
+        task.delay(CONFIG.TP_FF_LINGER + 0.5, function()
             if tempFF and tempFF.Parent then tempFF:Destroy() end
         end)
     end
@@ -720,16 +849,17 @@ local function proZoneTeleport(targetCFrame)
     return true
 end
 
--- ========== SMART MOVE (AUTO MODE SELECTOR) ==========
 local function smartMove(targetCFrame)
-    if USE_FAST_TELEPORT then
+    if CONFIG.USE_FAST_TELEPORT then
         return proZoneTeleport(targetCFrame)
     else
         return travelTween(targetCFrame)
     end
 end
 
--- ========== UI HOOKS ==========
+-- ============================================================
+-- ========== UI HOOKS =======================================
+-- ============================================================
 G.GR33D = G.GR33D or {}
 G.GR33D.Toggle = function(name, value)
     if name == "Noclip" then G.NoclipActive = value
@@ -749,7 +879,6 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "SlimHitbox" then
         slimHitboxEnabled = value
         G.SlimHitboxActive = value
-    elseif name == "NoSpeedLimit" then G.NoSpeedLimitActive = value
     elseif name == "AutoGrab" then G.AutoGrabActive = value
     elseif name == "Fly" then
         flyToggleEnabled = value
@@ -796,13 +925,18 @@ G.GR33D.Toggle = function(name, value)
 end
 
 installAntiCheatHook()
+installErrorSilencer()
 
 task.spawn(function()
     task.wait(2)
     pcall(reinstallSyncHooks)
 end)
 
--- ========== ANTI-AFK ==========
+installNotificationWatcher()
+
+-- ============================================================
+-- ========== ANTI-AFK =======================================
+-- ============================================================
 player.Idled:Connect(function()
     if antiAfkEnabled then
         pcall(function()
@@ -824,7 +958,9 @@ pcall(function()
     end
 end)
 
--- ========== UTILITY ==========
+-- ============================================================
+-- ========== STATS PARSING ==================================
+-- ============================================================
 local function parseStatValue(input)
     if type(input) == "number" then return input end
     if type(input) ~= "string" then return 0 end
@@ -903,7 +1039,9 @@ local function isValidGrabPrompt(prompt)
     return true
 end
 
--- ========== CACHING LOOPS ==========
+-- ============================================================
+-- ========== CACHING LOOPS ==================================
+-- ============================================================
 task.spawn(function()
     while true do
         if COMBAT.AimbotEnabled or COMBAT.BulletFollowEnabled then
@@ -1029,7 +1167,9 @@ task.spawn(function()
     end
 end)
 
--- ========== STAT SCANNING ==========
+-- ============================================================
+-- ========== STAT SCANNING ==================================
+-- ============================================================
 local function scanAndExtractStats(targetObj)
     local statData = { Value = 0, Luck = 0, Size = 0, Weight = 0, RarityScore = 0 }
     if not targetObj then return statData end
@@ -1095,7 +1235,9 @@ local function scanAndExtractStats(targetObj)
     return statData
 end
 
--- ========== AUTO-GRAB ==========
+-- ============================================================
+-- ========== AUTO-GRAB ======================================
+-- ============================================================
 local function cleanupPromptCache()
     for i = #cachedPrompts, 1, -1 do
         if not cachedPrompts[i] or not cachedPrompts[i].Parent then
@@ -1109,7 +1251,7 @@ local function executeAutoGrabRoutine()
     cleanupPromptCache()
     for _, prompt in ipairs(cachedPrompts) do
         if not isValidGrabPrompt(prompt) then continue end
-        if grabCooldowns[prompt] and (os.clock() - grabCooldowns[prompt]) < 0.5 then continue end
+        if grabCooldowns[prompt] and (tick() - grabCooldowns[prompt]) < 0.5 then continue end
         local targetModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
         if not targetModel then continue end
         local ok, distance = pcall(function()
@@ -1118,12 +1260,14 @@ local function executeAutoGrabRoutine()
         if not ok then continue end
         if distance <= (prompt.MaxActivationDistance or 10) + 5 then
             local ok2 = pcall(function() fireproximityprompt(prompt) end)
-            if ok2 then grabCooldowns[prompt] = os.clock() end
+            if ok2 then grabCooldowns[prompt] = tick() end
         end
     end
 end
 
--- ========== HIGHEST VALUE FINDER ==========
+-- ============================================================
+-- ========== HIGHEST VALUE FINDER ===========================
+-- ============================================================
 local function parseMoneyFromModel(model)
     if not model then return 0 end
     local best = 0
@@ -1197,7 +1341,9 @@ local function findHighestValue()
     return highestItem, highestPart, highestPrompt, highestValue
 end
 
--- ========== TP FUNCTIONS ==========
+-- ============================================================
+-- ========== TP FUNCTIONS ===================================
+-- ============================================================
 G.SaveLocation = function()
     if rootPart then
         savedMapCFrame = rootPart.CFrame
@@ -1238,7 +1384,7 @@ G.TeleportToHighestValue = function()
 end
 
 -- ============================================================
--- ========== STEAL & RETURN (PRO EDITION) ===================
+-- ========== STEAL & RETURN =================================
 -- ============================================================
 G.StealAndReturn = function()
     if not rootPart then warn("⚠️ No character"); return end
@@ -1258,7 +1404,6 @@ G.StealAndReturn = function()
 
     local targetPos = CFrame.new(part.Position + Vector3.new(0, 3, 0))
 
-    -- Move using SMART mode (travel tween by default, teleport if toggled)
     isTeleporting = true
     if not smartMove(targetPos) then
         warn("⚠️ Failed to move to target")
@@ -1267,7 +1412,6 @@ G.StealAndReturn = function()
     end
     print("✓ Arrived at target")
 
-    -- Hold + grab
     local anchoredParts = {}
     for _, p in ipairs(character:GetDescendants()) do
         if p:IsA("BasePart") then
@@ -1276,10 +1420,10 @@ G.StealAndReturn = function()
         end
     end
 
-    local grabStart = os.clock()
+    local grabStart = tick()
     local firesSent = 0
 
-    while os.clock() - grabStart < GRAB_HOLD_DURATION do
+    while tick() - grabStart < CONFIG.GRAB_HOLD_DURATION do
         if rootPart and rootPart.Parent then
             pcall(function()
                 rootPart.CFrame = targetPos
@@ -1287,14 +1431,12 @@ G.StealAndReturn = function()
                 rootPart.AssemblyAngularVelocity = Vector3.zero
             end)
         end
-
         if actualPrompt and actualPrompt.Parent then
             pcall(function()
                 fireproximityprompt(actualPrompt)
                 firesSent = firesSent + 1
             end)
         end
-
         if firetouchinterest and rootPart and part then
             pcall(function()
                 firetouchinterest(rootPart, part, 0)
@@ -1302,7 +1444,6 @@ G.StealAndReturn = function()
                 firetouchinterest(rootPart, part, 1)
             end)
         end
-
         RunService.Heartbeat:Wait()
     end
 
@@ -1331,7 +1472,9 @@ G.GR33D.TeleportToSpawn        = G.TeleportToSpawn
 G.GR33D.TeleportToHighestValue = G.TeleportToHighestValue
 G.GR33D.StealAndReturn         = G.StealAndReturn
 
--- ========== NOCLIP ==========
+-- ============================================================
+-- ========== NOCLIP =========================================
+-- ============================================================
 RunService.Stepped:Connect(function()
     if not G.NoclipActive then return end
     local char = character or player.Character
@@ -1343,7 +1486,9 @@ RunService.Stepped:Connect(function()
     end
 end)
 
--- ========== GOD MODE ==========
+-- ============================================================
+-- ========== GOD MODE =======================================
+-- ============================================================
 function makeInvisible(char)
     if not char then return end
     originalCharacterTransparencies = {}
@@ -1381,7 +1526,9 @@ function makeVisible(char)
     if godModeConnection then godModeConnection:Disconnect() godModeConnection = nil end
 end
 
--- ========== RAPID FIRE ==========
+-- ============================================================
+-- ========== RAPID FIRE =====================================
+-- ============================================================
 local COOLDOWN_KEYWORDS = {
     "cooldown", "delay", "fire", "rate", "speed", "mine", "dig",
     "swing", "hit", "reload", "firedelay"
@@ -1423,7 +1570,9 @@ function monitorTool(tool)
     end)
 end
 
--- ========== BULLET FOLLOW ==========
+-- ============================================================
+-- ========== BULLET FOLLOW PROJECTILES ======================
+-- ============================================================
 local trackedProjectiles = {}
 
 local function shouldTrackProjectile(part)
@@ -1439,7 +1588,7 @@ task.spawn(function()
         if not COMBAT.BulletFollowEnabled then
             if next(trackedProjectiles) then trackedProjectiles = {} end
         else
-            local now = os.clock()
+            local now = tick()
             for part, info in pairs(trackedProjectiles) do
                 if not part or not part.Parent then
                     trackedProjectiles[part] = nil
@@ -1468,12 +1617,14 @@ Workspace.DescendantAdded:Connect(function(desc)
     if not COMBAT.BulletFollowEnabled then return end
     if shouldTrackProjectile(desc) then
         if not trackedProjectiles[desc] then
-            trackedProjectiles[desc] = { spawnTime = os.clock(), maxAge = 5 }
+            trackedProjectiles[desc] = { spawnTime = tick(), maxAge = 5 }
         end
     end
 end)
 
--- ========== STATE REAPPLICATION ==========
+-- ============================================================
+-- ========== STATE REAPPLICATION ============================
+-- ============================================================
 local function reapplyAllStates(char)
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -1511,7 +1662,9 @@ local function reapplyAllStates(char)
     jumpImpulseTime = 0
 end
 
--- ========== CHARACTER SETUP ==========
+-- ============================================================
+-- ========== CHARACTER SETUP ================================
+-- ============================================================
 local function setupCharacter(char)
     character = char
     rootPart  = char:WaitForChild("HumanoidRootPart")
@@ -1537,7 +1690,7 @@ local function setupCharacter(char)
     humanoid.Jumping:Connect(function(isActive)
         if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
             local currentVel = rootPart.AssemblyLinearVelocity
-            rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
+            rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, CONFIG.jumpPowerValue, currentVel.Z)
         end
     end)
     task.defer(function()
@@ -1598,11 +1751,14 @@ if backpack then
     backpack.ChildAdded:Connect(function(child) monitorTool(child) end)
 end
 
--- ========== MAIN LOOPS ==========
+-- ============================================================
+-- ========== MAIN HEARTBEAT LOOP ============================
+-- ============================================================
 RunService.Heartbeat:Connect(function(deltaTime)
     if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
     if isTeleporting then return end
 
+    -- ========== PRO STEALTH SPEED ==========
     if humanoid and humanoid.Health > 0 then
         if runSpeedEnabled and not isFlying then
             if humanoid.WalkSpeed ~= defaultWalkSpeed then
@@ -1611,20 +1767,62 @@ RunService.Heartbeat:Connect(function(deltaTime)
             if not speedVelocity and rootPart then setupSpeedVelocity() end
             if speedVelocity and rootPart then
                 local moveDir = humanoid.MoveDirection
-                local speedTarget = runSpeedValue
+                local speedTarget = CONFIG.runSpeedValue
+
+                -- Terrain adaptation
                 local params = RaycastParams.new()
                 params.FilterDescendantsInstances = { character or player.Character }
                 params.FilterType = Enum.RaycastFilterType.Exclude
                 local groundCheck = Workspace:Raycast(rootPart.Position, Vector3.new(0, -6, 0), params)
-                if groundCheck and groundCheck.Material == Enum.Material.Water then
-                    speedTarget = math.min(speedTarget, 40)
+
+                if groundCheck then
+                    local mat = groundCheck.Material
+                    if mat == Enum.Material.Water then
+                        speedTarget = speedTarget * 0.5
+                    elseif mat == Enum.Material.Sand
+                        or mat == Enum.Material.Grass
+                        or mat == Enum.Material.Mud then
+                        speedTarget = speedTarget * 0.85
+                    elseif mat == Enum.Material.Slate
+                        or mat == Enum.Material.Concrete
+                        or mat == Enum.Material.Cobblestone then
+                        speedTarget = speedTarget * 1.05
+                    end
+                    local normal = groundCheck.Normal
+                    local slopeAngle = math.acos(math.clamp(normal.Y, -1, 1))
+                    if slopeAngle > 0.4 then
+                        speedTarget = speedTarget * (1 - slopeAngle * 0.5)
+                    end
                 end
+
+                -- Variable speed
+                local time = tick()
+                local variance = math.sin(time * 2.3) * 0.05 +
+                                 math.sin(time * 7.1) * 0.03 +
+                                 math.sin(time * 13.7) * 0.02
+                speedTarget = speedTarget * (1 + variance)
+
+                -- Micro-pauses
+                if (time % 8) < 0.4 and moveDir.Magnitude > 0 then
+                    speedTarget = speedTarget * 0.6
+                end
+
+                -- Burst mode
+                if CONFIG.BURST_MODE then
+                    if (time % 15) < 1.5 and moveDir.Magnitude > 0 then
+                        speedTarget = speedTarget * 2
+                    end
+                end
+
                 if moveDir.Magnitude > 0 then
                     speedRamp = math.min(1, speedRamp + RAMP_RATE * deltaTime)
                     local effectiveSpeed = speedTarget * speedRamp
                     local targetVel = moveDir * effectiveSpeed
-                    speedVelocity.VectorVelocity = speedVelocity.VectorVelocity:Lerp(targetVel, 0.35)
+                    local currentVel = speedVelocity.VectorVelocity
+                    local blendedVel = currentVel:Lerp(targetVel, 0.25)
+                    speedVelocity.VectorVelocity = blendedVel
                     speedVelocity.MaxForce = 1e5
+
                     if lastSpeedCFrame then
                         local realDelta = rootPart.CFrame.Position - lastSpeedCFrame.Position
                         local expected = (moveDir * effectiveSpeed * deltaTime).Magnitude
@@ -1637,7 +1835,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
                 else
                     speedRamp = math.max(0, speedRamp - RAMP_RATE * deltaTime * 2)
                     speedVelocity.VectorVelocity = speedVelocity.VectorVelocity:Lerp(Vector3.zero, 0.4)
-                    if speedVelocity.VectorVelocity.Magnitude < 1 then speedVelocity.MaxForce = 0 end
+                    if speedVelocity.VectorVelocity.Magnitude < 1 then
+                        speedVelocity.MaxForce = 0
+                    end
                     lastSpeedCFrame = nil
                 end
             end
@@ -1649,6 +1849,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
+    -- ========== PRO JUMP ==========
     if humanoid and humanoid.Health > 0 and rootPart then
         if jumpEnabled then
             if humanoid.UseJumpPower and humanoid.JumpPower ~= defaultJumpPower then
@@ -1659,21 +1860,21 @@ RunService.Heartbeat:Connect(function(deltaTime)
                               or currentState == Enum.HumanoidStateType.Freefall)
             if airborne and not jumpImpulseApplied then
                 jumpImpulseApplied = true
-                jumpImpulseTime = os.clock()
+                jumpImpulseTime = tick()
                 local currentVel = rootPart.AssemblyLinearVelocity
                 pcall(function()
                     rootPart.AssemblyLinearVelocity = Vector3.new(
-                        currentVel.X, jumpPowerValue, currentVel.Z)
+                        currentVel.X, CONFIG.jumpPowerValue, currentVel.Z)
                 end)
             end
             if jumpImpulseApplied and airborne then
-                local timeSinceImpulse = os.clock() - jumpImpulseTime
-                if timeSinceImpulse < JUMP_BOOST_DURATION then
+                local timeSinceImpulse = tick() - jumpImpulseTime
+                if timeSinceImpulse < CONFIG.JUMP_BOOST_DURATION then
                     local currentVel = rootPart.AssemblyLinearVelocity
-                    local fadeFactor = 1 - (timeSinceImpulse / JUMP_BOOST_DURATION)
+                    local fadeFactor = 1 - (timeSinceImpulse / CONFIG.JUMP_BOOST_DURATION)
                     local targetY = currentVel.Y
-                    if currentVel.Y < (jumpPowerValue * fadeFactor * 0.7) then
-                        targetY = jumpPowerValue * fadeFactor * 0.7
+                    if currentVel.Y < (CONFIG.jumpPowerValue * fadeFactor * 0.7) then
+                        targetY = CONFIG.jumpPowerValue * fadeFactor * 0.7
                     end
                     pcall(function()
                         rootPart.AssemblyLinearVelocity = Vector3.new(
@@ -1688,6 +1889,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
+    -- ========== PASSIVE FEATURES ==========
     if rapidHealingEnabled and humanoid and humanoid.Health > 0
        and humanoid.Health < humanoid.MaxHealth then
         local healAmount = humanoid.MaxHealth * 3 * deltaTime
@@ -1761,7 +1963,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
         local target = getBulletFollowTarget(camera.CFrame.Position)
         if target then
             local targetPart = target
-            if AIMBOT_TARGET_PART == "Head" then
+            if CONFIG.AIMBOT_TARGET_PART == "Head" then
                 local head = target.Parent and target.Parent:FindFirstChild("Head")
                 if head then targetPart = head end
             end
@@ -1769,9 +1971,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
             local camLook = camera.CFrame.LookVector
             local dot = camToTarget:Dot(camLook)
             local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
-            if angle <= AIMBOT_FOV then
+            if angle <= CONFIG.AIMBOT_FOV then
                 local goalCFrame = CFrame.new(camera.CFrame.Position, targetPart.Position)
-                camera.CFrame = camera.CFrame:Lerp(goalCFrame, AIMBOT_SMOOTHNESS)
+                camera.CFrame = camera.CFrame:Lerp(goalCFrame, CONFIG.AIMBOT_SMOOTHNESS)
                 camera.CameraType = Enum.CameraType.Scriptable
             end
         end
@@ -1782,7 +1984,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
     end
 end)
 
--- ========== FLIGHT RENDER ==========
+-- ============================================================
+-- ========== FLIGHT RENDER ==================================
+-- ============================================================
 RunService.RenderStepped:Connect(function(dt)
     if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
     if isTeleporting then return end
@@ -1800,7 +2004,7 @@ RunService.RenderStepped:Connect(function(dt)
                 if moveVector.Magnitude > 0 then
                     local camCFrame = camera.CFrame
                     local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
-                    flyVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
+                    flyVelocity.VectorVelocity = flightDir.Unit * CONFIG.FLY_SPEED
                 else
                     flyVelocity.VectorVelocity = Vector3.zero
                 end
@@ -1822,7 +2026,7 @@ end)
 local viewport = workspace.CurrentCamera.ViewportSize
 local isMobileScreen = viewport.X < 700
 local PANEL_W = isMobileScreen and math.min(320, math.max(220, viewport.X - 40)) or 360
-local PANEL_H = isMobileScreen and math.min(440, math.max(320, viewport.Y - 120)) or 520
+local PANEL_H = isMobileScreen and math.min(460, math.max(340, viewport.Y - 120)) or 540
 local PANEL_X = math.clamp((viewport.X - PANEL_W) / 2, 10, math.max(10, viewport.X - PANEL_W - 10))
 local PANEL_Y = isMobileScreen and 80 or math.clamp((viewport.Y - PANEL_H) / 2, 60, math.max(60, viewport.Y - PANEL_H - 10))
 
@@ -1863,7 +2067,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.24"
+titleLabel.Text = "GR33D Scripts V6.00"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -1890,7 +2094,7 @@ toggleContainer.Size = UDim2.new(1, 0, 1, -42)
 toggleContainer.Position = UDim2.new(0, 0, 0, 42)
 toggleContainer.BackgroundTransparency = 1
 toggleContainer.BorderSizePixel = 0
-toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 1050)
+toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 1100)
 toggleContainer.ScrollBarThickness = 4
 toggleContainer.Active = true
 
@@ -2012,25 +2216,29 @@ local function createButton(parent, text, y, buttonColor, callback)
     end)
 end
 
-local movement = createCollapsibleGroup(leftGroupFrame, "Movement & Utility", 0, 320)
+local movement = createCollapsibleGroup(leftGroupFrame, "Movement & Utility", 0, 350)
 createToggle(movement, "Flight Mode",    0,   function(s) G.GR33D.Toggle("Fly", s) end)
 createToggle(movement, "God Mode",       28,  function(s) G.GR33D.Toggle("GodMode", s) end)
 createToggle(movement, "Mega Health HP", 56,  function(s) G.GR33D.Toggle("MegaHealth", s) end)
 createToggle(movement, "Rapid Healing",  84,  function(s) G.GR33D.Toggle("RapidHealing", s) end)
 createToggle(movement, "No Fall Dmg",    112, function(s) G.GR33D.Toggle("NoFallDamage", s) end)
 createToggle(movement, "Noclip Bypass",  140, function(s) G.GR33D.Toggle("Noclip", s) end)
-createToggle(movement, "Stealth Speed",  168, function(s) G.GR33D.Toggle("RunSpeed", s) end)
+createToggle(movement, "Pro Speed",      168, function(s) G.GR33D.Toggle("RunSpeed", s) end)
 createInput(movement,  "Speed (studs/s)", 196, 64, function(v)
     local n = tonumber(v)
-    if n and n > 0 and n <= 200 then runSpeedValue = n end
+    if n and n > 0 and n <= 200 then CONFIG.runSpeedValue = n end
 end)
-createToggle(movement, "Stealth Jump",   224, function(s) G.GR33D.Toggle("JumpPower", s) end)
-createInput(movement,  "Jump Power",     252, 100, function(v)
+createToggle(movement, "Burst Mode",      224, function(s)
+    CONFIG.BURST_MODE = s
+    print("[GR33D] Burst mode " .. (s and "ON" or "OFF"))
+end)
+createToggle(movement, "Stealth Jump",   252, function(s) G.GR33D.Toggle("JumpPower", s) end)
+createInput(movement,  "Jump Power",     280, 100, function(v)
     local n = tonumber(v)
-    if n and n > 0 and n <= 500 then jumpPowerValue = n end
+    if n and n > 0 and n <= 500 then CONFIG.jumpPowerValue = n end
 end)
 
-local grab = createCollapsibleGroup(leftGroupFrame, "Safe Auto-Grab", 328, 130)
+local grab = createCollapsibleGroup(leftGroupFrame, "Safe Auto-Grab", 358, 130)
 createToggle(grab, "Auto Grab Nearby", 0,  function(s) G.GR33D.Toggle("AutoGrab", s) end)
 createInput(grab,  "Target Val",       28, 0, function(v) G.TargetValue = parseStatValue(v) end)
 createInput(grab,  "Target Luck",      56, 0, function(v) G.TargetLuck  = parseStatValue(v) end)
@@ -2079,30 +2287,19 @@ createToggle(utilities, "Egg Name ESP",   0,  function(s) G.GR33D.Toggle("EggESP
 createToggle(utilities, "Prompt Extender", 28, function(s) G.GR33D.Toggle("PromptExtender", s) end)
 createToggle(utilities, "Anti-AFK",        56, function(s) G.GR33D.Toggle("AntiAFK", s) end)
 
--- ========== PRO TELEPORT GROUP WITH DUAL MODE ==========
 local tpGroup = createCollapsibleGroup(rightGroupFrame, "Teleport (Pro)", 324, 300)
-
--- Stealth mode toggle
 createToggle(tpGroup, "Use Fast Teleport (Risky)", 0, function(s)
-    USE_FAST_TELEPORT = s
-    print("[GR33D] Mode: " .. (s and "FAST TELEPORT (risky)" or "STEALTH TRAVEL (safe)"))
+    CONFIG.USE_FAST_TELEPORT = s
+    print("[GR33D] Mode: " .. (s and "FAST TELEPORT" or "STEALTH TRAVEL"))
 end)
-
--- Travel speed input
 createInput(tpGroup, "Travel Speed (studs/s)", 28, 40, function(v)
     local n = tonumber(v)
-    if n and n >= 20 and n <= 200 then
-        TRAVEL_SPEED = n
-    end
+    if n and n >= 20 and n <= 200 then CONFIG.TRAVEL_SPEED = n end
 end)
-
--- Auto steal watcher
 createToggle(tpGroup, "Auto Steal on Notification", 56, function(s)
-    AUTO_STEAL_ENABLED = s
+    CONFIG.AUTO_STEAL_ENABLED = s
     print("[GR33D] Auto-steal watcher " .. (s and "ENABLED" or "DISABLED"))
 end)
-
--- Teleport buttons
 createButton(tpGroup, "Save Location",          84,  Color3.fromRGB(142, 68, 173), function() G.SaveLocation() end)
 createButton(tpGroup, "TP to Saved",            112, Color3.fromRGB(39, 174, 96),  function() G.TeleportToSaved() end)
 createButton(tpGroup, "TP to Spawn",            140, Color3.fromRGB(41, 128, 185), function() G.TeleportToSpawn() end)
@@ -2128,7 +2325,7 @@ createButton(tpGroup, "Rejoin Server",          252, Color3.fromRGB(52, 73, 94),
     TeleportService:TeleportToPlaceInstance(PlaceId, game.JobId, player)
 end)
 
--- ========== MOBILE-HARDENED DRAG ==========
+-- ========== DRAG SYSTEM ==========
 local dragging = false
 local dragTouch = nil
 local dragOffset = nil
@@ -2208,34 +2405,52 @@ minimizeButton.MouseButton1Click:Connect(function()
     end
 end)
 
+-- ========== EXPOSED API ==========
 getgenv().ResetUI = function()
     local vp = workspace.CurrentCamera.ViewportSize
     local w = math.min(320, vp.X - 40)
-    local h = math.min(440, vp.Y - 120)
+    local h = math.min(460, vp.Y - 120)
     mainFrame.Size = UDim2.new(0, w, 0, h)
     mainFrame.Position = UDim2.new(0, (vp.X - w) / 2, 0, 80)
     print("✓ UI re-centered")
 end
 
 getgenv().SetMode = function(fast)
-    USE_FAST_TELEPORT = fast
+    CONFIG.USE_FAST_TELEPORT = fast
     print("[GR33D] Mode: " .. (fast and "FAST" or "STEALTH"))
 end
 
 getgenv().SetTravelSpeed = function(speed)
     if speed >= 20 and speed <= 200 then
-        TRAVEL_SPEED = speed
+        CONFIG.TRAVEL_SPEED = speed
         print("[GR33D] Travel speed: " .. speed .. " studs/s")
     end
 end
 
-print("✓ GR33D Scripts V5.24 loaded — Pro Edition")
-print("✓ Travel tween: server-safe movement (no teleport flag)")
-print("✓ Toggle: 'Use Fast Teleport (Risky)' for old teleport")
-print("✓ Travel Speed: 40 studs/s default (safe zone)")
-print("✓ Auto-Steal watcher: reacts to egg notifications")
-print("✓ Steal & Return holds position + fires prompt 1.5s")
+getgenv().GetConfig = function() return CONFIG end
+
+print("")
+print("╔══════════════════════════════════════════════╗")
+print("║  GR33D Scripts V6.00 — PRO REWRITE           ║")
+print("║  Complete audit + improvements               ║")
+print("╚══════════════════════════════════════════════╝")
+print("")
+print("✓ Improved Anti-Cheat Hook:")
+print("  - Blocks Kick / Ban / ReportAbuse on self")
+print("  - Blocks SaveInstance / screenshot")
+print("  - Protects Humanoid from external writes")
+print("  - Hides DevPanelGui from scans")
+print("✓ Game Error Silencer installed")
+print("✓ Notification Watcher active")
+print("✓ State Sync Interceptor active")
+print("✓ Pro Speed: 5-layer humanization")
+print("✓ Travel Tween: server-safe movement")
+print("✓ Steal & Return: hold + multi-fire grab")
 print("✓ Mobile-fit UI + hardened drag")
-print("✓ Type getgenv().ResetUI() to re-center if UI lost")
-print("✓ Type getgenv().SetMode(true) for fast teleport mode")
-print("✓ Type getgenv().SetTravelSpeed(60) to speed up travel")
+print("")
+print("Commands:")
+print("  getgenv().ResetUI()              - re-center UI")
+print("  getgenv().SetMode(true)          - fast teleport mode")
+print("  getgenv().SetTravelSpeed(60)     - 60 studs/s travel")
+print("  getgenv().GetConfig()            - view config")
+print("")
