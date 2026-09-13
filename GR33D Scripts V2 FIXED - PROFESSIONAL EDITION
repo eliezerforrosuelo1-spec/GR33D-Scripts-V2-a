@@ -1,7 +1,7 @@
 -- ==========================================
--- GR33D SCRIPTS: V8.10 — MULTI-BYPASS FALLBACK
+-- GR33D SCRIPTS: V8.20 — FULL HARDENED
 -- SERVER-SIDE STEAL + TP + HIDDEN GODMODE
--- HONEYPOT + 5-PATH TP + 4-CHANNEL STEAL
+-- HONEYPOT + MULTI-BACKEND + ANTI-DETECTION
 -- ==========================================
 
 -- ========== EXECUTOR-SAFE GLOBALS ==========
@@ -68,21 +68,21 @@ local CONFIG = {
     AUTO_STEAL_ENABLED    = false,
     ANTI_TRAP_ENABLED     = true,
     ANTI_RAGDOLL_ENABLED  = true,
-    -- TP settings
     TP_TWEEN_DURATION     = 0.12,
     TP_NOCLIP_LINGER      = 0.15,
     TP_REASSERT_FRAMES    = 5,
     TP_SETTLE_FRAMES      = 2,
-    -- Stealth
     STEALTH_MODE          = false,
     GHOST_STRENGTH        = 1,
+    RAPID_HEAL_HZ         = 5,     -- max heals per second
+    ESP_SCAN_INTERVAL     = 4,     -- seconds between ESP scans
 }
 
 local defaultJumpPower    = 50
 local defaultWalkSpeed    = 16
 
 -- ============================================================
--- ========== SILENT LOGGER (stealth) ========================
+-- ========== SILENT LOGGER ==================================
 -- ============================================================
 local function log(...)
     if not CONFIG.STEALTH_MODE then print(...) end
@@ -149,6 +149,8 @@ local savedSlots            = {}
 
 local character, rootPart, humanoid
 local flyVelocity           = nil
+local flyBodyMover          = nil
+local flyBackend            = "velocity"
 local originalHitboxSizes   = {}
 local originalRootSize      = nil
 local trackedEggTags        = {}
@@ -161,16 +163,20 @@ local speedAttach           = nil
 local lastSpeedCFrame       = nil
 local speedRamp             = 0
 local RAMP_RATE             = 1.5
+local speedBackend          = "velocity"
 
 local jumpImpulseApplied    = false
 local jumpImpulseTime       = 0
 
 local lastHorizontalSpeed   = 0
 local knockbackInProgress   = false
+local velocityBuffer        = { time = 0, vel = Vector3.zero }
 
 local antiTrapBlocked       = 0
 local antiRagdollBlocked    = 0
 local tpKickAvoided         = 0
+
+local rapidHealNext         = 0
 
 -- ============================================================
 -- ========== HONEYPOT ANTI-DETECTION LAYER ==================
@@ -335,7 +341,6 @@ pcall(function()
     if not mt then return end
     setreadonly(mt, false)
 
-    -- LAYER 1: __namecall
     if mt.__namecall then
         local oldNamecall = mt.__namecall
         mt.__namecall = newcclosure(function(self, ...)
@@ -367,7 +372,6 @@ pcall(function()
         hookLayers.namecall = true
     end
 
-    -- LAYER 2: __index
     if mt.__index then
         local oldIndex = mt.__index
         mt.__index = newcclosure(function(self, key)
@@ -377,7 +381,6 @@ pcall(function()
         hookLayers.index = true
     end
 
-    -- LAYER 3: __newindex — blocks server Health resets while GodMode on
     if mt.__newindex then
         local oldNewIndex = mt.__newindex
         mt.__newindex = newcclosure(function(self, key, value)
@@ -401,7 +404,7 @@ pcall(function()
         tostring(hookLayers.newindex)))
 end)
 
--- LAYER 4: RemoteEvent watcher on PlayerScripts
+-- LAYER 4: RemoteEvent watcher
 task.spawn(function()
     local playerScripts = player:WaitForChild("PlayerScripts", 10)
     if not playerScripts then return end
@@ -443,10 +446,8 @@ local function serverSideGrab(prompt)
 
     local channels = 0
 
-    -- Channel 1: native prompt fire
     if pcall(fireproximityprompt, prompt) then channels = channels + 1 end
 
-    -- Channel 2: fire all nearby remotes with multiple signatures
     for remote in pairs(grabRemotes) do
         if remote and remote.Parent then
             for _, arg in ipairs({itemModel, prompt, itemModel.Name,
@@ -457,7 +458,6 @@ local function serverSideGrab(prompt)
         end
     end
 
-    -- Channel 3: fire the prompt's own Triggered via fake touch
     if firetouchinterest and rootPart then
         local targetPart = itemModel.PrimaryPart
                           or itemModel:FindFirstChildWhichIsA("BasePart")
@@ -471,7 +471,6 @@ local function serverSideGrab(prompt)
         end
     end
 
-    -- Channel 4: walk into range and let natural physics fire it
     task.spawn(function()
         if rootPart and itemModel.PrimaryPart then
             local oldCF = rootPart.CFrame
@@ -727,7 +726,7 @@ G.TeleportToSlot = function(i)
 end
 
 -- ============================================================
--- ========== FLY ============================================
+-- ========== FLY — MULTI-BACKEND ============================
 -- ============================================================
 local function isGrounded()
     if not rootPart or not humanoid then return false end
@@ -738,30 +737,75 @@ local function isGrounded()
     return Workspace:Raycast(rootPart.Position, Vector3.new(0, -5, 0), params) ~= nil
 end
 
+local function ensureFlightActuator()
+    if not rootPart then return end
+    if not rootPart:FindFirstChild("Gr33dFlightAtt") then
+        local att = Instance.new("Attachment")
+        att.Name = "Gr33dFlightAtt"
+        att.Parent = rootPart
+    end
+    if not rootPart:FindFirstChild("Gr33dFlightVel") then
+        local lv = Instance.new("LinearVelocity")
+        lv.Name = "Gr33dFlightVel"
+        lv.Attachment0 = rootPart.Gr33dFlightAtt
+        lv.RelativeTo = Enum.ActuatorRelativeTo.World
+        lv.MaxForce = 0
+        lv.Parent = rootPart
+    end
+    flyVelocity = rootPart:FindFirstChild("Gr33dFlightVel")
+end
+
+local function selectFlyBackend()
+    if flyVelocity then
+        flyBackend = "velocity"
+        return
+    end
+    if rootPart and not flyBodyMover then
+        local ok = pcall(function()
+            flyBodyMover = Instance.new("BodyVelocity")
+            flyBodyMover.Name = "Gr33dBodyVel"
+            flyBodyMover.MaxForce = Vector3.new(9e4, 9e4, 9e4)
+            flyBodyMover.Velocity = Vector3.zero
+            flyBodyMover.Parent = rootPart
+        end)
+        if ok then flyBackend = "bodymover" return end
+    end
+    flyBackend = "cframe"
+end
+
+local function applyFlightVelocity(dir, speed)
+    if flyBackend == "velocity" and flyVelocity then
+        flyVelocity.VectorVelocity = dir * speed
+    elseif flyBackend == "bodymover" and flyBodyMover then
+        flyBodyMover.Velocity = dir * speed
+    elseif flyBackend == "cframe" and rootPart then
+        local delta = dir * speed * (1/60)
+        rootPart.CFrame = rootPart.CFrame + delta
+    end
+end
+
 function setFlying(state)
     if not rootPart or not humanoid then return end
     if not state then flyDebounceUntil = tick() + CONFIG.FLY_DEBOUNCE end
     isFlying = state
-    if not flyVelocity and rootPart then
-        local att = Instance.new("Attachment")
-        att.Name = "Gr33dFlightAtt"
-        att.Parent = rootPart
-        flyVelocity = Instance.new("LinearVelocity")
-        flyVelocity.Name = "Gr33dFlightVel"
-        flyVelocity.Attachment0 = att
-        flyVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
-        flyVelocity.VectorVelocity = Vector3.zero
-        flyVelocity.MaxForce = 0
-        flyVelocity.Parent = rootPart
-    end
+    ensureFlightActuator()
+    selectFlyBackend()
+
     if isFlying then
-        flyVelocity.MaxForce = 9e4
+        if flyVelocity then flyVelocity.MaxForce = 9e4 end
+        if flyBodyMover then flyBodyMover.MaxForce = Vector3.new(9e4, 9e4, 9e4) end
         if humanoid.FloorMaterial == Enum.Material.Air then
-            humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+            pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Freefall) end)
         end
     else
-        flyVelocity.MaxForce = 0
-        flyVelocity.VectorVelocity = Vector3.zero
+        if flyVelocity then
+            flyVelocity.MaxForce = 0
+            flyVelocity.VectorVelocity = Vector3.zero
+        end
+        if flyBodyMover then
+            flyBodyMover.MaxForce = Vector3.zero
+            flyBodyMover.Velocity = Vector3.zero
+        end
         if humanoid.FloorMaterial ~= Enum.Material.Air then
             pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
         end
@@ -797,7 +841,7 @@ UserInputService.JumpRequest:Connect(function()
 end)
 
 -- ============================================================
--- ========== PRO SPEED ======================================
+-- ========== PRO SPEED — MULTI-BACKEND ======================
 -- ============================================================
 local function setupSpeedVelocity()
     if not rootPart then return end
@@ -834,8 +878,24 @@ local function teardownSpeedVelocity()
     lastSpeedCFrame = nil
 end
 
+local function applySpeedMotion(moveDir, speed, dt)
+    if speedVelocity and speedVelocity.Parent then
+        speedBackend = "velocity"
+        local targetVel = moveDir * speed
+        local currentVel = speedVelocity.VectorVelocity
+        speedVelocity.VectorVelocity = currentVel:Lerp(targetVel, 0.25)
+        speedVelocity.MaxForce = 1e5
+    else
+        speedBackend = "cframe"
+        if rootPart and moveDir.Magnitude > 0 then
+            local step = moveDir * speed * dt
+            rootPart.CFrame = rootPart.CFrame + step
+        end
+    end
+end
+
 -- ============================================================
--- ========== ANTI-KNOCKBACK DAMPENER ========================
+-- ========== ANTI-KNOCKBACK DAMPENER + VELOCITY BUFFER ======
 -- ============================================================
 local function runKnockbackDampener()
     if knockbackInProgress or not rootPart or not humanoid then return end
@@ -851,6 +911,13 @@ local function runKnockbackDampener()
         knockbackInProgress = true
         task.wait(CONFIG.KNOCKBACK_DELAY)
         task.spawn(function()
+            -- Restore the last known "safe" velocity instead of damping
+            if velocityBuffer.vel.Magnitude > 0
+               and (tick() - velocityBuffer.time) < 2 then
+                pcall(function()
+                    rootPart.AssemblyLinearVelocity = velocityBuffer.vel
+                end)
+            end
             for frame = 1, CONFIG.KNOCKBACK_FRAMES do
                 task.wait()
                 if rootPart and rootPart.Parent then
@@ -870,6 +937,20 @@ local function runKnockbackDampener()
     end
     lastHorizontalSpeed = horizontalSpeed
 end
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        if antiMeleeEnabled and rootPart and humanoid then
+            if humanoid.MoveDirection.Magnitude < 0.1
+               and not knockbackInProgress
+               and not isFlying then
+                velocityBuffer.time = tick()
+                velocityBuffer.vel  = rootPart.AssemblyLinearVelocity
+            end
+        end
+    end
+end)
 
 -- ============================================================
 -- ========== TRUE GHOST INVISIBILITY ========================
@@ -963,9 +1044,6 @@ task.spawn(function()
     while true do
         RunService.Heartbeat:Wait()
         if godModeEnabled and humanoid and humanoid.Parent then
-            if humanoid.MaxHealth < 1e8 then
-                pcall(function() humanoid.MaxHealth = 900000000 end)
-            end
             if humanoid.Health < humanoid.MaxHealth * 0.95 then
                 pcall(function() humanoid.Health = humanoid.MaxHealth - 0.15 end)
             end
@@ -988,10 +1066,8 @@ G.GR33D.Toggle = function(name, value)
     elseif name == "MegaHealth" then
         megaHealthEnabled = value
         G.MegaHealthActive = value
-        if humanoid then
-            humanoid.MaxHealth = value and 900000000 or 100
-            humanoid.Health    = value and 900000000 or 100
-        end
+        -- NOTE: we no longer touch MaxHealth — that's the most-detected property.
+        -- Instead we keep Health pinned at MaxHealth every tick.
     elseif name == "SlimHitbox" then
         slimHitboxEnabled = value
         G.SlimHitboxActive = value
@@ -1053,7 +1129,7 @@ G.GR33D.Toggle = function(name, value)
 end
 
 -- ============================================================
--- ========== ANTI-AFK (randomized) ==========================
+-- ========== ANTI-AFK =======================================
 -- ============================================================
 player.Idled:Connect(function()
     if antiAfkEnabled then
@@ -1277,6 +1353,7 @@ end)
 
 task.spawn(function()
     while true do
+        -- Cleanup dangling tags
         for obj, tag in pairs(trackedEggTags) do
             if not obj or not obj.Parent or not tag or not tag.Parent then
                 if tag and tag.Parent then tag:Destroy() end
@@ -1306,13 +1383,14 @@ task.spawn(function()
                         label.TextColor3             = Color3.fromRGB(255, 215, 0)
                         label.Font                   = Enum.Font.GothamBold
                         label.TextSize               = 12
-                        billboard.Parent = obj
+                        -- Parent to PlayerGui so other players can't see it
+                        billboard.Parent = protectedParent
                         trackedEggTags[obj] = billboard
                     end
                 end
             end
         end
-        task.wait(2)
+        task.wait(CONFIG.ESP_SCAN_INTERVAL + math.random() * 2)
     end
 end)
 
@@ -1361,12 +1439,15 @@ RunService.Stepped:Connect(function()
     local char = character or player.Character
     if not char then return end
     for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then part.CanCollide = false end
+        if part:IsA("BasePart") and part.CanCollide
+           and not part:FindFirstAncestorOfClass("Accessory") then
+            part.CanCollide = false
+        end
     end
 end)
 
 -- ============================================================
--- ========== RAPID FIRE =====================================
+-- ========== RAPID FIRE — VALUES + BURST FALLBACK ===========
 -- ============================================================
 local COOLDOWN_KEYWORDS = {
     "cooldown", "delay", "fire", "rate", "speed", "mine", "dig",
@@ -1389,6 +1470,30 @@ local function applyRapidFire(tool)
     end
 end
 
+local function applyBurstFire(tool)
+    local toolRemotes = {}
+    for _, d in ipairs(tool:GetDescendants()) do
+        if d:IsA("RemoteEvent") then table.insert(toolRemotes, d) end
+    end
+    if #toolRemotes == 0 then return false end
+
+    if toolConnections[tool .. "_burst"] then
+        toolConnections[tool .. "_burst"]:Disconnect()
+    end
+    toolConnections[tool .. "_burst"] = tool.Activated:Connect(function()
+        if not rapidFireEnabled then return end
+        task.spawn(function()
+            for _ = 1, 3 do
+                for _, r in ipairs(toolRemotes) do
+                    pcall(function() r:FireServer() end)
+                end
+                task.wait(0.03)
+            end
+        end)
+    end)
+    return true
+end
+
 local function disableRapidFire(tool)
     for _, v in ipairs(tool:GetDescendants()) do
         if originalToolValues[v] ~= nil then
@@ -1396,11 +1501,20 @@ local function disableRapidFire(tool)
             originalToolValues[v] = nil
         end
     end
+    if toolConnections[tool .. "_burst"] then
+        toolConnections[tool .. "_burst"]:Disconnect()
+        toolConnections[tool .. "_burst"] = nil
+    end
 end
 
 function monitorTool(tool)
     if not tool or not tool:IsA("Tool") then return end
-    if rapidFireEnabled then applyRapidFire(tool) else disableRapidFire(tool) end
+    if rapidFireEnabled then
+        applyRapidFire(tool)
+        applyBurstFire(tool)
+    else
+        disableRapidFire(tool)
+    end
     if toolConnections[tool] then toolConnections[tool]:Disconnect() toolConnections[tool] = nil end
     toolConnections[tool] = tool.DescendantAdded:Connect(function(v)
         if rapidFireEnabled and (v:IsA("NumberValue") or v:IsA("IntValue")) then
@@ -1541,12 +1655,11 @@ local function removeBulletFollowHook()
 end
 
 -- Layer A: BindableEvent.Fire hijack
-local originalBindableFire = nil
 pcall(function()
     local bindableMT = getrawmetatable and getrawmetatable(game:GetService("BindableEvent"))
     if not bindableMT or not bindableMT.Fire then return end
     setreadonly(bindableMT, false)
-    originalBindableFire = bindableMT.Fire
+    local originalBindableFire = bindableMT.Fire
     bindableMT.Fire = newcclosure(function(self, ...)
         if COMBAT.BulletFollowEnabled then
             local args = {...}
@@ -1559,12 +1672,11 @@ pcall(function()
 end)
 
 -- Layer B: Actor:SendMessage hijack
-local originalActorSend = nil
 pcall(function()
     local actorMT = getrawmetatable and getrawmetatable(game:GetService("Actor"))
     if not actorMT or not actorMT.SendMessage then return end
     setreadonly(actorMT, false)
-    originalActorSend = actorMT.SendMessage
+    local originalActorSend = actorMT.SendMessage
     actorMT.SendMessage = newcclosure(function(self, topic, ...)
         if COMBAT.BulletFollowEnabled then
             local args = {...}
@@ -1606,14 +1718,6 @@ local function reapplyAllStates(char)
     if not hrp or not hum then return end
     if flyToggleEnabled then task.defer(function() setFlying(true) end) end
     if godModeEnabled   then task.defer(function() applyGhost(char) end) end
-    if megaHealthEnabled then
-        task.defer(function()
-            if hum and hum.Parent then
-                hum.MaxHealth = 900000000
-                hum.Health    = 900000000
-            end
-        end)
-    end
     if G.NoclipActive then
         for _, part in ipairs(char:GetDescendants()) do
             if part:IsA("BasePart") then part.CanCollide = false end
@@ -1668,9 +1772,11 @@ local function setupCharacter(char)
     end
     if rootPart:FindFirstChild("Gr33dFlightAtt") then rootPart.Gr33dFlightAtt:Destroy() end
     if rootPart:FindFirstChild("Gr33dFlightVel") then rootPart.Gr33dFlightVel:Destroy() end
-    if rootPart:FindFirstChild("Gr33dSpeedAtt")  then rootPart.Gr33dSpeedAtt:Destroy() end
-    if rootPart:FindFirstChild("Gr33dSpeedVel")  then rootPart.Gr33dSpeedVel:Destroy() end
+    if rootPart:FindFirstChild("Gr33dBodyVel")   then rootPart.Gr33dBodyVel:Destroy()   end
+    if rootPart:FindFirstChild("Gr33dSpeedAtt")  then rootPart.Gr33dSpeedAtt:Destroy()  end
+    if rootPart:FindFirstChild("Gr33dSpeedVel")  then rootPart.Gr33dSpeedVel:Destroy()  end
     flyVelocity = nil
+    flyBodyMover = nil
     speedVelocity, speedAttach, speedRamp, lastSpeedCFrame = nil, nil, 0, nil
     jumpImpulseApplied, jumpImpulseTime = false, 0
     lastHorizontalSpeed, knockbackInProgress = 0, false
@@ -1684,7 +1790,6 @@ local function setupCharacter(char)
     end)
     task.defer(function() if rootPart then originalRootSize = Vector3.new(2, 2, 1) end end)
 
-    -- HealthChanged / Died defenses
     pcall(function()
         humanoid.HealthChanged:Connect(function(newHealth)
             if godModeEnabled and humanoid and humanoid.Parent then
@@ -1707,6 +1812,11 @@ end
 player.CharacterAdded:Connect(function(newChar)
     lockSpawnFrom(newChar)
 
+    -- Prompt extender safety reset
+    local wasExtending = promptExtenderEnabled
+    promptExtenderEnabled = false
+    task.delay(1, function() promptExtenderEnabled = wasExtending end)
+
     isFlying, flyDebounceUntil = false, 0
     jumpImpulseApplied, jumpImpulseTime = false, 0
     lastHorizontalSpeed, knockbackInProgress = 0, false
@@ -1715,6 +1825,13 @@ player.CharacterAdded:Connect(function(newChar)
             flyVelocity.MaxForce = 0
             flyVelocity.VectorVelocity = Vector3.zero
         end)
+    end
+    if flyBodyMover then
+        pcall(function()
+            flyBodyMover.MaxForce = Vector3.zero
+            flyBodyMover.Velocity = Vector3.zero
+        end)
+        flyBodyMover = nil
     end
     teardownSpeedVelocity()
     for tool, conn in pairs(toolConnections) do
@@ -1751,7 +1868,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
                 pcall(function() humanoid.WalkSpeed = defaultWalkSpeed end)
             end
             if not speedVelocity and rootPart then setupSpeedVelocity() end
-            if speedVelocity and rootPart then
+            if rootPart then
                 local moveDir = humanoid.MoveDirection
                 local speedTarget = CONFIG.runSpeedValue
 
@@ -1782,12 +1899,9 @@ RunService.Heartbeat:Connect(function(deltaTime)
                 if moveDir.Magnitude > 0 then
                     speedRamp = math.min(1, speedRamp + RAMP_RATE * deltaTime)
                     local effectiveSpeed = speedTarget * speedRamp
-                    local targetVel = moveDir * effectiveSpeed
-                    local currentVel = speedVelocity.VectorVelocity
-                    speedVelocity.VectorVelocity = currentVel:Lerp(targetVel, 0.25)
-                    speedVelocity.MaxForce = 1e5
+                    applySpeedMotion(moveDir, effectiveSpeed, deltaTime)
 
-                    if lastSpeedCFrame then
+                    if speedBackend == "velocity" and lastSpeedCFrame then
                         local realDelta = rootPart.CFrame.Position - lastSpeedCFrame.Position
                         local expected = (moveDir * effectiveSpeed * deltaTime).Magnitude
                         if realDelta.Magnitude < expected * 0.5 then
@@ -1798,8 +1912,10 @@ RunService.Heartbeat:Connect(function(deltaTime)
                     lastSpeedCFrame = rootPart.CFrame
                 else
                     speedRamp = math.max(0, speedRamp - RAMP_RATE * deltaTime * 2)
-                    speedVelocity.VectorVelocity = speedVelocity.VectorVelocity:Lerp(Vector3.zero, 0.4)
-                    if speedVelocity.VectorVelocity.Magnitude < 1 then speedVelocity.MaxForce = 0 end
+                    if speedVelocity then
+                        speedVelocity.VectorVelocity = speedVelocity.VectorVelocity:Lerp(Vector3.zero, 0.4)
+                        if speedVelocity.VectorVelocity.Magnitude < 1 then speedVelocity.MaxForce = 0 end
+                    end
                     lastSpeedCFrame = nil
                 end
             end
@@ -1848,12 +1964,23 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
+    -- Rapid Healing — throttled to 5 Hz max
     if rapidHealingEnabled and humanoid and humanoid.Health > 0
        and humanoid.Health < humanoid.MaxHealth then
-        local healAmount = humanoid.MaxHealth * 3 * deltaTime
-        humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + healAmount)
+        if tick() >= rapidHealNext then
+            rapidHealNext = tick() + (1 / CONFIG.RAPID_HEAL_HZ)
+            humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + humanoid.MaxHealth * 0.15)
+        end
     end
 
+    -- Mega Health — keep Health pinned without touching MaxHealth
+    if megaHealthEnabled and humanoid and humanoid.Health > 0 then
+        if humanoid.Health < humanoid.MaxHealth - 1 then
+            pcall(function() humanoid.Health = humanoid.MaxHealth end)
+        end
+    end
+
+    -- GodMode — same clamp but a hair below max to prevent overflow
     if godModeEnabled and humanoid and humanoid.Health > 0 then
         if humanoid.Health >= humanoid.MaxHealth then
             humanoid.Health = humanoid.MaxHealth - 0.15
@@ -1908,6 +2035,7 @@ RunService.Heartbeat:Connect(function(deltaTime)
         end
     end
 
+    -- Aimbot with human-like jitter
     if COMBAT.AimbotEnabled and rootPart and camera then
         local target = getBulletFollowTarget(camera.CFrame.Position)
         if target then
@@ -1925,8 +2053,15 @@ RunService.Heartbeat:Connect(function(deltaTime)
             local dot = camToTarget:Dot(camLook)
             local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
             if angle <= CONFIG.AIMBOT_FOV then
-                local goalCFrame = CFrame.new(camera.CFrame.Position, aimPos)
-                camera.CFrame = camera.CFrame:Lerp(goalCFrame, CONFIG.AIMBOT_SMOOTHNESS)
+                local easing = math.min(1, angle / CONFIG.AIMBOT_FOV + 0.15)
+                local jitter = Vector3.new(
+                    (math.random() - 0.5) * 0.4,
+                    (math.random() - 0.5) * 0.4,
+                    0
+                )
+                local goalCFrame = CFrame.new(camera.CFrame.Position + jitter, aimPos)
+                local lerpAmt = CONFIG.AIMBOT_SMOOTHNESS * easing
+                camera.CFrame = camera.CFrame:Lerp(goalCFrame, lerpAmt)
                 camera.CameraType = Enum.CameraType.Scriptable
             end
         end
@@ -1940,28 +2075,27 @@ end)
 -- ========== FLIGHT RENDER ==========
 RunService.RenderStepped:Connect(function(dt)
     if not camera or not camera.Parent then camera = Workspace.CurrentCamera end
-    if isFlying and flyVelocity and humanoid and rootPart then
+    if isFlying and humanoid and rootPart then
         local grounded = isGrounded()
         local stopped  = controls and controls:GetMoveVector().Magnitude == 0
         if grounded and stopped then setFlying(false)
         elseif grounded and humanoid.FloorMaterial ~= Enum.Material.Air then setFlying(false)
         else
-            if flyVelocity.MaxForce < 9e4 then flyVelocity.MaxForce = 9e4 end
             if controls then
                 local moveVector = controls:GetMoveVector()
                 if moveVector.Magnitude > 0 then
                     local camCFrame = camera.CFrame
                     local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
-                    flyVelocity.VectorVelocity = flightDir.Unit * CONFIG.FLY_SPEED
+                    applyFlightVelocity(flightDir.Unit, CONFIG.FLY_SPEED)
                 else
-                    flyVelocity.VectorVelocity = Vector3.zero
+                    applyFlightVelocity(Vector3.zero, 0)
                 end
             end
         end
     end
 end)
 
--- ========== GHOST ENFORCEMENT (anti server-reset) ==========
+-- ========== GHOST ENFORCEMENT ==========
 RunService.RenderStepped:Connect(function()
     if not godModeEnabled or not character then return end
     for _, d in ipairs(character:GetDescendants()) do
@@ -2027,7 +2161,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V8.10"
+titleLabel.Text = "GR33D Scripts V8.20"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = isMobileScreen and 12 or 13
@@ -2214,7 +2348,7 @@ infoLabel.Active = false
 
 createToggle(combat, "Advanced Aimbot",        22, function(s) G.GR33D.Toggle("Aimbot", s) end)
 createToggle(combat, "Auto Bullet Follow",     50, function(s) G.GR33D.Toggle("BulletFollow", s) end)
-createToggle(combat, "Hitbox Ext",             78,  function(s) G.GR33D.Toggle("HitboxExpander", s) end)
+createToggle(combat, "Hitbox Ext (Visual)",    78,  function(s) G.GR33D.Toggle("HitboxExpander", s) end)
 createToggle(combat, "Slim Hitbox",            106, function(s) G.GR33D.Toggle("SlimHitbox", s) end)
 createToggle(combat, "Anti-Knockback (Lite)",  134, function(s) G.GR33D.Toggle("AntiMelee", s) end)
 createToggle(combat, "Rapid Fire",             162, function(s) G.GR33D.Toggle("RapidFire", s) end)
@@ -2371,6 +2505,8 @@ getgenv().GetDiagnostics = function()
         hookLayers       = hookLayers,
         hookSignals      = hookFallbackSignals,
         tpPathUsed       = tpPathUsed,
+        flyBackend       = flyBackend,
+        speedBackend     = speedBackend,
         honeypotRemotes  = #honeyRemotes,
         grabRemotes      = #grabRemotes,
         godModeActive    = godModeEnabled,
@@ -2383,22 +2519,23 @@ end
 -- ========== SAFE BOOT PRINT ==========
 log("")
 log("╔══════════════════════════════════════════════╗")
-log("║  GR33D Scripts V8.10 — MULTI-BYPASS EDITION  ║")
-log("║  Server-Side Steal + TP + Hidden GodMode     ║")
-log("║  + Honeypot + 5-Path TP + 4-Channel Steal    ║")
+log("║  GR33D Scripts V8.20 — FULL HARDENED         ║")
+log("║  Multi-Backend + Honeypot + Anti-Detection   ║")
 log("╚══════════════════════════════════════════════╝")
 log("")
 log("✓ Multi-layer metatable hooks (namecall/index/newindex)")
 log("✓ RemoteEvent watcher (4th layer)")
-log("✓ Anti Ragdoll installed")
-log("✓ True Ghost GodMode + HealthChanged/Died defense")
-log("✓ 4-channel steal engine")
-log("✓ 5-path teleport fallback chain")
-log("✓ Auto Steal with human-like delay")
-log("✓ Spawn locked at exact join position")
-log("✓ Honeypot anti-detection layer active")
-log("✓ Bullet Follow multi-injection (namecall/Bindable/Actor/Camera)")
-log("✓ Stealth Mode suppresses console output")
+log("✓ Fly: velocity / BodyVelocity / CFrame backends")
+log("✓ Speed: velocity / CFrame backends")
+log("✓ Anti-Knockback: velocity buffer restore")
+log("✓ TP: 5-path fallback chain")
+log("✓ Steal: 4-channel engine")
+log("✓ GodMode: HealthChanged + Died + Heartbeat clamp")
+log("✓ Bullet Follow: namecall/Bindable/Actor/Camera")
+log("✓ Mega Health: no MaxHealth writes (stealth mode)")
+log("✓ Rapid Healing: throttled to 5 Hz")
+log("✓ ESP: Billboard parented to PlayerGui (hidden from others)")
+log("✓ Honeypot: decoy walk / remotes / jumps")
 log("")
 log("Commands:")
 log("  getgenv().ResetUI()           - re-center UI")
