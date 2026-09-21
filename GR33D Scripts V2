@@ -1,8 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS V6.8
--- UI: bottom-left anchored + floating button
--- Speed: 4 studs/0.016s (matches V6.6 timing)
--- TP: smaller hops + 0.3s cooldown between
+-- GR33D SCRIPTS V7.2
+-- Speed 15 + Prompt Extender (50 range, instant click)
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -42,24 +40,29 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V6.8 Starting ===")
+log("BOOT", "=== GR33D V7.2 Starting ===")
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
--- CONFIG (FIXED)
+-- CONFIG
 -- ==========================================
 
-local DEFAULT_SPEED          = 100
-local MAX_SPEED              = 100
-local SPEED_TWEEN_INTERVAL   = 0.016   -- ~60 Hz
-local SPEED_BASE_DIST        = 4       -- studs per 0.016s at speed 100 → 250 studs/s
+local DEFAULT_SPEED          = 15
+local MAX_SPEED              = 15
+local SPEED_TWEEN_INTERVAL   = 0.016
+local SPEED_BASE_DIST        = 4
 local TP_EFFECTIVE_SPEED     = 1500
-local TP_MAX_HOP             = 150     -- smaller hops
-local TP_HOP_COOLDOWN        = 0.3     -- seconds between hops
+local TP_MAX_HOP             = 150
+local TP_HOP_COOLDOWN        = 0.3
 local MAX_JUMP_IMPULSE       = 107
 local DEFAULT_JUMP           = 100
 local MAX_SAFE_FALL          = 50
 local DOUBLE_TAP_WINDOW      = 0.35
+
+-- Prompt extender config
+local PROMPT_MAX_DISTANCE    = 50
+local PROMPT_HOLD_DURATION   = 0
+local PROMPT_REQUIRES_LOS    = false
 
 -- ==========================================
 -- STATE
@@ -72,6 +75,7 @@ local noFallDamageEnabled = false
 local noclipEnabled       = false
 local runSpeedEnabled     = false
 local jumpEnabled         = false
+local promptExtenderEnabled = false
 local isMinimized         = false
 
 local runSpeedValue       = DEFAULT_SPEED
@@ -95,6 +99,8 @@ local activeTween = nil
 local speedTween  = nil
 local speedAccum  = 0
 local isTPBusy    = false
+
+local trackedPrompts = {}
 
 -- ==========================================
 -- INVISIBILITY
@@ -155,7 +161,68 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- TP (fast but server-safe)
+-- PROMPT EXTENDER
+-- ==========================================
+
+local function applyPromptExtender(prompt)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+    if trackedPrompts[prompt] then return end
+
+    trackedPrompts[prompt] = {
+        MaxActivationDistance = prompt.MaxActivationDistance,
+        HoldDuration = prompt.HoldDuration,
+        RequiresLineOfSight = prompt.RequiresLineOfSight,
+    }
+
+    pcall(function()
+        prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
+        prompt.HoldDuration = PROMPT_HOLD_DURATION
+        prompt.RequiresLineOfSight = PROMPT_REQUIRES_LOS
+    end)
+end
+
+local function removePromptExtender(prompt)
+    local saved = trackedPrompts[prompt]
+    if not saved then return end
+    pcall(function()
+        if prompt and prompt.Parent then
+            prompt.MaxActivationDistance = saved.MaxActivationDistance
+            prompt.HoldDuration = saved.HoldDuration
+            prompt.RequiresLineOfSight = saved.RequiresLineOfSight
+        end
+    end)
+    trackedPrompts[prompt] = nil
+end
+
+local function enablePromptExtenderAll()
+    log("PROMPT", "Enabling on all existing prompts")
+    local count = 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            applyPromptExtender(obj)
+            count = count + 1
+        end
+    end
+    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ")")
+end
+
+local function disablePromptExtenderAll()
+    log("PROMPT", "Disabling on all prompts")
+    for prompt, _ in pairs(trackedPrompts) do
+        removePromptExtender(prompt)
+    end
+    trackedPrompts = {}
+end
+
+workspace.DescendantAdded:Connect(function(obj)
+    if not promptExtenderEnabled then return end
+    if obj:IsA("ProximityPrompt") then
+        applyPromptExtender(obj)
+    end
+end)
+
+-- ==========================================
+-- TP
 -- ==========================================
 
 local function tweenMoveTo(targetPos, duration, easing)
@@ -238,7 +305,7 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (fixed interval)
+-- SPEED (capped at 15)
 -- ==========================================
 
 RunService.Heartbeat:Connect(function(dt)
@@ -272,9 +339,8 @@ RunService.Heartbeat:Connect(function(dt)
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("step=%.2f/%.3fs = %.0f studs/s | pos=(%.1f, %.1f, %.1f)",
-            stepDist, SPEED_TWEEN_INTERVAL, stepDist / SPEED_TWEEN_INTERVAL,
-            targetPos.X, targetPos.Y, targetPos.Z))
+        log("SPEED", string.format("step=%.2f/%.3fs = %.0f studs/s",
+            stepDist, SPEED_TWEEN_INTERVAL, stepDist / SPEED_TWEEN_INTERVAL))
     end
 end)
 
@@ -307,7 +373,7 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- FLIGHT + NO-FALL
+-- FLIGHT
 -- ==========================================
 
 local function setFlying(state)
@@ -346,78 +412,81 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (bottom-left anchor + floating button)
+-- UI (MOBILE-SAFE)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
+screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
--- FLOATING BUTTON (always visible, bottom-left corner)
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 170, 0, 330)
+mainFrame.AnchorPoint = Vector2.new(0, 0)
+mainFrame.Position = UDim2.new(0, 8, 0, 50)
+mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", mainFrame)
+stroke.Color = Color3.fromRGB(45, 45, 55)
+stroke.Thickness = 1.5
+stroke.Parent = mainFrame
+
+local header = Instance.new("Frame", mainFrame)
+header.Size = UDim2.new(1, 0, 0, 26)
+header.BackgroundTransparency = 1
+
+local title = Instance.new("TextLabel", header)
+title.Size = UDim2.new(1, -40, 1, 0)
+title.Position = UDim2.new(0, 8, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "Menu"
+title.TextColor3 = Color3.fromRGB(240, 240, 245)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+
+local minBtn = Instance.new("TextButton", header)
+minBtn.Size = UDim2.new(0, 22, 0, 22)
+minBtn.Position = UDim2.new(1, -26, 0.5, -11)
+minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+minBtn.Text = "−"
+minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 14
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
+
+local container = Instance.new("ScrollingFrame", mainFrame)
+container.Size = UDim2.new(1, -4, 1, -30)
+container.Position = UDim2.new(0, 2, 0, 28)
+container.BackgroundTransparency = 1
+container.BorderSizePixel = 0
+container.CanvasSize = UDim2.new(0, 0, 0, 610)
+container.ScrollBarThickness = 3
+container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
+
 local floatBtn = Instance.new("TextButton")
-floatBtn.Name = "FloatBtn"
 floatBtn.Size = UDim2.new(0, 40, 0, 40)
-floatBtn.AnchorPoint = Vector2.new(0, 1)
-floatBtn.Position = UDim2.new(0, 20, 1, -20)
+floatBtn.AnchorPoint = Vector2.new(0, 0)
+floatBtn.Position = UDim2.new(0, 8, 0, 50)
 floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
 floatBtn.Text = "M"
 floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 floatBtn.Font = Enum.Font.GothamBold
 floatBtn.TextSize = 18
 floatBtn.Visible = false
-Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 10)
 floatBtn.Parent = screenGui
 
--- MAIN PANEL (bottom-left anchored)
-local mainFrame = Instance.new("Frame")
-mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0, 460)
-mainFrame.AnchorPoint = Vector2.new(0, 1)
-mainFrame.Position = UDim2.new(0, 20, 1, -70)   -- bottom-left, 20px from left, 70px from bottom
-mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
-mainFrame.Active = true
-mainFrame.Draggable = true
-mainFrame.Parent = screenGui
-
-Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
-local stroke = Instance.new("UIStroke", mainFrame)
-stroke.Color = Color3.fromRGB(45, 45, 55)
-stroke.Thickness = 1.5
-stroke.Parent = mainFrame
-
-local topBar = Instance.new("Frame", mainFrame)
-topBar.Size = UDim2.new(1, 0, 0, 40)
-topBar.BackgroundTransparency = 1
-topBar.Active = true
-topBar.Parent = mainFrame
-
-local title = Instance.new("TextLabel", topBar)
-title.Size = UDim2.new(1, -60, 1, 0)
-title.Position = UDim2.new(0, 12, 0, 0)
-title.BackgroundTransparency = 1
-title.Text = "Menu"
-title.TextColor3 = Color3.fromRGB(240, 240, 245)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Left
-
-local minBtn = Instance.new("TextButton", topBar)
-minBtn.Size = UDim2.new(0, 26, 0, 26)
-minBtn.Position = UDim2.new(1, -34, 0.5, -13)
-minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minBtn.Text = "-"
-minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 16
-minBtn.ZIndex = 5
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
-
--- Drag
 local dragging, dragStart, startPos = false, nil, nil
-topBar.InputBegan:Connect(function(input)
+header.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
@@ -436,37 +505,29 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
-local container = Instance.new("ScrollingFrame", mainFrame)
-container.Size = UDim2.new(1, 0, 1, -45)
-container.Position = UDim2.new(0, 0, 0, 45)
-container.BackgroundTransparency = 1
-container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 660)
-container.ScrollBarThickness = 4
-
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, 0, 0, 22)
+    row.Position = UDim2.new(0, 0, 0, y)
     row.BackgroundTransparency = 1
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.6, 0, 1, 0)
+    lbl.Size = UDim2.new(0.65, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 11
+    lbl.TextSize = 9
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     local sw = Instance.new("TextButton", row)
-    sw.Size = UDim2.new(0, 36, 0, 18)
-    sw.Position = UDim2.new(1, -36, 0.5, -9)
+    sw.Size = UDim2.new(0, 30, 0, 14)
+    sw.Position = UDim2.new(1, -30, 0.5, -7)
     sw.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
     sw.Text = ""
     sw.AutoButtonColor = false
     Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
     local knob = Instance.new("Frame", sw)
-    knob.Size = UDim2.new(0, 12, 0, 12)
-    knob.Position = UDim2.new(0, 3, 0.5, -6)
+    knob.Size = UDim2.new(0, 10, 0, 10)
+    knob.Position = UDim2.new(0, 2, 0.5, -5)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
     local a = false
@@ -474,7 +535,7 @@ local function createToggle(name, y, cb)
         a = not a
         sw.BackgroundColor3 = a and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 40, 50)
         knob.BackgroundColor3 = a and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 210)
-        knob:TweenPosition(a and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
+        knob:TweenPosition(a and UDim2.new(1, -12, 0.5, -5) or UDim2.new(0, 2, 0.5, -5),
             Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
         cb(a)
     end)
@@ -482,26 +543,26 @@ end
 
 local function createInput(name, y, def, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, 0, 0, 22)
+    row.Position = UDim2.new(0, 0, 0, y)
     row.BackgroundTransparency = 1
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.5, 0, 1, 0)
+    lbl.Size = UDim2.new(0.55, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 11
+    lbl.TextSize = 9
     lbl.TextXAlignment = Enum.TextXAlignment.Left
     local box = Instance.new("TextBox", row)
-    box.Size = UDim2.new(0, 60, 0, 22)
-    box.Position = UDim2.new(1, -60, 0.5, -11)
+    box.Size = UDim2.new(0, 50, 0, 18)
+    box.Position = UDim2.new(1, -50, 0.5, -9)
     box.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
     box.Text = tostring(def)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.Font = Enum.Font.GothamBold
-    box.TextSize = 11
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    box.TextSize = 9
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
         if n then cb(n) else box.Text = tostring(def) end
@@ -510,30 +571,52 @@ end
 
 local function createButton(name, y, color, cb)
     local b = Instance.new("TextButton", container)
-    b.Size = UDim2.new(0.9, 0, 0, 28)
-    b.Position = UDim2.new(0.05, 0, 0, y)
+    b.Size = UDim2.new(1, 0, 0, 22)
+    b.Position = UDim2.new(0, 0, 0, y)
     b.BackgroundColor3 = color
     b.Text = name
     b.TextColor3 = Color3.fromRGB(255, 255, 255)
     b.Font = Enum.Font.GothamBold
-    b.TextSize = 11
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.TextSize = 9
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
     b.MouseButton1Click:Connect(cb)
     return b
 end
 
-createToggle("Flight Mode", 5, function(s) flyToggleEnabled = s log("UI", "Flight: " .. tostring(s)) if not s then setFlying(false) end end)
-createToggle("Invisibility", 40, function(s) applyInvisibility(s) end)
-createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
-createToggle("Noclip", 110, function(s) noclipEnabled = s log("UI", "Noclip: " .. tostring(s)) end)
-createToggle("Super Speed", 145, function(s) runSpeedEnabled = s log("UI", "Speed: " .. tostring(s)) end)
-createInput("Speed (max 100)", 180, DEFAULT_SPEED, function(v) if v > MAX_SPEED then v = MAX_SPEED end if v < 1 then v = 1 end runSpeedValue = v log("UI", "Speed value: " .. tostring(v)) end)
-createToggle("Custom Jump", 215, function(s) jumpEnabled = s log("UI", "Jump: " .. tostring(s)) end)
-createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v) if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end if v < 1 then v = 1 end jumpPowerValue = v log("UI", "Jump value: " .. tostring(v)) end)
+-- ==========================================
+-- UI BINDING
+-- ==========================================
 
-createButton("TP to Spawn", 290, Color3.fromRGB(41, 128, 185), function() log("UI", "TP to Spawn") doTeleport(getEntrySpawn()) end)
+createToggle("Flight Mode", 4, function(s) flyToggleEnabled = s log("UI", "Flight: " .. tostring(s)) if not s then setFlying(false) end end)
+createToggle("Invisibility", 30, function(s) applyInvisibility(s) end)
+createToggle("No Fall Damage", 56, function(s) noFallDamageEnabled = s end)
+createToggle("Noclip", 82, function(s) noclipEnabled = s log("UI", "Noclip: " .. tostring(s)) end)
+createToggle("Super Speed", 108, function(s) runSpeedEnabled = s log("UI", "Speed: " .. tostring(s)) end)
+createInput("Speed (max 15)", 134, DEFAULT_SPEED, function(v)
+    if v > MAX_SPEED then v = MAX_SPEED end
+    if v < 1 then v = 1 end
+    runSpeedValue = v
+    log("UI", "Speed value: " .. tostring(v))
+end)
+createToggle("Custom Jump", 160, function(s) jumpEnabled = s log("UI", "Jump: " .. tostring(s)) end)
+createInput("Jump (max 107)", 186, DEFAULT_JUMP, function(v)
+    if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end
+    if v < 1 then v = 1 end
+    jumpPowerValue = v
+    log("UI", "Jump value: " .. tostring(v))
+end)
+createToggle("Prompt Extender", 212, function(s)
+    promptExtenderEnabled = s
+    log("UI", "PromptExtender: " .. tostring(s))
+    if s then
+        enablePromptExtenderAll()
+    else
+        disablePromptExtenderAll()
+    end
+end)
+createButton("TP to Spawn", 238, Color3.fromRGB(41, 128, 185), function() log("UI", "TP to Spawn") doTeleport(getEntrySpawn()) end)
 
-local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173), function()
+local saveBtn = createButton("Save Location", 264, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -541,23 +624,15 @@ local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 364, Color3.fromRGB(39, 174, 96), function() log("UI", "TP to Saved") if savedMapCFrame then doTeleport(savedMapCFrame) end end)
-createButton("SAVE LOG", 401, Color3.fromRGB(200, 80, 80), function() saveLogToFile() log("LOGGER", "Log saved") end)
+createButton("TP to Saved", 290, Color3.fromRGB(39, 174, 96), function() log("UI", "TP to Saved") if savedMapCFrame then doTeleport(savedMapCFrame) end end)
+createButton("SAVE LOG", 316, Color3.fromRGB(200, 80, 80), function() saveLogToFile() log("LOGGER", "Log saved") end)
 
 minBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        mainFrame.Visible = false
-        floatBtn.Visible = true
-    else
-        mainFrame.Visible = true
-        floatBtn.Visible = false
-    end
+    mainFrame.Visible = false
+    floatBtn.Visible = true
 end)
 
--- Floating button opens panel again
 floatBtn.MouseButton1Click:Connect(function()
-    isMinimized = false
     mainFrame.Visible = true
     floatBtn.Visible = false
 end)
@@ -595,6 +670,9 @@ local function setupCharacter(char)
     watchCharacterForInvisibility(char)
     if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
+    if promptExtenderEnabled then
+        task.defer(function() enablePromptExtenderAll() end)
+    end
     if not firstSpawnCaptured then
         task.delay(1.5, function()
             if rootPart and rootPart.Parent and not firstSpawnCaptured then
@@ -619,4 +697,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V6.8 loaded.")
+print("V7.2 loaded. Prompt Extender: 50 range, instant click.")
