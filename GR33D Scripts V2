@@ -1,7 +1,7 @@
 -- ==========================================
 -- GR33D SCRIPTS V7.5
--- Speed loophole: WalkSpeed 60 + CFrame 4 studs/frame stack
--- UI unchanged from V7.4
+-- UI from V6.6 (working) + Prompt Extender + Hybrid Speed
+-- Speed: WalkSpeed 60 + CFrame 4 studs/frame stack
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -52,8 +52,8 @@ log("BOOT", "Player: " .. player.Name)
 
 local DEFAULT_SPEED          = 15
 local MAX_SPEED              = 15
-local SPEED_STUDS_PER_FRAME  = 4      -- same as V6.6
-local SPEED_WALK_BOOST       = 60     -- ← NEW: raises server's expected position
+local SPEED_STUDS_PER_FRAME  = 4
+local SPEED_WALK_BOOST       = 60     -- hybrid loophole: raises server's expected pos
 local TP_EFFECTIVE_SPEED     = 1500
 local TP_COOLDOWN            = 1.0
 local TP_MAX_HOP             = 400
@@ -203,7 +203,7 @@ local function enablePromptExtenderAll()
             count = count + 1
         end
     end
-    log("PROMPT", "Extended " .. count .. " prompts")
+    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ", instant=true)")
 end
 
 local function disablePromptExtenderAll()
@@ -222,7 +222,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TWEEN MOVEMENT (TP)
+-- TWEEN MOVEMENT (for TP)
 -- ==========================================
 
 local function tweenMoveTo(targetPos, duration, easing)
@@ -306,7 +306,7 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (HYBRID LOOPHOLE: WalkSpeed 60 + CFrame 4/frame)
+-- SPEED (hybrid loophole: WalkSpeed 60 + CFrame 4/frame)
 -- ==========================================
 
 RunService.RenderStepped:Connect(function(dt)
@@ -326,12 +326,12 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    -- 1. Raise WalkSpeed — raises server's expected position
+    -- Raise WalkSpeed — raises server's expected position
     if humanoid.WalkSpeed < SPEED_WALK_BOOST then
         humanoid.WalkSpeed = SPEED_WALK_BOOST
     end
 
-    -- 2. CFrame micro-step on top
+    -- CFrame micro-step on top
     local frameStep = SPEED_STUDS_PER_FRAME * (dt * 60)
     local speedMult = runSpeedValue / 100
     local step = moveDir.Unit * frameStep * speedMult
@@ -424,22 +424,20 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (MOBILE-SAFE + M FLOAT BUTTON)
+-- UI (EXACT COPY FROM V6.6 — WORKING ON MOBILE)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
-screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0.7, 0)
-mainFrame.AnchorPoint = Vector2.new(0, 0.5)
-mainFrame.Position = UDim2.new(0, 10, 0.5, 0)
+mainFrame.Size = UDim2.new(0, 220, 0, 500)
+mainFrame.Position = UDim2.new(0, 20, 0.5, -250)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -472,10 +470,11 @@ minBtn.Name = "MinBtn"
 minBtn.Size = UDim2.new(0, 26, 0, 26)
 minBtn.Position = UDim2.new(1, -34, 0.5, -13)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minBtn.Text = "−"
+minBtn.Text = "-"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
 minBtn.TextSize = 16
+minBtn.AutoButtonColor = true
 minBtn.ZIndex = 5
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
 
@@ -513,20 +512,6 @@ container.BorderSizePixel = 0
 container.CanvasSize = UDim2.new(0, 0, 0, 720)
 container.ScrollBarThickness = 4
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
-
-local floatBtn = Instance.new("TextButton")
-floatBtn.Name = "FloatBtn"
-floatBtn.Size = UDim2.new(0, 40, 0, 40)
-floatBtn.AnchorPoint = Vector2.new(0, 0.5)
-floatBtn.Position = UDim2.new(0, 10, 0.5, 0)
-floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-floatBtn.Text = "M"
-floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-floatBtn.Font = Enum.Font.GothamBold
-floatBtn.TextSize = 18
-floatBtn.Visible = false
-Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
-floatBtn.Parent = screenGui
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
@@ -634,9 +619,7 @@ end)
 createToggle("Super Speed", 145, function(s)
     runSpeedEnabled = s
     log("UI", "Speed: " .. tostring(s))
-    if not s and humanoid then
-        humanoid.WalkSpeed = 16
-    end
+    if not s and humanoid then humanoid.WalkSpeed = 16 end
 end)
 
 createInput("Speed (max 15)", 180, DEFAULT_SPEED, function(v)
@@ -692,14 +675,27 @@ createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
 end)
 
 minBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = false
-    floatBtn.Visible = true
+    isMinimized = not isMinimized
+    if isMinimized then
+        mainFrame.Size = UDim2.new(0, 36, 0, 36)
+        container.Visible = false
+        title.Visible = false
+        minBtn.Size = UDim2.new(1, 0, 1, 0)
+        minBtn.Position = UDim2.new(0, 0, 0, 0)
+        minBtn.Text = "+"
+    else
+        mainFrame.Size = UDim2.new(0, 220, 0, 500)
+        container.Visible = true
+        title.Visible = true
+        minBtn.Size = UDim2.new(0, 26, 0, 26)
+        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
+        minBtn.Text = "-"
+    end
 end)
 
-floatBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = true
-    floatBtn.Visible = false
-end)
+-- ==========================================
+-- JUMP INPUT
+-- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
     local now = os.clock()
@@ -779,4 +775,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V7.5 loaded. Speed: WalkSpeed 60 + CFrame 4/frame hybrid.")
+print("V7.5 loaded. UI from V6.6. Hybrid speed. Prompt extender.")
