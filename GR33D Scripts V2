@@ -1,6 +1,7 @@
 -- ==========================================
--- GR33D SCRIPTS V7.3
--- Speed from V6.6 (capped at 15) + Prompt Extender
+-- GR33D SCRIPTS V7.4
+-- Speed: 8 studs/frame × input 15 = ~2× boost
+-- UI: viewport-relative, always visible
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -41,17 +42,16 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V7.3 Starting ===")
-log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
+log("BOOT", "=== GR33D V7.4 Starting ===")
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
 -- CONFIG
 -- ==========================================
 
-local DEFAULT_SPEED          = 15     -- ← changed from 100
-local MAX_SPEED              = 15     -- ← changed from 100 (cap)
-local SPEED_STUDS_PER_FRAME  = 4      -- same as V6.6
+local DEFAULT_SPEED          = 15
+local MAX_SPEED              = 15
+local SPEED_STUDS_PER_FRAME  = 8      -- ← TEST A: doubled from 4
 local TP_EFFECTIVE_SPEED     = 1500
 local TP_COOLDOWN            = 1.0
 local TP_MAX_HOP             = 400
@@ -201,7 +201,7 @@ local function enablePromptExtenderAll()
             count = count + 1
         end
     end
-    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ", instant=true)")
+    log("PROMPT", "Extended " .. count .. " prompts")
 end
 
 local function disablePromptExtenderAll()
@@ -220,7 +220,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TWEEN MOVEMENT (for TP)
+-- TWEEN MOVEMENT (TP)
 -- ==========================================
 
 local function tweenMoveTo(targetPos, duration, easing)
@@ -304,7 +304,7 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (V6.6 micro-steps, capped at 15)
+-- SPEED (V6.6 method, 8 studs/frame × 15)
 -- ==========================================
 
 RunService.RenderStepped:Connect(function(dt)
@@ -314,7 +314,6 @@ RunService.RenderStepped:Connect(function(dt)
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude < 0.01 then return end
 
-    -- Same as V6.6 — raw CFrame micro-steps
     local frameStep = SPEED_STUDS_PER_FRAME * (dt * 60)
     local speedMult = runSpeedValue / 100
     local step = moveDir.Unit * frameStep * speedMult
@@ -407,20 +406,25 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (V6.6 style — narrower, left positioned)
+-- UI (viewport-relative — always visible)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
+screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
+-- Panel size: 220px wide, 70% of viewport tall
+-- Anchor: middle-left. Position: 10px from left, centered vertically.
+-- This ALWAYS fits any screen because 70% < 100%.
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0, 540)
-mainFrame.Position = UDim2.new(0, 20, 0.5, -270)
+mainFrame.Size = UDim2.new(0, 220, 0.7, 0)
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
+mainFrame.Position = UDim2.new(0, 10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -432,35 +436,36 @@ stroke.Color = Color3.fromRGB(45, 45, 55)
 stroke.Thickness = 1.5
 stroke.Parent = mainFrame
 
+-- Top bar
 local topBar = Instance.new("Frame", mainFrame)
-topBar.Size = UDim2.new(1, 0, 0, 40)
+topBar.Size = UDim2.new(1, 0, 0, 36)
 topBar.Position = UDim2.new(0, 0, 0, 0)
 topBar.BackgroundTransparency = 1
 topBar.Active = true
 
 local title = Instance.new("TextLabel", topBar)
-title.Size = UDim2.new(1, -60, 1, 0)
-title.Position = UDim2.new(0, 12, 0, 0)
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "Menu"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.TextSize = 13
 title.TextXAlignment = Enum.TextXAlignment.Left
 
 local minBtn = Instance.new("TextButton", topBar)
 minBtn.Name = "MinBtn"
-minBtn.Size = UDim2.new(0, 26, 0, 26)
-minBtn.Position = UDim2.new(1, -34, 0.5, -13)
+minBtn.Size = UDim2.new(0, 24, 0, 24)
+minBtn.Position = UDim2.new(1, -30, 0.5, -12)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minBtn.Text = "-"
+minBtn.Text = "−"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 16
-minBtn.AutoButtonColor = true
+minBtn.TextSize = 14
 minBtn.ZIndex = 5
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
+-- Drag
 local dragging, dragStart, startPos = false, nil, nil
 topBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -487,23 +492,39 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
+-- Scrolling container (fills below top bar)
 local container = Instance.new("ScrollingFrame", mainFrame)
-container.Size = UDim2.new(1, 0, 1, -45)
-container.Position = UDim2.new(0, 0, 0, 45)
+container.Size = UDim2.new(1, 0, 1, -40)
+container.Position = UDim2.new(0, 0, 0, 40)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
 container.CanvasSize = UDim2.new(0, 0, 0, 720)
 container.ScrollBarThickness = 4
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
 
+-- Floating "M" button (when panel minimized)
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name = "FloatBtn"
+floatBtn.Size = UDim2.new(0, 40, 0, 40)
+floatBtn.AnchorPoint = Vector2.new(0, 0.5)
+floatBtn.Position = UDim2.new(0, 10, 0.5, 0)
+floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+floatBtn.Text = "M"
+floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextSize = 18
+floatBtn.Visible = false
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
+floatBtn.Parent = screenGui
+
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, -8, 0, 30)
+    row.Position = UDim2.new(0, 4, 0, y)
     row.BackgroundTransparency = 1
 
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.6, 0, 1, 0)
+    lbl.Size = UDim2.new(0.62, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
@@ -538,12 +559,12 @@ end
 
 local function createInput(name, y, def, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, -8, 0, 30)
+    row.Position = UDim2.new(0, 4, 0, y)
     row.BackgroundTransparency = 1
 
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.5, 0, 1, 0)
+    lbl.Size = UDim2.new(0.55, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
@@ -569,8 +590,8 @@ end
 
 local function createButton(name, y, color, cb)
     local b = Instance.new("TextButton", container)
-    b.Size = UDim2.new(0.9, 0, 0, 28)
-    b.Position = UDim2.new(0.05, 0, 0, y)
+    b.Size = UDim2.new(1, -8, 0, 28)
+    b.Position = UDim2.new(0, 4, 0, y)
     b.BackgroundColor3 = color
     b.Text = name
     b.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -604,7 +625,6 @@ createToggle("Super Speed", 145, function(s)
     log("UI", "Speed: " .. tostring(s))
 end)
 
--- ↓↓↓ Speed input capped at 15 ↓↓↓
 createInput("Speed (max 15)", 180, DEFAULT_SPEED, function(v)
     if v > MAX_SPEED then v = MAX_SPEED end
     if v < 1 then v = 1 end
@@ -658,23 +678,18 @@ createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
 end)
 
 minBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        mainFrame.Size = UDim2.new(0, 36, 0, 36)
-        container.Visible = false
-        title.Visible = false
-        minBtn.Size = UDim2.new(1, 0, 1, 0)
-        minBtn.Position = UDim2.new(0, 0, 0, 0)
-        minBtn.Text = "+"
-    else
-        mainFrame.Size = UDim2.new(0, 220, 0, 540)
-        container.Visible = true
-        title.Visible = true
-        minBtn.Size = UDim2.new(0, 26, 0, 26)
-        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
-        minBtn.Text = "-"
-    end
+    mainFrame.Visible = false
+    floatBtn.Visible = true
 end)
+
+floatBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    floatBtn.Visible = false
+end)
+
+-- ==========================================
+-- JUMP INPUT
+-- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
     local now = os.clock()
@@ -754,4 +769,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V7.3 loaded. Speed capped at 15. Prompt Extender added.")
+print("V7.4 loaded. Speed: 8 studs/frame × 15. UI: viewport-relative.")
