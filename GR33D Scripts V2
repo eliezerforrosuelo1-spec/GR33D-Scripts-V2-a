@@ -1,8 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS V6.3 - TWEEN EDITION
--- Matches the working auto-steal cheat's method
--- Speed: 100 (from cheat)
--- Modes: Tween (safe) / Instant (risky)
+-- GR33D SCRIPTS V6.4.1
+-- UI repositioned + all V6.4 fixes
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -43,21 +41,24 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V6.3 Starting ===")
+log("BOOT", "=== GR33D V6.4.1 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
--- CONFIG (from working cheat)
+-- CONFIG
 -- ==========================================
 
-local DEFAULT_SPEED      = 100
-local MAX_SPEED          = 100    -- cap at 100 like the working cheat
-local SPEED_STUDS_PER_SEC = 2800  -- hidden multiplier — what "speed 100" actually means
-local MAX_JUMP_IMPULSE   = 107
-local DEFAULT_JUMP       = 100
-local MAX_SAFE_FALL      = 50
-local DOUBLE_TAP_WINDOW  = 0.35
+local DEFAULT_SPEED         = 100
+local MAX_SPEED             = 100
+local TP_EFFECTIVE_SPEED    = 2800
+local TP_COOLDOWN           = 1.0
+local TP_MAX_HOP            = 800
+local SPEED_BURST_DURATION  = 0.15
+local MAX_JUMP_IMPULSE      = 107
+local DEFAULT_JUMP          = 100
+local MAX_SAFE_FALL         = 50
+local DOUBLE_TAP_WINDOW     = 0.35
 
 -- ==========================================
 -- STATE
@@ -71,14 +72,16 @@ local noclipEnabled       = false
 local runSpeedEnabled     = false
 local jumpEnabled         = false
 local isMinimized         = false
-local useInstantMode      = false    -- false = Tween (safe), true = Instant (risky)
 
 local runSpeedValue       = DEFAULT_SPEED
 local jumpPowerValue      = DEFAULT_JUMP
 
 local lastJumpTapTime     = 0
 local lastJumpReqTime     = 0
-local entrySpawnCFrame    = nil
+local lastTPTime          = 0
+local lastBurstTime       = 0
+local realSpawnCFrame     = nil
+local firstSpawnCaptured  = false
 local savedMapCFrame      = nil
 
 local character, rootPart, humanoid
@@ -88,9 +91,8 @@ local originalTransparency      = {}
 local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
--- Active tween tracking (for cancellation)
-local activeTween = nil
-local activeTweenEnd = nil
+local activeTween      = nil
+local activeBurstTween = nil
 
 -- ==========================================
 -- INVISIBILITY
@@ -152,130 +154,123 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- TWEEN TELEPORT (the working cheat's method)
+-- TWEEN MOVEMENT
 -- ==========================================
 
-local function cancelActiveTween()
+local function tweenMoveTo(targetPos, duration, easing)
+    if not rootPart then return false end
     if activeTween then
         pcall(function() activeTween:Cancel() end)
         activeTween = nil
     end
-    activeTweenEnd = nil
-end
 
-local function doTeleport(targetCFrame)
-    if not rootPart or not humanoid then return end
-    if not targetCFrame then return end
+    duration = duration or 0.3
+    easing = easing or Enum.EasingStyle.Quad
 
-    cancelActiveTween()
+    local targetCF = CFrame.new(targetPos)
+    local tweenInfo = TweenInfo.new(duration, easing, Enum.EasingDirection.Out)
+    activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
+    activeTween:Play()
+    activeTween.Completed:Wait()
+    activeTween = nil
 
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local startPos  = rootPart.Position
-    local distance  = (targetPos - startPos).Magnitude
-
-    log("TP", string.format("doTeleport dist=%.1f mode=%s",
-        distance, useInstantMode and "INSTANT" or "TWEEN"))
-
-    if distance < 5 then return end
-
-    -- Kill velocity
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    if useInstantMode then
-        -- INSTANT: short tween that looks like a teleport
-        -- Duration ~0.08s regardless of distance
-        local duration = 0.08
-        local targetCF = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
-        local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-        activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
-        activeTween:Play()
-        activeTween.Completed:Wait()
-        activeTween = nil
-        log("TP", "Instant complete")
-    else
-        -- TWEEN: smooth interpolation based on speed
-        -- Duration = distance / (speed × multiplier / 100)
-        local effectiveSpeed = (runSpeedValue / 100) * SPEED_STUDS_PER_SEC
-        local duration = math.max(0.15, distance / effectiveSpeed)
-
-        log("TP", string.format("Tween duration=%.3fs effectiveSpeed=%.0f",
-            duration, effectiveSpeed))
-
-        local targetCF = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
-        local tweenInfo = TweenInfo.new(
-            duration,
-            Enum.EasingStyle.Quad,  -- matches working cheat
-            Enum.EasingDirection.Out
-        )
-        activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
-        activeTween:Play()
-
-        -- Reset state during tween
-        local resets = 0
-        local conn
-        conn = RunService.Heartbeat:Connect(function()
-            if not activeTween then
-                if conn then conn:Disconnect() end
-                return
-            end
-            resets = resets + 1
-            if resets % 5 == 0 and humanoid then
-                pcall(function()
-                    humanoid:ChangeState(Enum.HumanoidStateType.Running)
-                end)
-            end
-        end)
-
-        activeTween.Completed:Wait()
-        activeTween = nil
-        if conn then conn:Disconnect() end
-        log("TP", "Tween complete")
-    end
-
-    -- Zero velocity on arrival
     if rootPart and rootPart.Parent then
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
     end
     if humanoid and humanoid.Parent then
-        pcall(function()
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
-        end)
+        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
     end
+    return true
+end
+
+local function doTeleport(targetCFrame)
+    if not rootPart or not humanoid or not targetCFrame then return end
+
+    local now = os.clock()
+    if now - lastTPTime < TP_COOLDOWN then
+        local wait = TP_COOLDOWN - (now - lastTPTime)
+        log("TP", string.format("Cooldown: waiting %.2fs", wait))
+        task.wait(wait)
+    end
+    lastTPTime = os.clock()
+
+    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
+    local startPos  = rootPart.Position
+    local distance  = (targetPos - startPos).Magnitude
+
+    log("TP", string.format("doTeleport dist=%.1f", distance))
+
+    if distance < 5 then return end
+
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    if distance > TP_MAX_HOP then
+        local hops = math.ceil(distance / TP_MAX_HOP)
+        log("TP", string.format("Chaining %d hops", hops))
+        for i = 1, hops do
+            if not rootPart or not rootPart.Parent then return end
+            local alpha = i / hops
+            local hopPos = startPos:Lerp(targetPos, alpha)
+            local hopDist = (hopPos - rootPart.Position).Magnitude
+            local hopDuration = math.max(0.25, hopDist / TP_EFFECTIVE_SPEED)
+            tweenMoveTo(hopPos, hopDuration, Enum.EasingStyle.Quad)
+            if i < hops then task.wait(TP_COOLDOWN) end
+        end
+    else
+        local duration = math.max(0.25, distance / TP_EFFECTIVE_SPEED)
+        log("TP", string.format("Single tween: duration=%.3fs", duration))
+        tweenMoveTo(targetPos, duration, Enum.EasingStyle.Quad)
+    end
+
+    log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
+        rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
 end
 
 local function getEntrySpawn()
-    if entrySpawnCFrame then return entrySpawnCFrame end
+    if realSpawnCFrame then return realSpawnCFrame end
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
-            entrySpawnCFrame = obj.CFrame
-            log("TP", "Found spawn")
-            return entrySpawnCFrame
+            log("SPAWN", "Fallback: found SpawnLocation")
+            return obj.CFrame
         end
     end
     return rootPart and rootPart.CFrame or CFrame.new(0, 5, 0)
 end
 
 -- ==========================================
--- SUPER SPEED (Tween-based per-frame)
+-- SPEED VIA TWEEN BURST
 -- ==========================================
 
--- The working cheat runs at speed 100 — we move via short tweens per direction change.
--- Simpler: use WalkSpeed and set it to 100 (matches the cheat's cap)
+RunService.Heartbeat:Connect(function()
+    if not runSpeedEnabled or not rootPart or not humanoid then return end
+    if isFlying or activeTween then return end
 
-RunService.Stepped:Connect(function()
-    if not humanoid then return end
-    if runSpeedEnabled and not isFlying and not activeTween then
-        local target = math.min(runSpeedValue, MAX_SPEED)
-        if humanoid.WalkSpeed < target then
-            humanoid.WalkSpeed = target
-        end
-    elseif not runSpeedEnabled then
-        if humanoid.WalkSpeed > 20 then
-            humanoid.WalkSpeed = 16
-        end
+    local moveDir = humanoid.MoveDirection
+    if moveDir.Magnitude < 0.01 then return end
+
+    local now = os.clock()
+    if now - lastBurstTime < SPEED_BURST_DURATION then return end
+    lastBurstTime = now
+
+    local speedMult = runSpeedValue / 100
+    local burstDistance = 60 * speedMult
+
+    local startPos = rootPart.Position
+    local targetPos = startPos + moveDir.Unit * burstDistance
+
+    local duration = SPEED_BURST_DURATION
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+
+    if activeBurstTween then
+        pcall(function() activeBurstTween:Cancel() end)
     end
+
+    activeBurstTween = TweenService:Create(rootPart, tweenInfo, {
+        CFrame = CFrame.new(targetPos, targetPos + moveDir.Unit)
+    })
+    activeBurstTween:Play()
 end)
 
 -- ==========================================
@@ -297,7 +292,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- NOCLIP (via CanCollide only, with reset)
+-- NOCLIP
 -- ==========================================
 
 RunService.Stepped:Connect(function()
@@ -355,17 +350,23 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI
+-- UI (FIXED POSITION)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = false   -- keep Roblox top bar reserved
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
 mainFrame.Size = UDim2.new(0, 250, 0, 540)
-mainFrame.Position = UDim2.new(0.8, -125, 0.5, -270)
+-- FIXED POSITION: Right side of screen, vertically centered, never under top bar
+-- X: right edge minus (width + 20px margin)
+-- Y: center of screen minus half height
+mainFrame.Position = UDim2.new(1, -270, 0.5, -270)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -377,8 +378,15 @@ stroke.Color = Color3.fromRGB(45, 45, 55)
 stroke.Thickness = 1.5
 stroke.Parent = mainFrame
 
-local title = Instance.new("TextLabel", mainFrame)
-title.Size = UDim2.new(1, -40, 0, 40)
+-- Top bar with title + minimize button
+local topBar = Instance.new("Frame", mainFrame)
+topBar.Size = UDim2.new(1, 0, 0, 40)
+topBar.Position = UDim2.new(0, 0, 0, 0)
+topBar.BackgroundTransparency = 1
+topBar.Active = true
+
+local title = Instance.new("TextLabel", topBar)
+title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 12, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "Menu"
@@ -387,29 +395,67 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
-local minBtn = Instance.new("TextButton", mainFrame)
+-- MINIMIZE BUTTON — moved INSIDE the frame, away from Roblox top bar
+local minBtn = Instance.new("TextButton", topBar)
+minBtn.Name = "MinBtn"
 minBtn.Size = UDim2.new(0, 26, 0, 26)
-minBtn.Position = UDim2.new(1, -34, 0, 7)
+minBtn.Position = UDim2.new(1, -34, 0.5, -13)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
 minBtn.Text = "-"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
 minBtn.TextSize = 16
+minBtn.AutoButtonColor = true
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
 
+-- Dragging (works on topBar)
+local dragging, dragStart, startPos = false, nil, nil
+
+topBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- Scrolling container for toggles
 local container = Instance.new("ScrollingFrame", mainFrame)
+container.Name = "Container"
 container.Size = UDim2.new(1, 0, 1, -45)
 container.Position = UDim2.new(0, 0, 0, 45)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 650)
+container.CanvasSize = UDim2.new(0, 0, 0, 660)
 container.ScrollBarThickness = 4
+container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
 
+-- Toggle builder
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
     row.Size = UDim2.new(0.9, 0, 0, 32)
     row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
+
     local lbl = Instance.new("TextLabel", row)
     lbl.Size = UDim2.new(0.65, 0, 1, 0)
     lbl.BackgroundTransparency = 1
@@ -418,6 +464,7 @@ local function createToggle(name, y, cb)
     lbl.Font = Enum.Font.GothamMedium
     lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
+
     local sw = Instance.new("TextButton", row)
     sw.Size = UDim2.new(0, 40, 0, 20)
     sw.Position = UDim2.new(1, -40, 0.5, -10)
@@ -425,11 +472,13 @@ local function createToggle(name, y, cb)
     sw.Text = ""
     sw.AutoButtonColor = false
     Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
+
     local knob = Instance.new("Frame", sw)
     knob.Size = UDim2.new(0, 14, 0, 14)
     knob.Position = UDim2.new(0, 3, 0.5, -7)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
     local a = false
     sw.MouseButton1Click:Connect(function()
         a = not a
@@ -446,6 +495,7 @@ local function createInput(name, y, def, cb)
     row.Size = UDim2.new(0.9, 0, 0, 32)
     row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
+
     local lbl = Instance.new("TextLabel", row)
     lbl.Size = UDim2.new(0.5, 0, 1, 0)
     lbl.BackgroundTransparency = 1
@@ -454,6 +504,7 @@ local function createInput(name, y, def, cb)
     lbl.Font = Enum.Font.GothamMedium
     lbl.TextSize = 12
     lbl.TextXAlignment = Enum.TextXAlignment.Left
+
     local box = Instance.new("TextBox", row)
     box.Size = UDim2.new(0, 75, 0, 24)
     box.Position = UDim2.new(1, -75, 0.5, -12)
@@ -463,6 +514,7 @@ local function createInput(name, y, def, cb)
     box.Font = Enum.Font.GothamBold
     box.TextSize = 12
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
         if n then cb(n) else box.Text = tostring(def) end
@@ -482,6 +534,10 @@ local function createButton(name, y, color, cb)
     b.MouseButton1Click:Connect(cb)
     return b
 end
+
+-- ==========================================
+-- UI BINDING
+-- ==========================================
 
 createToggle("Flight Mode", 5, function(s)
     flyToggleEnabled = s
@@ -522,18 +578,12 @@ createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v)
     log("UI", "Jump value: " .. tostring(v))
 end)
 
--- TP MODE TOGGLE
-createToggle("Use INSTANT Mode", 285, function(s)
-    useInstantMode = s
-    log("UI", "TP mode: " .. (s and "INSTANT" or "TWEEN"))
-end)
-
-createButton("TP to Spawn", 320, Color3.fromRGB(41, 128, 185), function()
+createButton("TP to Spawn", 290, Color3.fromRGB(41, 128, 185), function()
     log("UI", "TP to Spawn")
     doTeleport(getEntrySpawn())
 end)
 
-local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173), function()
+local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -541,15 +591,19 @@ local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 394, Color3.fromRGB(39, 174, 96), function()
+createButton("TP to Saved", 364, Color3.fromRGB(39, 174, 96), function()
     log("UI", "TP to Saved")
     if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
-createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
+createButton("SAVE LOG", 401, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
+
+-- ==========================================
+-- MINIMIZE FUNCTION
+-- ==========================================
 
 minBtn.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
@@ -565,7 +619,7 @@ minBtn.MouseButton1Click:Connect(function()
         container.Visible = true
         title.Visible = true
         minBtn.Size = UDim2.new(0, 26, 0, 26)
-        minBtn.Position = UDim2.new(1, -34, 0, 7)
+        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
         minBtn.Text = "-"
     end
 end)
@@ -621,6 +675,19 @@ local function setupCharacter(char)
     watchCharacterForInvisibility(char)
     if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
+
+    if not firstSpawnCaptured then
+        task.delay(1.5, function()
+            if rootPart and rootPart.Parent and not firstSpawnCaptured then
+                realSpawnCFrame = rootPart.CFrame
+                firstSpawnCaptured = true
+                log("SPAWN", string.format("Captured real spawn: (%.1f, %.1f, %.1f)",
+                    realSpawnCFrame.Position.X,
+                    realSpawnCFrame.Position.Y,
+                    realSpawnCFrame.Position.Z))
+            end
+        end)
+    end
 end
 
 task.spawn(function()
@@ -630,10 +697,11 @@ end)
 player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
-    cancelActiveTween()
+    if activeTween then pcall(function() activeTween:Cancel() end) activeTween = nil end
+    if activeBurstTween then pcall(function() activeBurstTween:Cancel() end) activeBurstTween = nil end
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V6.3 loaded. Use SAVE LOG.")
+print("V6.4.1 loaded. UI fixed. Use SAVE LOG.")
