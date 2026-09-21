@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS V7.2
--- Speed 15 + Prompt Extender (50 range, instant click)
+-- GR33D SCRIPTS V7.3
+-- Speed from V6.6 (capped at 15) + Prompt Extender
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -30,8 +30,9 @@ local function log(cat, msg)
     if logCount >= MAX_LOG_LINES then return end
     logCount = logCount + 1
     local t = string.format("%.3f", os.clock() - logStartTime)
-    table.insert(logBuffer, string.format("[%s][%s] %s", t, cat, msg))
-    print(logBuffer[#logBuffer])
+    local line = string.format("[%s][%s] %s", t, cat, msg)
+    table.insert(logBuffer, line)
+    print(line)
 end
 
 local function saveLogToFile()
@@ -40,26 +41,26 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V7.2 Starting ===")
+log("BOOT", "=== GR33D V7.3 Starting ===")
+log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
 -- CONFIG
 -- ==========================================
 
-local DEFAULT_SPEED          = 15
-local MAX_SPEED              = 15
-local SPEED_TWEEN_INTERVAL   = 0.016
-local SPEED_BASE_DIST        = 4
+local DEFAULT_SPEED          = 15     -- ← changed from 100
+local MAX_SPEED              = 15     -- ← changed from 100 (cap)
+local SPEED_STUDS_PER_FRAME  = 4      -- same as V6.6
 local TP_EFFECTIVE_SPEED     = 1500
-local TP_MAX_HOP             = 150
-local TP_HOP_COOLDOWN        = 0.3
+local TP_COOLDOWN            = 1.0
+local TP_MAX_HOP             = 400
 local MAX_JUMP_IMPULSE       = 107
 local DEFAULT_JUMP           = 100
 local MAX_SAFE_FALL          = 50
 local DOUBLE_TAP_WINDOW      = 0.35
 
--- Prompt extender config
+-- Prompt Extender
 local PROMPT_MAX_DISTANCE    = 50
 local PROMPT_HOLD_DURATION   = 0
 local PROMPT_REQUIRES_LOS    = false
@@ -83,6 +84,7 @@ local jumpPowerValue      = DEFAULT_JUMP
 
 local lastJumpTapTime     = 0
 local lastJumpReqTime     = 0
+local lastTPTime          = 0
 local lastSpeedLogTime    = 0
 local realSpawnCFrame     = nil
 local firstSpawnCaptured  = false
@@ -96,10 +98,6 @@ local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
 local activeTween = nil
-local speedTween  = nil
-local speedAccum  = 0
-local isTPBusy    = false
-
 local trackedPrompts = {}
 
 -- ==========================================
@@ -203,7 +201,7 @@ local function enablePromptExtenderAll()
             count = count + 1
         end
     end
-    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ")")
+    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ", instant=true)")
 end
 
 local function disablePromptExtenderAll()
@@ -222,7 +220,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TP
+-- TWEEN MOVEMENT (for TP)
 -- ==========================================
 
 local function tweenMoveTo(targetPos, duration, easing)
@@ -231,67 +229,68 @@ local function tweenMoveTo(targetPos, duration, easing)
         pcall(function() activeTween:Cancel() end)
         activeTween = nil
     end
+
     duration = duration or 0.3
     easing = easing or Enum.EasingStyle.Quad
-    local lookDir = rootPart.CFrame.LookVector
-    local targetCF = CFrame.new(targetPos, targetPos + lookDir)
+
+    local currentLook = rootPart.CFrame.LookVector
+    local targetCF = CFrame.new(targetPos, targetPos + currentLook)
+
     local tweenInfo = TweenInfo.new(duration, easing, Enum.EasingDirection.Out)
     activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
     activeTween:Play()
     activeTween.Completed:Wait()
     activeTween = nil
+
     if rootPart and rootPart.Parent then
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
     end
     if humanoid and humanoid.Parent then
         pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
-        humanoid.Health = humanoid.MaxHealth
     end
     return true
 end
 
 local function doTeleport(targetCFrame)
     if not rootPart or not humanoid or not targetCFrame then return end
-    if isTPBusy then return end
-    isTPBusy = true
 
-    local wasNoFall = noFallDamageEnabled
-    noFallDamageEnabled = true
+    local now = os.clock()
+    if now - lastTPTime < TP_COOLDOWN then
+        task.wait(TP_COOLDOWN - (now - lastTPTime))
+    end
+    lastTPTime = os.clock()
 
     local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local startPos = rootPart.Position
-    local distance = (targetPos - startPos).Magnitude
+    local startPos  = rootPart.Position
+    local distance  = (targetPos - startPos).Magnitude
 
     log("TP", string.format("doTeleport dist=%.1f", distance))
 
-    if distance < 5 then
-        noFallDamageEnabled = wasNoFall
-        isTPBusy = false
-        return
-    end
+    if distance < 5 then return end
 
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    local hops = math.max(1, math.ceil(distance / TP_MAX_HOP))
-    log("TP", string.format("Chaining %d hops of %.1f studs", hops, distance / hops))
-
-    for i = 1, hops do
-        if not rootPart or not rootPart.Parent then break end
-        local alpha = i / hops
-        local hopPos = startPos:Lerp(targetPos, alpha)
-        local hopDist = (hopPos - rootPart.Position).Magnitude
-        local hopDuration = math.max(0.1, hopDist / TP_EFFECTIVE_SPEED)
-        tweenMoveTo(hopPos, hopDuration, Enum.EasingStyle.Linear)
-        if i < hops then task.wait(TP_HOP_COOLDOWN) end
+    if distance > TP_MAX_HOP then
+        local hops = math.ceil(distance / TP_MAX_HOP)
+        log("TP", string.format("Chaining %d hops", hops))
+        for i = 1, hops do
+            if not rootPart or not rootPart.Parent then return end
+            local alpha = i / hops
+            local hopPos = startPos:Lerp(targetPos, alpha)
+            local hopDist = (hopPos - rootPart.Position).Magnitude
+            local hopDuration = math.max(0.3, hopDist / TP_EFFECTIVE_SPEED)
+            tweenMoveTo(hopPos, hopDuration, Enum.EasingStyle.Quad)
+            if i < hops then task.wait(TP_COOLDOWN) end
+        end
+    else
+        local duration = math.max(0.3, distance / TP_EFFECTIVE_SPEED)
+        tweenMoveTo(targetPos, duration, Enum.EasingStyle.Quad)
     end
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
-
-    noFallDamageEnabled = wasNoFall
-    isTPBusy = false
 end
 
 local function getEntrySpawn()
@@ -305,42 +304,29 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (capped at 15)
+-- SPEED (V6.6 micro-steps, capped at 15)
 -- ==========================================
 
-RunService.Heartbeat:Connect(function(dt)
+RunService.RenderStepped:Connect(function(dt)
     if not runSpeedEnabled or not rootPart or not humanoid then return end
-    if isFlying or activeTween or isTPBusy then return end
+    if isFlying or activeTween then return end
 
     local moveDir = humanoid.MoveDirection
-    if moveDir.Magnitude < 0.01 then
-        if speedTween then pcall(function() speedTween:Cancel() end) speedTween = nil end
-        speedAccum = 0
-        return
-    end
+    if moveDir.Magnitude < 0.01 then return end
 
-    speedAccum = speedAccum + dt
-    if speedAccum < SPEED_TWEEN_INTERVAL then return end
-    speedAccum = 0
-
-    if speedTween then pcall(function() speedTween:Cancel() end) end
-
+    -- Same as V6.6 — raw CFrame micro-steps
+    local frameStep = SPEED_STUDS_PER_FRAME * (dt * 60)
     local speedMult = runSpeedValue / 100
-    local stepDist = SPEED_BASE_DIST * speedMult
-    local startPos = rootPart.Position
-    local targetPos = startPos + moveDir.Unit * stepDist
+    local step = moveDir.Unit * frameStep * speedMult
 
-    local tweenInfo = TweenInfo.new(SPEED_TWEEN_INTERVAL, Enum.EasingStyle.Linear)
-    speedTween = TweenService:Create(rootPart, tweenInfo, {
-        CFrame = CFrame.new(targetPos, targetPos + moveDir.Unit)
-    })
-    speedTween:Play()
+    local newPos = rootPart.Position + step
+    rootPart.CFrame = CFrame.new(newPos, newPos + moveDir.Unit)
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("step=%.2f/%.3fs = %.0f studs/s",
-            stepDist, SPEED_TWEEN_INTERVAL, stepDist / SPEED_TWEEN_INTERVAL))
+        log("SPEED", string.format("step=%.2f studs/frame, pos=(%.1f, %.1f, %.1f)",
+            frameStep, newPos.X, newPos.Y, newPos.Z))
     end
 end)
 
@@ -355,7 +341,10 @@ local function applyJump()
     lastJumpReqTime = os.clock()
     local impulse = math.min(jumpPowerValue, MAX_JUMP_IMPULSE)
     rootPart.AssemblyLinearVelocity = Vector3.new(
-        rootPart.AssemblyLinearVelocity.X, impulse, rootPart.AssemblyLinearVelocity.Z)
+        rootPart.AssemblyLinearVelocity.X,
+        impulse,
+        rootPart.AssemblyLinearVelocity.Z
+    )
     log("JUMP", string.format("impulse=%.1f", impulse))
 end
 
@@ -364,10 +353,12 @@ end
 -- ==========================================
 
 RunService.Stepped:Connect(function()
-    if not character or not noclipEnabled then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then
-            part.CanCollide = false
+    if not character then return end
+    if noclipEnabled then
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") and part.CanCollide then
+                part.CanCollide = false
+            end
         end
     end
 end)
@@ -397,9 +388,13 @@ RunService.RenderStepped:Connect(function()
         camera = workspace.CurrentCamera
         return
     end
+
     if isFlying and linearVelocity and humanoid and rootPart then
-        if humanoid.FloorMaterial ~= Enum.Material.Air then setFlying(false) end
+        if humanoid.FloorMaterial ~= Enum.Material.Air then
+            setFlying(false)
+        end
     end
+
     if humanoid and rootPart and noFallDamageEnabled then
         local st = humanoid:GetState()
         if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
@@ -412,130 +407,130 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (MOBILE-SAFE)
+-- UI (V6.6 style — narrower, left positioned)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
-screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 170, 0, 330)
-mainFrame.AnchorPoint = Vector2.new(0, 0)
-mainFrame.Position = UDim2.new(0, 8, 0, 50)
+mainFrame.Size = UDim2.new(0, 220, 0, 540)
+mainFrame.Position = UDim2.new(0, 20, 0.5, -270)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
 mainFrame.Parent = screenGui
 
-Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 local stroke = Instance.new("UIStroke", mainFrame)
 stroke.Color = Color3.fromRGB(45, 45, 55)
 stroke.Thickness = 1.5
 stroke.Parent = mainFrame
 
-local header = Instance.new("Frame", mainFrame)
-header.Size = UDim2.new(1, 0, 0, 26)
-header.BackgroundTransparency = 1
+local topBar = Instance.new("Frame", mainFrame)
+topBar.Size = UDim2.new(1, 0, 0, 40)
+topBar.Position = UDim2.new(0, 0, 0, 0)
+topBar.BackgroundTransparency = 1
+topBar.Active = true
 
-local title = Instance.new("TextLabel", header)
-title.Size = UDim2.new(1, -40, 1, 0)
-title.Position = UDim2.new(0, 8, 0, 0)
+local title = Instance.new("TextLabel", topBar)
+title.Size = UDim2.new(1, -60, 1, 0)
+title.Position = UDim2.new(0, 12, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "Menu"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 12
+title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 
-local minBtn = Instance.new("TextButton", header)
-minBtn.Size = UDim2.new(0, 22, 0, 22)
-minBtn.Position = UDim2.new(1, -26, 0.5, -11)
+local minBtn = Instance.new("TextButton", topBar)
+minBtn.Name = "MinBtn"
+minBtn.Size = UDim2.new(0, 26, 0, 26)
+minBtn.Position = UDim2.new(1, -34, 0.5, -13)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minBtn.Text = "−"
+minBtn.Text = "-"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 14
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
-
-local container = Instance.new("ScrollingFrame", mainFrame)
-container.Size = UDim2.new(1, -4, 1, -30)
-container.Position = UDim2.new(0, 2, 0, 28)
-container.BackgroundTransparency = 1
-container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 610)
-container.ScrollBarThickness = 3
-container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
-
-local floatBtn = Instance.new("TextButton")
-floatBtn.Size = UDim2.new(0, 40, 0, 40)
-floatBtn.AnchorPoint = Vector2.new(0, 0)
-floatBtn.Position = UDim2.new(0, 8, 0, 50)
-floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
-floatBtn.Text = "M"
-floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-floatBtn.Font = Enum.Font.GothamBold
-floatBtn.TextSize = 18
-floatBtn.Visible = false
-Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 10)
-floatBtn.Parent = screenGui
+minBtn.TextSize = 16
+minBtn.AutoButtonColor = true
+minBtn.ZIndex = 5
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
 
 local dragging, dragStart, startPos = false, nil, nil
-header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+topBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPos = mainFrame.Position
     end
 end)
 UserInputService.InputChanged:Connect(function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
         local delta = input.Position - dragStart
-        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        mainFrame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
     end
 end)
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false
     end
 end)
 
+local container = Instance.new("ScrollingFrame", mainFrame)
+container.Size = UDim2.new(1, 0, 1, -45)
+container.Position = UDim2.new(0, 0, 0, 45)
+container.BackgroundTransparency = 1
+container.BorderSizePixel = 0
+container.CanvasSize = UDim2.new(0, 0, 0, 720)
+container.ScrollBarThickness = 4
+container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
+
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(1, 0, 0, 22)
-    row.Position = UDim2.new(0, 0, 0, y)
+    row.Size = UDim2.new(0.9, 0, 0, 32)
+    row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
+
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.65, 0, 1, 0)
+    lbl.Size = UDim2.new(0.6, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 9
+    lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
+
     local sw = Instance.new("TextButton", row)
-    sw.Size = UDim2.new(0, 30, 0, 14)
-    sw.Position = UDim2.new(1, -30, 0.5, -7)
+    sw.Size = UDim2.new(0, 36, 0, 18)
+    sw.Position = UDim2.new(1, -36, 0.5, -9)
     sw.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
     sw.Text = ""
     sw.AutoButtonColor = false
     Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
+
     local knob = Instance.new("Frame", sw)
-    knob.Size = UDim2.new(0, 10, 0, 10)
-    knob.Position = UDim2.new(0, 2, 0.5, -5)
+    knob.Size = UDim2.new(0, 12, 0, 12)
+    knob.Position = UDim2.new(0, 3, 0.5, -6)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
     local a = false
     sw.MouseButton1Click:Connect(function()
         a = not a
         sw.BackgroundColor3 = a and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 40, 50)
         knob.BackgroundColor3 = a and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 210)
-        knob:TweenPosition(a and UDim2.new(1, -12, 0.5, -5) or UDim2.new(0, 2, 0.5, -5),
+        knob:TweenPosition(a and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
             Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
         cb(a)
     end)
@@ -543,26 +538,29 @@ end
 
 local function createInput(name, y, def, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(1, 0, 0, 22)
-    row.Position = UDim2.new(0, 0, 0, y)
+    row.Size = UDim2.new(0.9, 0, 0, 32)
+    row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
+
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.55, 0, 1, 0)
+    lbl.Size = UDim2.new(0.5, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 9
+    lbl.TextSize = 11
     lbl.TextXAlignment = Enum.TextXAlignment.Left
+
     local box = Instance.new("TextBox", row)
-    box.Size = UDim2.new(0, 50, 0, 18)
-    box.Position = UDim2.new(1, -50, 0.5, -9)
+    box.Size = UDim2.new(0, 60, 0, 22)
+    box.Position = UDim2.new(1, -60, 0.5, -11)
     box.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
     box.Text = tostring(def)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.Font = Enum.Font.GothamBold
-    box.TextSize = 9
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+    box.TextSize = 11
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
         if n then cb(n) else box.Text = tostring(def) end
@@ -571,14 +569,14 @@ end
 
 local function createButton(name, y, color, cb)
     local b = Instance.new("TextButton", container)
-    b.Size = UDim2.new(1, 0, 0, 22)
-    b.Position = UDim2.new(0, 0, 0, y)
+    b.Size = UDim2.new(0.9, 0, 0, 28)
+    b.Position = UDim2.new(0.05, 0, 0, y)
     b.BackgroundColor3 = color
     b.Text = name
     b.TextColor3 = Color3.fromRGB(255, 255, 255)
     b.Font = Enum.Font.GothamBold
-    b.TextSize = 9
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    b.TextSize = 11
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
     b.MouseButton1Click:Connect(cb)
     return b
 end
@@ -587,25 +585,46 @@ end
 -- UI BINDING
 -- ==========================================
 
-createToggle("Flight Mode", 4, function(s) flyToggleEnabled = s log("UI", "Flight: " .. tostring(s)) if not s then setFlying(false) end end)
-createToggle("Invisibility", 30, function(s) applyInvisibility(s) end)
-createToggle("No Fall Damage", 56, function(s) noFallDamageEnabled = s end)
-createToggle("Noclip", 82, function(s) noclipEnabled = s log("UI", "Noclip: " .. tostring(s)) end)
-createToggle("Super Speed", 108, function(s) runSpeedEnabled = s log("UI", "Speed: " .. tostring(s)) end)
-createInput("Speed (max 15)", 134, DEFAULT_SPEED, function(v)
+createToggle("Flight Mode", 5, function(s)
+    flyToggleEnabled = s
+    log("UI", "Flight: " .. tostring(s))
+    if not s then setFlying(false) end
+end)
+
+createToggle("Invisibility", 40, function(s) applyInvisibility(s) end)
+createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
+
+createToggle("Noclip", 110, function(s)
+    noclipEnabled = s
+    log("UI", "Noclip: " .. tostring(s))
+end)
+
+createToggle("Super Speed", 145, function(s)
+    runSpeedEnabled = s
+    log("UI", "Speed: " .. tostring(s))
+end)
+
+-- ↓↓↓ Speed input capped at 15 ↓↓↓
+createInput("Speed (max 15)", 180, DEFAULT_SPEED, function(v)
     if v > MAX_SPEED then v = MAX_SPEED end
     if v < 1 then v = 1 end
     runSpeedValue = v
     log("UI", "Speed value: " .. tostring(v))
 end)
-createToggle("Custom Jump", 160, function(s) jumpEnabled = s log("UI", "Jump: " .. tostring(s)) end)
-createInput("Jump (max 107)", 186, DEFAULT_JUMP, function(v)
+
+createToggle("Custom Jump", 215, function(s)
+    jumpEnabled = s
+    log("UI", "Jump: " .. tostring(s))
+end)
+
+createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v)
     if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end
     if v < 1 then v = 1 end
     jumpPowerValue = v
     log("UI", "Jump value: " .. tostring(v))
 end)
-createToggle("Prompt Extender", 212, function(s)
+
+createToggle("Prompt Extender", 285, function(s)
     promptExtenderEnabled = s
     log("UI", "PromptExtender: " .. tostring(s))
     if s then
@@ -614,9 +633,13 @@ createToggle("Prompt Extender", 212, function(s)
         disablePromptExtenderAll()
     end
 end)
-createButton("TP to Spawn", 238, Color3.fromRGB(41, 128, 185), function() log("UI", "TP to Spawn") doTeleport(getEntrySpawn()) end)
 
-local saveBtn = createButton("Save Location", 264, Color3.fromRGB(142, 68, 173), function()
+createButton("TP to Spawn", 320, Color3.fromRGB(41, 128, 185), function()
+    log("UI", "TP to Spawn")
+    doTeleport(getEntrySpawn())
+end)
+
+local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -624,77 +647,111 @@ local saveBtn = createButton("Save Location", 264, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 290, Color3.fromRGB(39, 174, 96), function() log("UI", "TP to Saved") if savedMapCFrame then doTeleport(savedMapCFrame) end end)
-createButton("SAVE LOG", 316, Color3.fromRGB(200, 80, 80), function() saveLogToFile() log("LOGGER", "Log saved") end)
-
-minBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = false
-    floatBtn.Visible = true
+createButton("TP to Saved", 394, Color3.fromRGB(39, 174, 96), function()
+    log("UI", "TP to Saved")
+    if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
-floatBtn.MouseButton1Click:Connect(function()
-    mainFrame.Visible = true
-    floatBtn.Visible = false
+createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
+    saveLogToFile()
+    log("LOGGER", "Log saved")
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    if isMinimized then
+        mainFrame.Size = UDim2.new(0, 36, 0, 36)
+        container.Visible = false
+        title.Visible = false
+        minBtn.Size = UDim2.new(1, 0, 1, 0)
+        minBtn.Position = UDim2.new(0, 0, 0, 0)
+        minBtn.Text = "+"
+    else
+        mainFrame.Size = UDim2.new(0, 220, 0, 540)
+        container.Visible = true
+        title.Visible = true
+        minBtn.Size = UDim2.new(0, 26, 0, 26)
+        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
+        minBtn.Text = "-"
+    end
 end)
 
 UserInputService.JumpRequest:Connect(function()
     local now = os.clock()
     if flyToggleEnabled and (now - lastJumpTapTime) <= DOUBLE_TAP_WINDOW then
         if isFlying then setFlying(false)
-        elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
+        elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
+            or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
             setFlying(true)
         end
         lastJumpTapTime = 0
     else
         lastJumpTapTime = now
     end
-    if jumpEnabled and not flyToggleEnabled then applyJump() end
+    if jumpEnabled and not flyToggleEnabled then
+        applyJump()
+    end
 end)
+
+-- ==========================================
+-- CHARACTER SETUP
+-- ==========================================
 
 local function setupCharacter(char)
     character = char
     rootPart = char:WaitForChild("HumanoidRootPart")
     humanoid = char:WaitForChild("Humanoid")
+
     log("CHAR", "Setup: " .. char.Name)
+
     rootPart.CanCollide = false
+
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
+
     attachment = Instance.new("Attachment", rootPart)
     attachment.Name = "FlightAttachment"
+
     linearVelocity = Instance.new("LinearVelocity", rootPart)
     linearVelocity.Name = "FlightVelocity"
     linearVelocity.Attachment0 = attachment
     linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
     linearVelocity.MaxForce = 0
     linearVelocity.VectorVelocity = Vector3.zero
+
     watchCharacterForInvisibility(char)
     if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
+
     if promptExtenderEnabled then
         task.defer(function() enablePromptExtenderAll() end)
     end
+
     if not firstSpawnCaptured then
         task.delay(1.5, function()
             if rootPart and rootPart.Parent and not firstSpawnCaptured then
                 realSpawnCFrame = rootPart.CFrame
                 firstSpawnCaptured = true
                 log("SPAWN", string.format("Captured real spawn: (%.1f, %.1f, %.1f)",
-                    realSpawnCFrame.Position.X, realSpawnCFrame.Position.Y, realSpawnCFrame.Position.Z))
+                    realSpawnCFrame.Position.X,
+                    realSpawnCFrame.Position.Y,
+                    realSpawnCFrame.Position.Z))
             end
         end)
     end
 end
 
-task.spawn(function() setupCharacter(player.Character or player.CharacterAdded:Wait()) end)
+task.spawn(function()
+    setupCharacter(player.Character or player.CharacterAdded:Wait())
+end)
 
 player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
     if activeTween then pcall(function() activeTween:Cancel() end) activeTween = nil end
-    if speedTween then pcall(function() speedTween:Cancel() end) speedTween = nil end
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V7.2 loaded. Prompt Extender: 50 range, instant click.")
+print("V7.3 loaded. Speed capped at 15. Prompt Extender added.")
