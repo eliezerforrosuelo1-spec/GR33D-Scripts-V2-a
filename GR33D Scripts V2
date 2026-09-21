@@ -1,7 +1,9 @@
 -- ==========================================
--- GR33D SCRIPTS V7.5
--- UI from V6.6 (working) + Prompt Extender + Hybrid Speed
--- Speed: WalkSpeed 60 + CFrame 4 studs/frame stack
+-- GR33D SCRIPTS V8.0
+-- Exact recreation of working cheat from capture log
+-- Speed: WalkSpeed 231.4 + Tween Quad
+-- TP: Warmup hops + instant CFrame
+-- UI: V6.6 (working on mobile)
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -42,27 +44,29 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V7.5 Starting ===")
+log("BOOT", "=== GR33D V8.0 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
--- CONFIG
+-- CONFIG (values from cheat capture)
 -- ==========================================
 
 local DEFAULT_SPEED          = 15
 local MAX_SPEED              = 15
-local SPEED_STUDS_PER_FRAME  = 4
-local SPEED_WALK_BOOST       = 60     -- hybrid loophole: raises server's expected pos
+local WALKSPEED_BOOST        = 231.4    -- from log: cheat sets this
+local SPEED_INTERVAL         = 0.1      -- tween every 100ms
+local SPEED_DISTANCE         = 25       -- studs per tween
+local TP_WARMUP_1            = 30       -- first warmup hop (studs)
+local TP_WARMUP_2            = 15       -- second warmup hop (studs)
 local TP_EFFECTIVE_SPEED     = 1500
 local TP_COOLDOWN            = 1.0
-local TP_MAX_HOP             = 400
 local MAX_JUMP_IMPULSE       = 107
 local DEFAULT_JUMP           = 100
 local MAX_SAFE_FALL          = 50
 local DOUBLE_TAP_WINDOW      = 0.35
 
--- Prompt Extender
+-- Prompt Extender (from log: cheat uses 50 range)
 local PROMPT_MAX_DISTANCE    = 50
 local PROMPT_HOLD_DURATION   = 0
 local PROMPT_REQUIRES_LOS    = false
@@ -99,7 +103,10 @@ local originalTransparency      = {}
 local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
-local activeTween = nil
+local activeTween  = nil
+local speedTween   = nil
+local speedAccum   = 0
+local isTPBusy     = false
 local trackedPrompts = {}
 
 -- ==========================================
@@ -161,7 +168,7 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- PROMPT EXTENDER
+-- PROMPT EXTENDER (from log: 50 range, instant)
 -- ==========================================
 
 local function applyPromptExtender(prompt)
@@ -203,7 +210,7 @@ local function enablePromptExtenderAll()
             count = count + 1
         end
     end
-    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ", instant=true)")
+    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ")")
 end
 
 local function disablePromptExtenderAll()
@@ -222,7 +229,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TWEEN MOVEMENT (for TP)
+-- TWEEN MOVE (single tween helper)
 -- ==========================================
 
 local function tweenMoveTo(targetPos, duration, easing)
@@ -254,14 +261,14 @@ local function tweenMoveTo(targetPos, duration, easing)
     return true
 end
 
+-- ==========================================
+-- TELEPORT (warmup hops + instant jump — from cheat log)
+-- ==========================================
+
 local function doTeleport(targetCFrame)
     if not rootPart or not humanoid or not targetCFrame then return end
-
-    local now = os.clock()
-    if now - lastTPTime < TP_COOLDOWN then
-        task.wait(TP_COOLDOWN - (now - lastTPTime))
-    end
-    lastTPTime = os.clock()
+    if isTPBusy then return end
+    isTPBusy = true
 
     local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
     local startPos  = rootPart.Position
@@ -269,30 +276,45 @@ local function doTeleport(targetCFrame)
 
     log("TP", string.format("doTeleport dist=%.1f", distance))
 
-    if distance < 5 then return end
+    if distance < 5 then
+        isTPBusy = false
+        return
+    end
 
+    -- Kill velocity
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    if distance > TP_MAX_HOP then
-        local hops = math.ceil(distance / TP_MAX_HOP)
-        log("TP", string.format("Chaining %d hops", hops))
-        for i = 1, hops do
-            if not rootPart or not rootPart.Parent then return end
-            local alpha = i / hops
-            local hopPos = startPos:Lerp(targetPos, alpha)
-            local hopDist = (hopPos - rootPart.Position).Magnitude
-            local hopDuration = math.max(0.3, hopDist / TP_EFFECTIVE_SPEED)
-            tweenMoveTo(hopPos, hopDuration, Enum.EasingStyle.Quad)
-            if i < hops then task.wait(TP_COOLDOWN) end
-        end
-    else
-        local duration = math.max(0.3, distance / TP_EFFECTIVE_SPEED)
-        tweenMoveTo(targetPos, duration, Enum.EasingStyle.Quad)
+    -- WARMUP 1: 30 studs toward target
+    local warmup1Dir = (targetPos - startPos).Unit
+    local warmup1Pos = startPos + warmup1Dir * math.min(TP_WARMUP_1, distance * 0.3)
+    rootPart.CFrame = CFrame.new(warmup1Pos)
+    RunService.Heartbeat:Wait()
+    task.wait(0.02)
+
+    -- WARMUP 2: 15 more studs
+    local currentPos = rootPart.Position
+    local warmup2Dir = (targetPos - currentPos).Unit
+    local warmup2Dist = (targetPos - currentPos).Magnitude
+    local warmup2Pos = currentPos + warmup2Dir * math.min(TP_WARMUP_2, warmup2Dist * 0.3)
+    rootPart.CFrame = CFrame.new(warmup2Pos)
+    RunService.Heartbeat:Wait()
+    task.wait(0.02)
+
+    -- MAIN JUMP: instant to target
+    rootPart.CFrame = CFrame.new(targetPos)
+    RunService.Heartbeat:Wait()
+
+    -- Zero velocity
+    if rootPart and rootPart.Parent then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
     end
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
+
+    isTPBusy = false
 end
 
 local function getEntrySpawn()
@@ -306,12 +328,13 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (hybrid loophole: WalkSpeed 60 + CFrame 4/frame)
+-- SPEED (WalkSpeed 231.4 + Tween Quad — from cheat log)
 -- ==========================================
 
-RunService.RenderStepped:Connect(function(dt)
+RunService.Heartbeat:Connect(function(dt)
     if not runSpeedEnabled or not rootPart or not humanoid then return end
-    if isFlying or activeTween then
+
+    if isFlying or activeTween or isTPBusy then
         if humanoid.WalkSpeed ~= 16 then
             humanoid.WalkSpeed = 16
         end
@@ -326,24 +349,37 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    -- Raise WalkSpeed — raises server's expected position
-    if humanoid.WalkSpeed < SPEED_WALK_BOOST then
-        humanoid.WalkSpeed = SPEED_WALK_BOOST
+    -- 1. Raise WalkSpeed to 231.4 (server accepts this per log)
+    if humanoid.WalkSpeed < WALKSPEED_BOOST then
+        humanoid.WalkSpeed = WALKSPEED_BOOST
     end
 
-    -- CFrame micro-step on top
-    local frameStep = SPEED_STUDS_PER_FRAME * (dt * 60)
-    local speedMult = runSpeedValue / 100
-    local step = moveDir.Unit * frameStep * speedMult
+    -- 2. Tween Quad with interval (matches cheat's 4→20 studs/frame signature)
+    speedAccum = speedAccum + dt
+    if speedAccum < SPEED_INTERVAL then return end
+    speedAccum = 0
 
-    local newPos = rootPart.Position + step
-    rootPart.CFrame = CFrame.new(newPos, newPos + moveDir.Unit)
+    if speedTween then pcall(function() speedTween:Cancel() end) end
+
+    local speedMult = runSpeedValue / 100
+    local stepDist = SPEED_DISTANCE * speedMult
+
+    local startPos = rootPart.Position
+    local targetPos = startPos + moveDir.Unit * stepDist
+
+    -- Quad easing gives the accel → decel curve from the log
+    local tweenInfo = TweenInfo.new(SPEED_INTERVAL, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    speedTween = TweenService:Create(rootPart, tweenInfo, {
+        CFrame = CFrame.new(targetPos, targetPos + moveDir.Unit)
+    })
+    speedTween:Play()
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("WalkSpeed=%d + step=%.2f | pos=(%.1f, %.1f, %.1f)",
-            humanoid.WalkSpeed, frameStep, newPos.X, newPos.Y, newPos.Z))
+        log("SPEED", string.format("WalkSpeed=%.1f + tween=%.1f studs/%.2fs | pos=(%.1f, %.1f, %.1f)",
+            humanoid.WalkSpeed, stepDist, SPEED_INTERVAL,
+            targetPos.X, targetPos.Y, targetPos.Z))
     end
 end)
 
@@ -424,7 +460,7 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (EXACT COPY FROM V6.6 — WORKING ON MOBILE)
+-- UI (V6.6 — exact copy)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
@@ -770,9 +806,10 @@ player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
     if activeTween then pcall(function() activeTween:Cancel() end) activeTween = nil end
+    if speedTween then pcall(function() speedTween:Cancel() end) speedTween = nil end
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V7.5 loaded. UI from V6.6. Hybrid speed. Prompt extender.")
+print("V8.0 loaded. Speed: WalkSpeed 231.4 + Tween. TP: warmup hops.")
