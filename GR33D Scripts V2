@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS V6.1
--- Method copied from working auto-steal cheat
+-- GR33D SCRIPTS V6.2
+-- CFrame-driven movement (matches working cheat)
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -25,46 +25,36 @@ local logStartTime = os.clock()
 local MAX_LOG_LINES = 5000
 local logCount = 0
 
-local function log(category, message)
+local function log(cat, msg)
     if logCount >= MAX_LOG_LINES then return end
     logCount = logCount + 1
     local t = string.format("%.3f", os.clock() - logStartTime)
-    local line = string.format("[%s][%s] %s", t, category, message)
+    local line = string.format("[%s][%s] %s", t, cat, msg)
     table.insert(logBuffer, line)
     print(line)
 end
 
-local function getLogText() return table.concat(logBuffer, "\n") end
-
 local function saveLogToFile()
-    local text = getLogText()
     if writefile then
-        pcall(function()
-            writefile(LOG_FILE_NAME, text)
-            log("LOGGER", "Log saved to " .. LOG_FILE_NAME)
-        end)
+        pcall(function() writefile(LOG_FILE_NAME, table.concat(logBuffer, "\n")) end)
     end
-    return text
 end
 
-log("BOOT", "=== GR33D V6.1 Starting ===")
+log("BOOT", "=== GR33D V6.2 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
-log("BOOT", "Executor: " .. tostring(identifyexecutor and identifyexecutor() or "unknown"))
 
 -- ==========================================
--- CONFIG (all values taken from working cheat)
+-- CONFIG
 -- ==========================================
 
-local MAX_WALKSPEED         = 230      -- server accepts this
-local DEFAULT_WALKSPEED     = 16
-local JUMP_IMPULSE          = 107      -- from log
-local MAX_HOP_STUDS         = 35       -- per-frame CFrame delta from log
-local TP_HOP_STUDS          = 35       -- same as above for TP hops
-local MAX_SAFE_FALL         = 50
-local DEFAULT_RUN_SPEED     = 100
-local DEFAULT_JUMP_POWER    = 100
-local DOUBLE_TAP_WINDOW     = 0.35
+local MAX_RUN_SPEED      = 300      -- server-safe upper bound (raised from 230)
+local DEFAULT_RUN_SPEED  = 200
+local MAX_JUMP_IMPULSE   = 107
+local DEFAULT_JUMP       = 100
+local MAX_FRAME_STEP     = 40       -- studs per frame (60 fps = 2400 studs/s cap)
+local MAX_SAFE_FALL      = 50
+local DOUBLE_TAP_WINDOW  = 0.35
 
 -- ==========================================
 -- STATE
@@ -77,37 +67,36 @@ local noFallDamageEnabled = false
 local noclipEnabled       = false
 local runSpeedEnabled     = false
 local jumpEnabled         = false
-local autoRunEnabled      = false    -- NEW: auto-move toward a target
 local isMinimized         = false
 
 local runSpeedValue       = DEFAULT_RUN_SPEED
-local jumpPowerValue      = DEFAULT_JUMP_POWER
+local jumpPowerValue      = DEFAULT_JUMP
 
 local lastJumpTapTime     = 0
 local lastJumpReqTime     = 0
+local lastSpeedLogTime    = 0
 local entrySpawnCFrame    = nil
 local savedMapCFrame      = nil
 
 local character, rootPart, humanoid
 local attachment, linearVelocity
 
--- Invisibility
 local originalTransparency      = {}
 local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
--- Movement state
-local isTPBusy = false
-local autoRunTarget = nil
+-- Movement state (driven by RenderStepped)
+local activeTarget = nil          -- Vector3 target position
+local activeSpeed  = MAX_FRAME_STEP
 
 -- ==========================================
--- INVISIBILITY (unchanged from V6.0)
+-- INVISIBILITY
 -- ==========================================
 
 local function installInvisibilityHook()
     if invisibilityHookInstalled then return end
     invisibilityHookInstalled = true
-    log("INVIS", "Installing metatable hook")
+    log("INVIS", "Installing hook")
     pcall(function()
         local mt = getrawmetatable(game)
         oldNewIndex = hookfunction(mt.__newindex, newcclosure(function(t, k, v)
@@ -160,82 +149,64 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- STATE RESET (the secret trick from the working cheat)
+-- CORE MOVEMENT LOOP (drives everything)
 -- ==========================================
 
-local function legitimizePosition()
+RunService.RenderStepped:Connect(function(dt)
     if not rootPart or not humanoid then return end
-    rootPart.CanCollide = true
-    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-    RunService.Heartbeat:Wait()
-    rootPart.CanCollide = false
-    humanoid:ChangeState(Enum.HumanoidStateType.Running)
-end
 
--- ==========================================
--- CORE MOVE FUNCTION (35-stud CFrame hops)
--- ==========================================
-
-local function moveToPosition(targetPos, maxStep)
-    if not rootPart or not humanoid then return end
-    maxStep = maxStep or MAX_HOP_STUDS
-
-    while true do
-        if not rootPart or not rootPart.Parent then return end
-        local current = rootPart.Position
-        local delta = targetPos - current
+    -- 1. TP target: move at max speed toward target
+    if activeTarget then
+        local delta = activeTarget - rootPart.Position
         local dist = delta.Magnitude
-        if dist < 5 then return end
-
-        local step = delta.Unit * math.min(maxStep, dist)
-        local newPos = current + step
-        rootPart.CFrame = CFrame.new(newPos, newPos + delta.Unit)
-        RunService.Heartbeat:Wait()
+        if dist < 5 then
+            activeTarget = nil
+            log("TP", "Arrived")
+        else
+            local step = delta.Unit * math.min(activeSpeed, dist)
+            rootPart.CFrame = CFrame.new(rootPart.Position + step,
+                rootPart.Position + step + delta.Unit)
+        end
     end
-end
+
+    -- 2. Speed: inject CFrame movement along move direction
+    if runSpeedEnabled and not isFlying and not activeTarget then
+        local moveDir = humanoid.MoveDirection
+        if moveDir.Magnitude > 0.01 then
+            local spd = math.min(runSpeedValue, MAX_RUN_SPEED)
+            -- Per-frame step at ~60 fps
+            local step = moveDir * (spd / 60)
+            -- Cap step to prevent overshoot
+            if step.Magnitude > MAX_FRAME_STEP then
+                step = step.Unit * MAX_FRAME_STEP
+            end
+            rootPart.CFrame = rootPart.CFrame + step
+        end
+    end
+end)
 
 -- ==========================================
--- TELEPORT (chained 35-stud hops + state reset)
+-- TELEPORT
 -- ==========================================
 
 local function doTeleport(targetCFrame)
-    if not rootPart or not humanoid then return end
-    if isTPBusy then return end
-    isTPBusy = true
-
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local startPos = rootPart.Position
-    local distance = (targetPos - startPos).Magnitude
-
-    log("TP", string.format("doTeleport dist=%.1f", distance))
-
-    if distance < 10 then
-        isTPBusy = false
+    if not rootPart or not targetCFrame then return end
+    if activeTarget then
+        log("TP", "Already teleporting")
         return
     end
 
-    -- Kill velocity first
+    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
+    local dist = (targetPos - rootPart.Position).Magnitude
+
+    log("TP", string.format("doTeleport dist=%.1f", dist))
+
+    -- Set target; RenderStepped loop moves us there at max speed
+    activeTarget = targetPos
+
+    -- Velocity reset once
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    -- Big jump needs state reset to be accepted by server
-    if distance > 50 then
-        log("TP", "Applying state reset (distance > 50)")
-        legitimizePosition()
-    end
-
-    -- Move in 35-stud hops
-    moveToPosition(targetPos, TP_HOP_STUDS)
-
-    -- Reset state again on arrival
-    if distance > 50 then
-        legitimizePosition()
-    end
-
-    log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
-        rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
-
-    isTPBusy = false
 end
 
 local function getEntrySpawn()
@@ -243,33 +214,15 @@ local function getEntrySpawn()
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
             entrySpawnCFrame = obj.CFrame
-            log("TP", "Found spawn at " .. tostring(obj.Position))
+            log("TP", "Found spawn")
             return entrySpawnCFrame
         end
     end
-    log("TP", "No SpawnLocation — using current")
     return rootPart and rootPart.CFrame or CFrame.new(0, 5, 0)
 end
 
 -- ==========================================
--- SPEED (WalkSpeed — the working cheat's method)
--- ==========================================
-
-RunService.Stepped:Connect(function()
-    if not humanoid then return end
-    if runSpeedEnabled and not isFlying then
-        local target = math.min(runSpeedValue, MAX_WALKSPEED)
-        humanoid.WalkSpeed = target
-    elseif not runSpeedEnabled then
-        -- Only reset once when off
-        if humanoid.WalkSpeed > DEFAULT_WALKSPEED + 1 then
-            humanoid.WalkSpeed = DEFAULT_WALKSPEED
-        end
-    end
-end)
-
--- ==========================================
--- JUMP (velocity impulse = 107 from working cheat)
+-- JUMP (velocity impulse)
 -- ==========================================
 
 local function applyJump()
@@ -277,8 +230,7 @@ local function applyJump()
     if humanoid.FloorMaterial == Enum.Material.Air then return end
     if os.clock() - lastJumpReqTime < 0.15 then return end
     lastJumpReqTime = os.clock()
-
-    local impulse = math.min(jumpPowerValue, 107)
+    local impulse = math.min(jumpPowerValue, MAX_JUMP_IMPULSE)
     rootPart.AssemblyLinearVelocity = Vector3.new(
         rootPart.AssemblyLinearVelocity.X,
         impulse,
@@ -288,30 +240,11 @@ local function applyJump()
 end
 
 -- ==========================================
--- AUTO RUN (move toward a target position continuously)
--- ==========================================
-
-RunService.RenderStepped:Connect(function(dt)
-    if not autoRunEnabled or not rootPart or not autoRunTarget then return end
-    if isTPBusy then return end
-
-    local delta = autoRunTarget - rootPart.Position
-    local dist = delta.Magnitude
-    if dist < 5 then
-        autoRunTarget = nil
-        return
-    end
-
-    local step = delta.Unit * math.min(MAX_HOP_STUDS, dist)
-    rootPart.CFrame = rootPart.CFrame + step
-end)
-
--- ==========================================
--- NOCLIP (only CanCollide — matches working cheat)
+-- NOCLIP (only CanCollide)
 -- ==========================================
 
 RunService.Stepped:Connect(function()
-    if not character or not rootPart then return end
+    if not character then return end
     if noclipEnabled then
         for _, part in ipairs(character:GetDescendants()) do
             if part:IsA("BasePart") and part.CanCollide then
@@ -322,7 +255,7 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- FLIGHT (uses LinearVelocity — legit physics)
+-- FLIGHT
 -- ==========================================
 
 local function setFlying(state)
@@ -342,7 +275,7 @@ local function setFlying(state)
 end
 
 -- ==========================================
--- MAIN RENDER LOOP
+-- FLIGHT + SAFE FALL (in render loop)
 -- ==========================================
 
 RunService.RenderStepped:Connect(function(dt)
@@ -351,34 +284,16 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    -- FLIGHT
     if isFlying and linearVelocity and humanoid and rootPart then
         if humanoid.FloorMaterial ~= Enum.Material.Air then
             setFlying(false)
-        else
-            local controls = nil
-            pcall(function()
-                controls = require(player.PlayerScripts.PlayerModule):GetControls()
-            end)
-            if controls then
-                local moveVector = controls:GetMoveVector()
-                if moveVector.Magnitude > 0 then
-                    local camCFrame = camera.CFrame
-                    local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
-                    linearVelocity.VectorVelocity = flightDir.Unit * 50
-                else
-                    linearVelocity.VectorVelocity = Vector3.zero
-                end
-            end
         end
     end
 
-    -- SAFE FALL
-    if humanoid and rootPart then
-        local state = humanoid:GetState()
-        if noFallDamageEnabled and
-            (state == Enum.HumanoidStateType.Freefall
-            or state == Enum.HumanoidStateType.FallingDown) then
+    if humanoid and rootPart and noFallDamageEnabled then
+        local st = humanoid:GetState()
+        if st == Enum.HumanoidStateType.Freefall
+            or st == Enum.HumanoidStateType.FallingDown then
             local v = rootPart.AssemblyLinearVelocity
             if v.Y < -MAX_SAFE_FALL then
                 rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
@@ -397,7 +312,6 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Name = "Frame"
 mainFrame.Size = UDim2.new(0, 250, 0, 500)
 mainFrame.Position = UDim2.new(0.8, -125, 0.5, -250)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
@@ -405,145 +319,117 @@ mainFrame.Active = true
 mainFrame.Draggable = true
 mainFrame.Parent = screenGui
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 12)
-corner.Parent = mainFrame
-
-local stroke = Instance.new("UIStroke")
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+local stroke = Instance.new("UIStroke", mainFrame)
 stroke.Color = Color3.fromRGB(45, 45, 55)
 stroke.Thickness = 1.5
 stroke.Parent = mainFrame
 
-local titleLabel = Instance.new("TextLabel")
-titleLabel.Size = UDim2.new(1, -40, 0, 40)
-titleLabel.Position = UDim2.new(0, 12, 0, 0)
-titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "Menu"
-titleLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
-titleLabel.Font = Enum.Font.GothamBold
-titleLabel.TextSize = 14
-titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-titleLabel.Parent = mainFrame
+local title = Instance.new("TextLabel", mainFrame)
+title.Size = UDim2.new(1, -40, 0, 40)
+title.Position = UDim2.new(0, 12, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "Menu"
+title.TextColor3 = Color3.fromRGB(240, 240, 245)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
 
-local minimizeButton = Instance.new("TextButton")
-minimizeButton.Size = UDim2.new(0, 26, 0, 26)
-minimizeButton.Position = UDim2.new(1, -34, 0, 7)
-minimizeButton.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minimizeButton.Text = "-"
-minimizeButton.TextColor3 = Color3.fromRGB(200, 200, 210)
-minimizeButton.Font = Enum.Font.GothamBold
-minimizeButton.TextSize = 16
-minimizeButton.Parent = mainFrame
+local minBtn = Instance.new("TextButton", mainFrame)
+minBtn.Size = UDim2.new(0, 26, 0, 26)
+minBtn.Position = UDim2.new(1, -34, 0, 7)
+minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+minBtn.Text = "-"
+minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 16
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
 
-local minCorner = Instance.new("UICorner")
-minCorner.CornerRadius = UDim.new(0, 8)
-minCorner.Parent = minimizeButton
-
-local container = Instance.new("ScrollingFrame")
+local container = Instance.new("ScrollingFrame", mainFrame)
 container.Size = UDim2.new(1, 0, 1, -45)
 container.Position = UDim2.new(0, 0, 0, 45)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
 container.CanvasSize = UDim2.new(0, 0, 0, 600)
 container.ScrollBarThickness = 4
-container.Parent = mainFrame
 
-local function createToggle(name, yPos, callback)
-    local row = Instance.new("Frame")
+local function createToggle(name, y, cb)
+    local row = Instance.new("Frame", container)
     row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, yPos)
+    row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
-    row.Parent = container
-
-    local label = Instance.new("TextLabel", row)
-    label.Size = UDim2.new(0.65, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.Text = name
-    label.TextColor3 = Color3.fromRGB(200, 200, 210)
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-
-    local switchBg = Instance.new("TextButton", row)
-    switchBg.Size = UDim2.new(0, 40, 0, 20)
-    switchBg.Position = UDim2.new(1, -40, 0.5, -10)
-    switchBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
-    switchBg.Text = ""
-    switchBg.AutoButtonColor = false
-    Instance.new("UICorner", switchBg).CornerRadius = UDim.new(1, 0)
-
-    local knob = Instance.new("Frame", switchBg)
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(0.65, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = name
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    local sw = Instance.new("TextButton", row)
+    sw.Size = UDim2.new(0, 40, 0, 20)
+    sw.Position = UDim2.new(1, -40, 0.5, -10)
+    sw.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    sw.Text = ""
+    sw.AutoButtonColor = false
+    Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
+    local knob = Instance.new("Frame", sw)
     knob.Size = UDim2.new(0, 14, 0, 14)
     knob.Position = UDim2.new(0, 3, 0.5, -7)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
-
-    local active = false
-    switchBg.MouseButton1Click:Connect(function()
-        active = not active
-        if active then
-            switchBg.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
-            knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-            knob:TweenPosition(UDim2.new(1, -17, 0.5, -7), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
-        else
-            switchBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
-            knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
-            knob:TweenPosition(UDim2.new(0, 3, 0.5, -7), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
-        end
-        callback(active)
+    local a = false
+    sw.MouseButton1Click:Connect(function()
+        a = not a
+        sw.BackgroundColor3 = a and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 40, 50)
+        knob.BackgroundColor3 = a and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 210)
+        knob:TweenPosition(a and UDim2.new(1, -17, 0.5, -7) or UDim2.new(0, 3, 0.5, -7),
+            Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
+        cb(a)
     end)
 end
 
-local function createInput(name, yPos, default, callback)
-    local row = Instance.new("Frame")
+local function createInput(name, y, def, cb)
+    local row = Instance.new("Frame", container)
     row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, yPos)
+    row.Position = UDim2.new(0.05, 0, 0, y)
     row.BackgroundTransparency = 1
-    row.Parent = container
-
-    local label = Instance.new("TextLabel", row)
-    label.Size = UDim2.new(0.5, 0, 1, 0)
-    label.BackgroundTransparency = 1
-    label.Text = name
-    label.TextColor3 = Color3.fromRGB(200, 200, 210)
-    label.Font = Enum.Font.GothamMedium
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-
+    local lbl = Instance.new("TextLabel", row)
+    lbl.Size = UDim2.new(0.5, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = name
+    lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
     local box = Instance.new("TextBox", row)
     box.Size = UDim2.new(0, 75, 0, 24)
     box.Position = UDim2.new(1, -75, 0.5, -12)
     box.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-    box.Text = tostring(default)
+    box.Text = tostring(def)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.Font = Enum.Font.GothamBold
     box.TextSize = 12
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
-
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
-        if n then callback(n) else box.Text = tostring(default) end
+        if n then cb(n) else box.Text = tostring(def) end
     end)
 end
 
-local function createButton(name, yPos, color, callback)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.9, 0, 0, 30)
-    btn.Position = UDim2.new(0.05, 0, 0, yPos)
-    btn.BackgroundColor3 = color
-    btn.Text = name
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
-    btn.Parent = container
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-    btn.MouseButton1Click:Connect(callback)
-    return btn
+local function createButton(name, y, color, cb)
+    local b = Instance.new("TextButton", container)
+    b.Size = UDim2.new(0.9, 0, 0, 30)
+    b.Position = UDim2.new(0.05, 0, 0, y)
+    b.BackgroundColor3 = color
+    b.Text = name
+    b.TextColor3 = Color3.fromRGB(255, 255, 255)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(cb)
+    return b
 end
-
--- ==========================================
--- UI BINDING
--- ==========================================
 
 createToggle("Flight Mode", 5, function(s)
     flyToggleEnabled = s
@@ -551,13 +437,10 @@ createToggle("Flight Mode", 5, function(s)
     if not s then setFlying(false) end
 end)
 
-createToggle("Invisibility", 40, function(s)
-    applyInvisibility(s)
-end)
+createToggle("Invisibility", 40, function(s) applyInvisibility(s) end)
 
 createToggle("No Fall Damage", 75, function(s)
     noFallDamageEnabled = s
-    log("UI", "NoFall: " .. tostring(s))
 end)
 
 createToggle("Noclip", 110, function(s)
@@ -570,8 +453,8 @@ createToggle("Super Speed", 145, function(s)
     log("UI", "Speed: " .. tostring(s))
 end)
 
-createInput("Speed (max 230)", 180, DEFAULT_RUN_SPEED, function(v)
-    if v > MAX_WALKSPEED then v = MAX_WALKSPEED end
+createInput("Speed (max 300)", 180, DEFAULT_RUN_SPEED, function(v)
+    if v > MAX_RUN_SPEED then v = MAX_RUN_SPEED end
     if v < 1 then v = 1 end
     runSpeedValue = v
     log("UI", "Speed value: " .. tostring(v))
@@ -582,15 +465,15 @@ createToggle("Custom Jump", 215, function(s)
     log("UI", "Jump: " .. tostring(s))
 end)
 
-createInput("Jump (max 107)", 250, DEFAULT_JUMP_POWER, function(v)
-    if v > JUMP_IMPULSE then v = JUMP_IMPULSE end
+createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v)
+    if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end
     if v < 1 then v = 1 end
     jumpPowerValue = v
     log("UI", "Jump value: " .. tostring(v))
 end)
 
 createButton("TP to Spawn", 290, Color3.fromRGB(41, 128, 185), function()
-    log("UI", "TP to Spawn clicked")
+    log("UI", "TP to Spawn")
     doTeleport(getEntrySpawn())
 end)
 
@@ -603,21 +486,36 @@ local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173),
 end)
 
 createButton("TP to Saved", 364, Color3.fromRGB(39, 174, 96), function()
-    log("UI", "TP to Saved clicked")
-    if savedMapCFrame then
-        doTeleport(savedMapCFrame)
-    else
-        log("UI", "No saved location")
-    end
+    log("UI", "TP to Saved")
+    if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
 createButton("SAVE LOG", 401, Color3.fromRGB(200, 80, 80), function()
-    local text = saveLogToFile()
-    log("LOGGER", "Log saved (" .. #text .. " chars)")
+    saveLogToFile()
+    log("LOGGER", "Log saved")
+end)
+
+minBtn.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    if isMinimized then
+        mainFrame.Size = UDim2.new(0, 36, 0, 36)
+        container.Visible = false
+        title.Visible = false
+        minBtn.Size = UDim2.new(1, 0, 1, 0)
+        minBtn.Position = UDim2.new(0, 0, 0, 0)
+        minBtn.Text = "+"
+    else
+        mainFrame.Size = UDim2.new(0, 250, 0, 500)
+        container.Visible = true
+        title.Visible = true
+        minBtn.Size = UDim2.new(0, 26, 0, 26)
+        minBtn.Position = UDim2.new(1, -34, 0, 7)
+        minBtn.Text = "-"
+    end
 end)
 
 -- ==========================================
--- FLIGHT DOUBLE-TAP
+-- JUMP INPUT
 -- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
@@ -638,25 +536,6 @@ UserInputService.JumpRequest:Connect(function()
     end
 end)
 
-minimizeButton.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        mainFrame.Size = UDim2.new(0, 36, 0, 36)
-        container.Visible = false
-        titleLabel.Visible = false
-        minimizeButton.Size = UDim2.new(1, 0, 1, 0)
-        minimizeButton.Position = UDim2.new(0, 0, 0, 0)
-        minimizeButton.Text = "+"
-    else
-        mainFrame.Size = UDim2.new(0, 250, 0, 500)
-        container.Visible = true
-        titleLabel.Visible = true
-        minimizeButton.Size = UDim2.new(0, 26, 0, 26)
-        minimizeButton.Position = UDim2.new(1, -34, 0, 7)
-        minimizeButton.Text = "-"
-    end
-end)
-
 -- ==========================================
 -- CHARACTER SETUP
 -- ==========================================
@@ -673,17 +552,15 @@ local function setupCharacter(char)
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
 
-    attachment = Instance.new("Attachment")
+    attachment = Instance.new("Attachment", rootPart)
     attachment.Name = "FlightAttachment"
-    attachment.Parent = rootPart
 
-    linearVelocity = Instance.new("LinearVelocity")
+    linearVelocity = Instance.new("LinearVelocity", rootPart)
     linearVelocity.Name = "FlightVelocity"
     linearVelocity.Attachment0 = attachment
     linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
     linearVelocity.MaxForce = 0
     linearVelocity.VectorVelocity = Vector3.zero
-    linearVelocity.Parent = rootPart
 
     watchCharacterForInvisibility(char)
     if invisibleEnabled then applyInvisibility(true) end
@@ -697,11 +574,10 @@ end)
 player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
-    isTPBusy = false
-    autoRunTarget = nil
+    activeTarget = nil
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("Loaded. Use SAVE LOG button.")
+print("V6.2 loaded. Use SAVE LOG.")
