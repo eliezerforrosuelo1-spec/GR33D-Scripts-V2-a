@@ -1,11 +1,14 @@
 -- ==========================================
--- GR33D SCRIPTS V6.2
--- CFrame-driven movement (matches working cheat)
+-- GR33D SCRIPTS V6.3 - TWEEN EDITION
+-- Matches the working auto-steal cheat's method
+-- Speed: 100 (from cheat)
+-- Modes: Tween (safe) / Instant (risky)
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -40,19 +43,19 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V6.2 Starting ===")
+log("BOOT", "=== GR33D V6.3 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
 -- ==========================================
--- CONFIG
+-- CONFIG (from working cheat)
 -- ==========================================
 
-local MAX_RUN_SPEED      = 300      -- server-safe upper bound (raised from 230)
-local DEFAULT_RUN_SPEED  = 200
+local DEFAULT_SPEED      = 100
+local MAX_SPEED          = 100    -- cap at 100 like the working cheat
+local SPEED_STUDS_PER_SEC = 2800  -- hidden multiplier — what "speed 100" actually means
 local MAX_JUMP_IMPULSE   = 107
 local DEFAULT_JUMP       = 100
-local MAX_FRAME_STEP     = 40       -- studs per frame (60 fps = 2400 studs/s cap)
 local MAX_SAFE_FALL      = 50
 local DOUBLE_TAP_WINDOW  = 0.35
 
@@ -68,13 +71,13 @@ local noclipEnabled       = false
 local runSpeedEnabled     = false
 local jumpEnabled         = false
 local isMinimized         = false
+local useInstantMode      = false    -- false = Tween (safe), true = Instant (risky)
 
-local runSpeedValue       = DEFAULT_RUN_SPEED
+local runSpeedValue       = DEFAULT_SPEED
 local jumpPowerValue      = DEFAULT_JUMP
 
 local lastJumpTapTime     = 0
 local lastJumpReqTime     = 0
-local lastSpeedLogTime    = 0
 local entrySpawnCFrame    = nil
 local savedMapCFrame      = nil
 
@@ -85,9 +88,9 @@ local originalTransparency      = {}
 local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
--- Movement state (driven by RenderStepped)
-local activeTarget = nil          -- Vector3 target position
-local activeSpeed  = MAX_FRAME_STEP
+-- Active tween tracking (for cancellation)
+local activeTween = nil
+local activeTweenEnd = nil
 
 -- ==========================================
 -- INVISIBILITY
@@ -149,64 +152,97 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- CORE MOVEMENT LOOP (drives everything)
+-- TWEEN TELEPORT (the working cheat's method)
 -- ==========================================
 
-RunService.RenderStepped:Connect(function(dt)
-    if not rootPart or not humanoid then return end
-
-    -- 1. TP target: move at max speed toward target
-    if activeTarget then
-        local delta = activeTarget - rootPart.Position
-        local dist = delta.Magnitude
-        if dist < 5 then
-            activeTarget = nil
-            log("TP", "Arrived")
-        else
-            local step = delta.Unit * math.min(activeSpeed, dist)
-            rootPart.CFrame = CFrame.new(rootPart.Position + step,
-                rootPart.Position + step + delta.Unit)
-        end
+local function cancelActiveTween()
+    if activeTween then
+        pcall(function() activeTween:Cancel() end)
+        activeTween = nil
     end
-
-    -- 2. Speed: inject CFrame movement along move direction
-    if runSpeedEnabled and not isFlying and not activeTarget then
-        local moveDir = humanoid.MoveDirection
-        if moveDir.Magnitude > 0.01 then
-            local spd = math.min(runSpeedValue, MAX_RUN_SPEED)
-            -- Per-frame step at ~60 fps
-            local step = moveDir * (spd / 60)
-            -- Cap step to prevent overshoot
-            if step.Magnitude > MAX_FRAME_STEP then
-                step = step.Unit * MAX_FRAME_STEP
-            end
-            rootPart.CFrame = rootPart.CFrame + step
-        end
-    end
-end)
-
--- ==========================================
--- TELEPORT
--- ==========================================
+    activeTweenEnd = nil
+end
 
 local function doTeleport(targetCFrame)
-    if not rootPart or not targetCFrame then return end
-    if activeTarget then
-        log("TP", "Already teleporting")
-        return
-    end
+    if not rootPart or not humanoid then return end
+    if not targetCFrame then return end
+
+    cancelActiveTween()
 
     local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local dist = (targetPos - rootPart.Position).Magnitude
+    local startPos  = rootPart.Position
+    local distance  = (targetPos - startPos).Magnitude
 
-    log("TP", string.format("doTeleport dist=%.1f", dist))
+    log("TP", string.format("doTeleport dist=%.1f mode=%s",
+        distance, useInstantMode and "INSTANT" or "TWEEN"))
 
-    -- Set target; RenderStepped loop moves us there at max speed
-    activeTarget = targetPos
+    if distance < 5 then return end
 
-    -- Velocity reset once
+    -- Kill velocity
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    if useInstantMode then
+        -- INSTANT: short tween that looks like a teleport
+        -- Duration ~0.08s regardless of distance
+        local duration = 0.08
+        local targetCF = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
+        local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+        activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
+        activeTween:Play()
+        activeTween.Completed:Wait()
+        activeTween = nil
+        log("TP", "Instant complete")
+    else
+        -- TWEEN: smooth interpolation based on speed
+        -- Duration = distance / (speed × multiplier / 100)
+        local effectiveSpeed = (runSpeedValue / 100) * SPEED_STUDS_PER_SEC
+        local duration = math.max(0.15, distance / effectiveSpeed)
+
+        log("TP", string.format("Tween duration=%.3fs effectiveSpeed=%.0f",
+            duration, effectiveSpeed))
+
+        local targetCF = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
+        local tweenInfo = TweenInfo.new(
+            duration,
+            Enum.EasingStyle.Quad,  -- matches working cheat
+            Enum.EasingDirection.Out
+        )
+        activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
+        activeTween:Play()
+
+        -- Reset state during tween
+        local resets = 0
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if not activeTween then
+                if conn then conn:Disconnect() end
+                return
+            end
+            resets = resets + 1
+            if resets % 5 == 0 and humanoid then
+                pcall(function()
+                    humanoid:ChangeState(Enum.HumanoidStateType.Running)
+                end)
+            end
+        end)
+
+        activeTween.Completed:Wait()
+        activeTween = nil
+        if conn then conn:Disconnect() end
+        log("TP", "Tween complete")
+    end
+
+    -- Zero velocity on arrival
+    if rootPart and rootPart.Parent then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+    end
+    if humanoid and humanoid.Parent then
+        pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end)
+    end
 end
 
 local function getEntrySpawn()
@@ -222,7 +258,28 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- JUMP (velocity impulse)
+-- SUPER SPEED (Tween-based per-frame)
+-- ==========================================
+
+-- The working cheat runs at speed 100 — we move via short tweens per direction change.
+-- Simpler: use WalkSpeed and set it to 100 (matches the cheat's cap)
+
+RunService.Stepped:Connect(function()
+    if not humanoid then return end
+    if runSpeedEnabled and not isFlying and not activeTween then
+        local target = math.min(runSpeedValue, MAX_SPEED)
+        if humanoid.WalkSpeed < target then
+            humanoid.WalkSpeed = target
+        end
+    elseif not runSpeedEnabled then
+        if humanoid.WalkSpeed > 20 then
+            humanoid.WalkSpeed = 16
+        end
+    end
+end)
+
+-- ==========================================
+-- JUMP
 -- ==========================================
 
 local function applyJump()
@@ -240,7 +297,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- NOCLIP (only CanCollide)
+-- NOCLIP (via CanCollide only, with reset)
 -- ==========================================
 
 RunService.Stepped:Connect(function()
@@ -274,11 +331,7 @@ local function setFlying(state)
     end
 end
 
--- ==========================================
--- FLIGHT + SAFE FALL (in render loop)
--- ==========================================
-
-RunService.RenderStepped:Connect(function(dt)
+RunService.RenderStepped:Connect(function()
     if not camera or not camera.Parent then
         camera = workspace.CurrentCamera
         return
@@ -292,8 +345,7 @@ RunService.RenderStepped:Connect(function(dt)
 
     if humanoid and rootPart and noFallDamageEnabled then
         local st = humanoid:GetState()
-        if st == Enum.HumanoidStateType.Freefall
-            or st == Enum.HumanoidStateType.FallingDown then
+        if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
             local v = rootPart.AssemblyLinearVelocity
             if v.Y < -MAX_SAFE_FALL then
                 rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
@@ -312,8 +364,8 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 250, 0, 500)
-mainFrame.Position = UDim2.new(0.8, -125, 0.5, -250)
+mainFrame.Size = UDim2.new(0, 250, 0, 540)
+mainFrame.Position = UDim2.new(0.8, -125, 0.5, -270)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -350,7 +402,7 @@ container.Size = UDim2.new(1, 0, 1, -45)
 container.Position = UDim2.new(0, 0, 0, 45)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 600)
+container.CanvasSize = UDim2.new(0, 0, 0, 650)
 container.ScrollBarThickness = 4
 
 local function createToggle(name, y, cb)
@@ -439,9 +491,7 @@ end)
 
 createToggle("Invisibility", 40, function(s) applyInvisibility(s) end)
 
-createToggle("No Fall Damage", 75, function(s)
-    noFallDamageEnabled = s
-end)
+createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
 
 createToggle("Noclip", 110, function(s)
     noclipEnabled = s
@@ -453,8 +503,8 @@ createToggle("Super Speed", 145, function(s)
     log("UI", "Speed: " .. tostring(s))
 end)
 
-createInput("Speed (max 300)", 180, DEFAULT_RUN_SPEED, function(v)
-    if v > MAX_RUN_SPEED then v = MAX_RUN_SPEED end
+createInput("Speed (max 100)", 180, DEFAULT_SPEED, function(v)
+    if v > MAX_SPEED then v = MAX_SPEED end
     if v < 1 then v = 1 end
     runSpeedValue = v
     log("UI", "Speed value: " .. tostring(v))
@@ -472,12 +522,18 @@ createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v)
     log("UI", "Jump value: " .. tostring(v))
 end)
 
-createButton("TP to Spawn", 290, Color3.fromRGB(41, 128, 185), function()
+-- TP MODE TOGGLE
+createToggle("Use INSTANT Mode", 285, function(s)
+    useInstantMode = s
+    log("UI", "TP mode: " .. (s and "INSTANT" or "TWEEN"))
+end)
+
+createButton("TP to Spawn", 320, Color3.fromRGB(41, 128, 185), function()
     log("UI", "TP to Spawn")
     doTeleport(getEntrySpawn())
 end)
 
-local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173), function()
+local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -485,12 +541,12 @@ local saveBtn = createButton("Save Location", 327, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 364, Color3.fromRGB(39, 174, 96), function()
+createButton("TP to Saved", 394, Color3.fromRGB(39, 174, 96), function()
     log("UI", "TP to Saved")
     if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
-createButton("SAVE LOG", 401, Color3.fromRGB(200, 80, 80), function()
+createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
@@ -505,7 +561,7 @@ minBtn.MouseButton1Click:Connect(function()
         minBtn.Position = UDim2.new(0, 0, 0, 0)
         minBtn.Text = "+"
     else
-        mainFrame.Size = UDim2.new(0, 250, 0, 500)
+        mainFrame.Size = UDim2.new(0, 250, 0, 540)
         container.Visible = true
         title.Visible = true
         minBtn.Size = UDim2.new(0, 26, 0, 26)
@@ -574,10 +630,10 @@ end)
 player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
-    activeTarget = nil
+    cancelActiveTween()
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V6.2 loaded. Use SAVE LOG.")
+print("V6.3 loaded. Use SAVE LOG.")
