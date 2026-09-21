@@ -1,426 +1,21 @@
 -- ==========================================
--- GR33D SCRIPTS V7.4
--- Speed from V6.6 (4 studs/frame, capped at 15) + Prompt Extender
--- UI unchanged from V7.3
--- ==========================================
-
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local Players          = game:GetService("Players")
-local TweenService     = game:GetService("TweenService")
-
-local player = Players.LocalPlayer
-local protectedParent = player:WaitForChild("PlayerGui")
-if protectedParent:FindFirstChild("Panel") then
-    protectedParent.Panel:Destroy()
-end
-
-local camera = workspace.CurrentCamera
-
--- ==========================================
--- LOGGER
--- ==========================================
-
-local LOG_FILE_NAME = "gr33d_log.txt"
-local logBuffer = {}
-local logStartTime = os.clock()
-local MAX_LOG_LINES = 5000
-local logCount = 0
-
-local function log(cat, msg)
-    if logCount >= MAX_LOG_LINES then return end
-    logCount = logCount + 1
-    local t = string.format("%.3f", os.clock() - logStartTime)
-    local line = string.format("[%s][%s] %s", t, cat, msg)
-    table.insert(logBuffer, line)
-    print(line)
-end
-
-local function saveLogToFile()
-    if writefile then
-        pcall(function() writefile(LOG_FILE_NAME, table.concat(logBuffer, "\n")) end)
-    end
-end
-
-log("BOOT", "=== GR33D V7.4 Starting ===")
-log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
-log("BOOT", "Player: " .. player.Name)
-
--- ==========================================
--- CONFIG
--- ==========================================
-
-local DEFAULT_SPEED          = 15
-local MAX_SPEED              = 15
-local SPEED_STUDS_PER_FRAME  = 4      -- same as V6.6
-local TP_EFFECTIVE_SPEED     = 1500
-local TP_COOLDOWN            = 1.0
-local TP_MAX_HOP             = 400
-local MAX_JUMP_IMPULSE       = 107
-local DEFAULT_JUMP           = 100
-local MAX_SAFE_FALL          = 50
-local DOUBLE_TAP_WINDOW      = 0.35
-
--- Prompt Extender
-local PROMPT_MAX_DISTANCE    = 50
-local PROMPT_HOLD_DURATION   = 0
-local PROMPT_REQUIRES_LOS    = false
-
--- ==========================================
--- STATE
--- ==========================================
-
-local flyToggleEnabled    = false
-local isFlying            = false
-local invisibleEnabled    = false
-local noFallDamageEnabled = false
-local noclipEnabled       = false
-local runSpeedEnabled     = false
-local jumpEnabled         = false
-local promptExtenderEnabled = false
-local isMinimized         = false
-
-local runSpeedValue       = DEFAULT_SPEED
-local jumpPowerValue      = DEFAULT_JUMP
-
-local lastJumpTapTime     = 0
-local lastJumpReqTime     = 0
-local lastTPTime          = 0
-local lastSpeedLogTime    = 0
-local realSpawnCFrame     = nil
-local firstSpawnCaptured  = false
-local savedMapCFrame      = nil
-
-local character, rootPart, humanoid
-local attachment, linearVelocity
-
-local originalTransparency      = {}
-local invisibilityHookInstalled = false
-local oldNewIndex               = nil
-
-local activeTween = nil
-local trackedPrompts = {}
-
--- ==========================================
--- INVISIBILITY
--- ==========================================
-
-local function installInvisibilityHook()
-    if invisibilityHookInstalled then return end
-    invisibilityHookInstalled = true
-    pcall(function()
-        local mt = getrawmetatable(game)
-        oldNewIndex = hookfunction(mt.__newindex, newcclosure(function(t, k, v)
-            if not checkcaller() and typeof(t) == "Instance" and t:IsA("BasePart") then
-                local char = player.Character
-                if char and t:IsDescendantOf(char) and invisibleEnabled then
-                    if k == "Transparency" and v < 1 then return end
-                    if k == "LocalTransparencyModifier" and v < 1 then return end
-                end
-            end
-            return oldNewIndex(t, k, v)
-        end))
-    end)
-end
-
-local function applyInvisibility(state)
-    invisibleEnabled = state
-    log("INVIS", "Invisibility: " .. tostring(state))
-    if not character then return end
-    if state then
-        installInvisibilityHook()
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") or part:IsA("Decal") then
-                if not originalTransparency[part] then
-                    originalTransparency[part] = part.Transparency
-                end
-                part.Transparency = 1
-                part.LocalTransparencyModifier = 1
-            end
-        end
-    else
-        for part, orig in pairs(originalTransparency) do
-            if part and part.Parent then
-                part.Transparency = orig
-                part.LocalTransparencyModifier = 0
-            end
-        end
-        originalTransparency = {}
-    end
-end
-
-local function watchCharacterForInvisibility(char)
-    char.DescendantAdded:Connect(function(desc)
-        if invisibleEnabled and (desc:IsA("BasePart") or desc:IsA("Decal")) then
-            originalTransparency[desc] = desc.Transparency
-            desc.Transparency = 1
-            desc.LocalTransparencyModifier = 1
-        end
-    end)
-end
-
--- ==========================================
--- PROMPT EXTENDER
--- ==========================================
-
-local function applyPromptExtender(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") then return end
-    if trackedPrompts[prompt] then return end
-
-    trackedPrompts[prompt] = {
-        MaxActivationDistance = prompt.MaxActivationDistance,
-        HoldDuration = prompt.HoldDuration,
-        RequiresLineOfSight = prompt.RequiresLineOfSight,
-    }
-
-    pcall(function()
-        prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
-        prompt.HoldDuration = PROMPT_HOLD_DURATION
-        prompt.RequiresLineOfSight = PROMPT_REQUIRES_LOS
-    end)
-end
-
-local function removePromptExtender(prompt)
-    local saved = trackedPrompts[prompt]
-    if not saved then return end
-    pcall(function()
-        if prompt and prompt.Parent then
-            prompt.MaxActivationDistance = saved.MaxActivationDistance
-            prompt.HoldDuration = saved.HoldDuration
-            prompt.RequiresLineOfSight = saved.RequiresLineOfSight
-        end
-    end)
-    trackedPrompts[prompt] = nil
-end
-
-local function enablePromptExtenderAll()
-    log("PROMPT", "Enabling on all existing prompts")
-    local count = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
-            applyPromptExtender(obj)
-            count = count + 1
-        end
-    end
-    log("PROMPT", "Extended " .. count .. " prompts (range=" .. PROMPT_MAX_DISTANCE .. ", instant=true)")
-end
-
-local function disablePromptExtenderAll()
-    log("PROMPT", "Disabling on all prompts")
-    for prompt, _ in pairs(trackedPrompts) do
-        removePromptExtender(prompt)
-    end
-    trackedPrompts = {}
-end
-
-workspace.DescendantAdded:Connect(function(obj)
-    if not promptExtenderEnabled then return end
-    if obj:IsA("ProximityPrompt") then
-        applyPromptExtender(obj)
-    end
-end)
-
--- ==========================================
--- TWEEN MOVEMENT (for TP)
--- ==========================================
-
-local function tweenMoveTo(targetPos, duration, easing)
-    if not rootPart then return false end
-    if activeTween then
-        pcall(function() activeTween:Cancel() end)
-        activeTween = nil
-    end
-
-    duration = duration or 0.3
-    easing = easing or Enum.EasingStyle.Quad
-
-    local currentLook = rootPart.CFrame.LookVector
-    local targetCF = CFrame.new(targetPos, targetPos + currentLook)
-
-    local tweenInfo = TweenInfo.new(duration, easing, Enum.EasingDirection.Out)
-    activeTween = TweenService:Create(rootPart, tweenInfo, { CFrame = targetCF })
-    activeTween:Play()
-    activeTween.Completed:Wait()
-    activeTween = nil
-
-    if rootPart and rootPart.Parent then
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-    end
-    if humanoid and humanoid.Parent then
-        pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Running) end)
-    end
-    return true
-end
-
-local function doTeleport(targetCFrame)
-    if not rootPart or not humanoid or not targetCFrame then return end
-
-    local now = os.clock()
-    if now - lastTPTime < TP_COOLDOWN then
-        task.wait(TP_COOLDOWN - (now - lastTPTime))
-    end
-    lastTPTime = os.clock()
-
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local startPos  = rootPart.Position
-    local distance  = (targetPos - startPos).Magnitude
-
-    log("TP", string.format("doTeleport dist=%.1f", distance))
-
-    if distance < 5 then return end
-
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    if distance > TP_MAX_HOP then
-        local hops = math.ceil(distance / TP_MAX_HOP)
-        log("TP", string.format("Chaining %d hops", hops))
-        for i = 1, hops do
-            if not rootPart or not rootPart.Parent then return end
-            local alpha = i / hops
-            local hopPos = startPos:Lerp(targetPos, alpha)
-            local hopDist = (hopPos - rootPart.Position).Magnitude
-            local hopDuration = math.max(0.3, hopDist / TP_EFFECTIVE_SPEED)
-            tweenMoveTo(hopPos, hopDuration, Enum.EasingStyle.Quad)
-            if i < hops then task.wait(TP_COOLDOWN) end
-        end
-    else
-        local duration = math.max(0.3, distance / TP_EFFECTIVE_SPEED)
-        tweenMoveTo(targetPos, duration, Enum.EasingStyle.Quad)
-    end
-
-    log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
-        rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
-end
-
-local function getEntrySpawn()
-    if realSpawnCFrame then return realSpawnCFrame end
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("SpawnLocation") and obj.Enabled then
-            return obj.CFrame
-        end
-    end
-    return rootPart and rootPart.CFrame or CFrame.new(0, 5, 0)
-end
-
--- ==========================================
--- SPEED (V6.6 micro-steps, capped at 15)
--- ==========================================
-
-RunService.RenderStepped:Connect(function(dt)
-    if not runSpeedEnabled or not rootPart or not humanoid then return end
-    if isFlying or activeTween then return end
-
-    local moveDir = humanoid.MoveDirection
-    if moveDir.Magnitude < 0.01 then return end
-
-    local frameStep = SPEED_STUDS_PER_FRAME * (dt * 60)
-    local speedMult = runSpeedValue / 100
-    local step = moveDir.Unit * frameStep * speedMult
-
-    local newPos = rootPart.Position + step
-    rootPart.CFrame = CFrame.new(newPos, newPos + moveDir.Unit)
-
-    local now = os.clock()
-    if now - lastSpeedLogTime > 1 then
-        lastSpeedLogTime = now
-        log("SPEED", string.format("step=%.2f studs/frame, pos=(%.1f, %.1f, %.1f)",
-            frameStep, newPos.X, newPos.Y, newPos.Z))
-    end
-end)
-
--- ==========================================
--- JUMP
--- ==========================================
-
-local function applyJump()
-    if not jumpEnabled or not rootPart or not humanoid then return end
-    if humanoid.FloorMaterial == Enum.Material.Air then return end
-    if os.clock() - lastJumpReqTime < 0.15 then return end
-    lastJumpReqTime = os.clock()
-    local impulse = math.min(jumpPowerValue, MAX_JUMP_IMPULSE)
-    rootPart.AssemblyLinearVelocity = Vector3.new(
-        rootPart.AssemblyLinearVelocity.X,
-        impulse,
-        rootPart.AssemblyLinearVelocity.Z
-    )
-    log("JUMP", string.format("impulse=%.1f", impulse))
-end
-
--- ==========================================
--- NOCLIP
--- ==========================================
-
-RunService.Stepped:Connect(function()
-    if not character then return end
-    if noclipEnabled then
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") and part.CanCollide then
-                part.CanCollide = false
-            end
-        end
-    end
-end)
-
--- ==========================================
--- FLIGHT
--- ==========================================
-
-local function setFlying(state)
-    if not rootPart or not humanoid or not linearVelocity then return end
-    log("FLY", "setFlying: " .. tostring(state))
-    isFlying = state
-    if isFlying then
-        linearVelocity.MaxForce = 100000
-        humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-    else
-        linearVelocity.MaxForce = 0
-        linearVelocity.VectorVelocity = Vector3.zero
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    end
-end
-
-RunService.RenderStepped:Connect(function()
-    if not camera or not camera.Parent then
-        camera = workspace.CurrentCamera
-        return
-    end
-
-    if isFlying and linearVelocity and humanoid and rootPart then
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            setFlying(false)
-        end
-    end
-
-    if humanoid and rootPart and noFallDamageEnabled then
-        local st = humanoid:GetState()
-        if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
-            local v = rootPart.AssemblyLinearVelocity
-            if v.Y < -MAX_SAFE_FALL then
-                rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
-            end
-        end
-    end
-end)
-
--- ==========================================
--- UI (UNCHANGED FROM V7.3)
+-- UI (MOBILE-SAFE + M FLOAT BUTTON)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
+screenGui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 screenGui.Parent = protectedParent
 
+-- MAIN PANEL: 220px wide, 70% of viewport tall (always fits)
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0, 540)
-mainFrame.Position = UDim2.new(0, 20, 0.5, -270)
+mainFrame.Size = UDim2.new(0, 220, 0.7, 0)
+mainFrame.AnchorPoint = Vector2.new(0, 0.5)
+mainFrame.Position = UDim2.new(0, 10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -453,14 +48,14 @@ minBtn.Name = "MinBtn"
 minBtn.Size = UDim2.new(0, 26, 0, 26)
 minBtn.Position = UDim2.new(1, -34, 0.5, -13)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
-minBtn.Text = "-"
+minBtn.Text = "−"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
 minBtn.TextSize = 16
-minBtn.AutoButtonColor = true
 minBtn.ZIndex = 5
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
 
+-- DRAG
 local dragging, dragStart, startPos = false, nil, nil
 topBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -487,6 +82,7 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
+-- CONTAINER
 local container = Instance.new("ScrollingFrame", mainFrame)
 container.Size = UDim2.new(1, 0, 1, -45)
 container.Position = UDim2.new(0, 0, 0, 45)
@@ -495,6 +91,21 @@ container.BorderSizePixel = 0
 container.CanvasSize = UDim2.new(0, 0, 0, 720)
 container.ScrollBarThickness = 4
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
+
+-- FLOAT "M" BUTTON (visible when minimized)
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name = "FloatBtn"
+floatBtn.Size = UDim2.new(0, 40, 0, 40)
+floatBtn.AnchorPoint = Vector2.new(0, 0.5)
+floatBtn.Position = UDim2.new(0, 10, 0.5, 0)
+floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+floatBtn.Text = "M"
+floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextSize = 18
+floatBtn.Visible = false
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
+floatBtn.Parent = screenGui
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
@@ -656,23 +267,16 @@ createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
     log("LOGGER", "Log saved")
 end)
 
+-- MINIMIZE: hide panel, show M button
 minBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        mainFrame.Size = UDim2.new(0, 36, 0, 36)
-        container.Visible = false
-        title.Visible = false
-        minBtn.Size = UDim2.new(1, 0, 1, 0)
-        minBtn.Position = UDim2.new(0, 0, 0, 0)
-        minBtn.Text = "+"
-    else
-        mainFrame.Size = UDim2.new(0, 220, 0, 540)
-        container.Visible = true
-        title.Visible = true
-        minBtn.Size = UDim2.new(0, 26, 0, 26)
-        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
-        minBtn.Text = "-"
-    end
+    mainFrame.Visible = false
+    floatBtn.Visible = true
+end)
+
+-- M BUTTON: show panel, hide M
+floatBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    floatBtn.Visible = false
 end)
 
 UserInputService.JumpRequest:Connect(function()
@@ -753,4 +357,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V7.4 loaded. Speed: 4 studs/frame × 15. UI unchanged from V7.3.")
+print("V7.4 loaded. UI fixed for mobile. Speed 4 studs/frame × 15.")
