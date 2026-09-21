@@ -1,80 +1,11 @@
 -- ==========================================
--- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.1
--- "LOOPHOLE EDITION" - FULLY PATCHED
--- Philosophy: Mimic a laggy legit player, never fight the AC head-on
+-- GR33D SCRIPTS: UNIVERSAL UTILITY SUITE V5.4
+-- "PASSIVE MODE" - CLEANED, LAZY INIT
+-- Philosophy: Do nothing until a toggle is enabled
 -- ==========================================
 
 -- ─────────────────────────────────────────
--- 1. REMOTE HOOKS (LOOPHOLE: per-instance, no setreadonly)
--- ─────────────────────────────────────────
-
-local remoteCooldowns = {}
-local kickSpoofReasons = {
-    "Disconnected due to network error",
-    "Lost connection to the server",
-    "Network timeout, please rejoin",
-}
-
--- Loophole: hook only suspicious remotes, not the global metatable
-local function hookSuspiciousRemote(remote)
-    if not (remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction")) then return end
-    local n = remote.Name:lower()
-    if not (n:find("anticheat") or n:find("detect") or n:find("ban")
-        or n:find("report") or n:find("integrity") or n:find("exploit")) then return end
-    if rawget(remote, "__gr33d_hooked") then return end
-    rawset(remote, "__gr33d_hooked", true)
-
-    if remote:IsA("RemoteEvent") then
-        local oldFire = remote.FireServer
-        remote.FireServer = newcclosure(function(self, ...)
-            -- Loophole: delay + jitter to mimic lag, don't drop
-            local now = os.clock()
-            local last = remoteCooldowns[self] or 0
-            if now - last < 0.08 then
-                task.wait(math.random(80, 250) / 1000)
-            end
-            remoteCooldowns[self] = os.clock()
-            return oldFire(self, ...)
-        end)
-    end
-end
-
-for _, obj in ipairs(game:GetDescendants()) do pcall(hookSuspiciousRemote, obj) end
-game.DescendantAdded:Connect(function(obj) pcall(hookSuspiciousRemote, obj) end)
-
--- Loophole: hook Kick on LocalPlayer only, spoof reason
-local oldKick
-pcall(function()
-    oldKick = hookfunction(player.Kick, newcclosure(function(self, ...)
-        local args = {...}
-        if args[1] then args[1] = kickSpoofReasons[math.random(#kickSpoofReasons)] end
-        return oldKick(self, unpack(args))
-    end))
-end)
-
--- Loophole: global __newindex hook ONLY for Humanoid health (not setreadonly)
-local oldNewIndex
-pcall(function()
-    local mt = getrawmetatable(game)
-    oldNewIndex = hookfunction(mt.__newindex, newcclosure(function(t, k, v)
-        if not checkcaller() and typeof(t) == "Instance" and t:IsA("Humanoid") then
-            local char = game.Players.LocalPlayer.Character
-            if char and t:IsDescendantOf(char) then
-                if k == "Health" and (getgenv().GodModeActive or getgenv().MegaHealthActive) then
-                    local safeVal = math.max(1, math.min(v, t.MaxHealth))
-                    return oldNewIndex(t, k, safeVal)
-                end
-                if k == "MaxHealth" and getgenv().MegaHealthActive and v < 10000 then
-                    return oldNewIndex(t, k, v)
-                end
-            end
-        end
-        return oldNewIndex(t, k, v)
-    end))
-end)
-
--- ─────────────────────────────────────────
--- 2. SERVICES & STATE
+-- 1. SERVICES (always needed — read-only)
 -- ─────────────────────────────────────────
 
 local UserInputService = game:GetService("UserInputService")
@@ -84,7 +15,6 @@ local Workspace        = game:GetService("Workspace")
 local TeleportService  = game:GetService("TeleportService")
 local HttpService      = game:GetService("HttpService")
 local VirtualUser      = game:GetService("VirtualUser")
-local TweenService     = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -95,25 +25,16 @@ end
 local camera  = Workspace.CurrentCamera
 local PlaceId = game.PlaceId
 
+-- ─────────────────────────────────────────
+-- 2. STATE (all OFF by default — nothing runs)
+-- ─────────────────────────────────────────
+
 local FLY_SPEED          = 50
 local runSpeedValue      = 50
 local jumpPowerValue     = 50
 local defaultJumpPower   = 50
 local defaultWalkSpeed   = 16
 local DOUBLE_TAP_WINDOW  = 0.35
-local cachedPrompts      = {}
-local cachedMonsters     = {}
-local originalPromptValues = {}
-local originalToolValues   = {}
-
-getgenv().NoclipActive     = false
-getgenv().GodModeActive    = false
-getgenv().MegaHealthActive = false
-getgenv().SlimHitboxActive = false
-getgenv().AutoGrabActive   = false
-getgenv().TargetValue      = 0
-getgenv().TargetLuck       = 0
-getgenv().TargetSize       = 0
 
 local flyToggleEnabled      = false
 local isFlying              = false
@@ -126,14 +47,10 @@ local jumpEnabled           = false
 local hitboxEnabled         = false
 local slimHitboxEnabled     = false
 local aimbotEnabled         = false
-local thirdPersonCamEnabled = false
 local rapidFireEnabled      = false
-local eggEspEnabled         = false
-local autoPromptTpEnabled   = false
 local antiAfkEnabled        = false
 local antiMeleeEnabled      = false
 local isMinimized           = false
-local autoGrabLoopRunning   = false
 local panicActive           = false
 
 local lastJumpTapTime    = 0
@@ -148,240 +65,100 @@ local jumpConnection
 local originalHitboxSizes = {}
 local originalRootSize    = nil
 local pristineRootSize    = Vector3.new(2, 2, 1)
-local trackedEggTags      = {}
+local originalToolValues  = {}
+local cachedMonsters      = {}
+
+-- Lazy-init connection handles
+local mainRenderConnection     = nil
+local speedConnection          = nil
+local noclipConnection         = nil
+local monsterScannerThread     = nil
+local healthHookInstalled      = false
+local kickHookInstalled        = false
+local oldNewIndex              = nil
+local oldKick                  = nil
 
 -- ─────────────────────────────────────────
--- 3. ANTI-AFK (randomized, human-like)
+-- 3. LAZY HELPERS
 -- ─────────────────────────────────────────
 
-player.Idled:Connect(function()
-    if antiAfkEnabled then
-        pcall(function()
-            local randPos = Vector2.new(math.random(-50, 50), math.random(-50, 50))
-            VirtualUser:Button2Down(randPos, camera.CFrame)
-            task.wait(math.random(50, 200) / 1000)
-            VirtualUser:Button2Up(randPos, camera.CFrame)
-        end)
-    end
-end)
+local function isAnyFeatureActive()
+    return godModeEnabled or megaHealthEnabled or rapidHealingEnabled
+        or noFallDamageEnabled or runSpeedEnabled or jumpEnabled
+        or hitboxEnabled or slimHitboxEnabled or aimbotEnabled
+        or rapidFireEnabled or antiMeleeEnabled or flyToggleEnabled
+end
 
 -- ─────────────────────────────────────────
--- 4. CONTROLS
+-- 4. CONTROLS (only needed for flight)
 -- ─────────────────────────────────────────
 
 local controls = nil
-pcall(function()
-    local playerScripts = player:WaitForChild("PlayerScripts", 5)
-    if playerScripts then
-        local playerModuleScript = playerScripts:WaitForChild("PlayerModule", 5)
-        if playerModuleScript then
-            controls = require(playerModuleScript):GetControls()
-        end
-    end
-end)
-
--- ─────────────────────────────────────────
--- 5. PARSING HELPERS
--- ─────────────────────────────────────────
-
-local function parseStatValue(input)
-    if type(input) == "number" then return input end
-    if type(input) ~= "string" then return 0 end
-    local upperInput = input:upper():gsub("%s+", "")
-    if upperInput == "" or upperInput == "0" then return 0 end
-    if upperInput:find("KG") or upperInput:find("TON") or upperInput:find("LUCK") or upperInput:find("%%") then return 0 end
-    local numStr, suffix = upperInput:match("(%d+%.?%d*)([KMGT]?)")
-    local num = tonumber(numStr)
-    if not num then
-        local cleaned = upperInput:gsub("[^0-9KMBT%.]", "")
-        num = tonumber(cleaned:match("[%d%.]+"))
-        if not num then return 0 end
-        if cleaned:find("T") then return num * 1e12
-        elseif cleaned:find("B") then return num * 1e9
-        elseif cleaned:find("M") then return num * 1e6
-        elseif cleaned:find("K") then return num * 1e3 end
-        return num
-    end
-    local multiplier = 1
-    if suffix == "T" or upperInput:find("TRILLION") then multiplier = 1e12
-    elseif suffix == "B" or upperInput:find("BILLION") then multiplier = 1e9
-    elseif suffix == "M" or upperInput:find("MILLION") then multiplier = 1e6
-    elseif suffix == "K" or upperInput:find("THOUSAND") then multiplier = 1e3 end
-    return num * multiplier
-end
-
-local function parseWeightValue(input)
-    if type(input) == "number" then return input end
-    if type(input) ~= "string" then return 0 end
-    local upperInput = input:upper()
-    local cleaned = upperInput:gsub("[^0-9%.]", "")
-    local num = tonumber(cleaned:match("[%d%.]+"))
-    if not num then return 0 end
-    if upperInput:find("TON") then return num * 1000
-    elseif upperInput:find("KG") then return num
-    elseif upperInput:find("G") then return num / 1000 end
-    return num
-end
-
-local function isValidGrabPrompt(prompt)
-    if not prompt or not prompt.Enabled then return false end
-    local parentObj = prompt.Parent
-    if not parentObj then return false end
-    if parentObj:IsA("ScreenGui") or parentObj:IsA("BillboardGui") or parentObj:IsA("SurfaceGui")
-        or parentObj:IsA("TextButton") or parentObj:IsA("ImageButton") then
-        return false
-    end
-    local actionText = prompt.ActionText:lower()
-    local objectText = prompt.ObjectText:lower()
-    local blockedKeywords = {"buy","purchase","view","shop","robux","configure","finish","mining","backpack","group","gift","verify","claim","full","reward","spin","upgrade","warmth","carry","open"}
-    for _, keyword in ipairs(blockedKeywords) do
-        if actionText:find(keyword) or objectText:find(keyword) then return false end
-    end
-    local ancestor = prompt:FindFirstAncestorOfClass("Model")
-    if ancestor then
-        local nameLower = ancestor.Name:lower()
-        for _, keyword in ipairs(blockedKeywords) do
-            if nameLower:find(keyword) then return false end
-        end
-    end
-    return true
-end
-
--- ─────────────────────────────────────────
--- 6. BACKGROUND SCANNERS
--- ─────────────────────────────────────────
-
-task.spawn(function()
-    while true do
-        if getgenv().AutoGrabActive or autoPromptTpEnabled then
-            local cache = {}
-            for _, obj in ipairs(Workspace:GetDescendants()) do
-                if obj:IsA("ProximityPrompt")
-                    and isValidGrabPrompt(obj)
-                    and not obj:IsDescendantOf(player.PlayerGui)
-                    and not obj:IsDescendantOf(game:GetService("CoreGui")) then
-                    table.insert(cache, obj)
-                end
-            end
-            cachedPrompts = cache
-        end
-        task.wait(1)
-    end
-end)
-
-task.spawn(function()
-    while true do
-        local list = {}
-        for _, obj in ipairs(Workspace:GetDescendants()) do
-            if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
-                local nameLower = obj.Name:lower()
-                local isFriendly = nameLower:find("shop") or nameLower:find("npc") or nameLower:find("dummy")
-                    or nameLower:find("merchant") or nameLower:find("guide") or nameLower:find("bank") or nameLower:find("quest")
-                if not isFriendly then
-                    local hum = obj:FindFirstChildOfClass("Humanoid")
-                    local hrp = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("PrimaryPart")
-                    if hum and hrp and hum.Health > 0 then table.insert(list, hrp) end
-                end
+local function getControls()
+    if controls then return controls end
+    pcall(function()
+        local playerScripts = player:WaitForChild("PlayerScripts", 5)
+        if playerScripts then
+            local playerModuleScript = playerScripts:WaitForChild("PlayerModule", 5)
+            if playerModuleScript then
+                controls = require(playerModuleScript):GetControls()
             end
         end
-        cachedMonsters = list
-        task.wait(1)
-    end
-end)
+    end)
+    return controls
+end
 
-task.spawn(function()
-    while true do
-        if eggEspEnabled then
-            for _, obj in ipairs(Workspace:GetDescendants()) do
-                if obj:IsA("Model") and (obj.Name:lower():find("egg") or obj.Name:lower():find("brainrot")) and not trackedEggTags[obj] then
-                    local targetPart = obj:FindFirstChild("HumanoidRootPart") or obj.PrimaryPart or obj:FindFirstChildOfClass("BasePart")
-                    if targetPart then
-                        local billboard = Instance.new("BillboardGui")
-                        billboard.Name = "EggESP"
-                        billboard.Adornee = targetPart
-                        billboard.Size = UDim2.new(0, 100, 0, 30)
-                        billboard.StudsOffset = Vector3.new(0, 2, 0)
-                        billboard.AlwaysOnTop = true
-                        local label = Instance.new("TextLabel")
-                        label.Parent = billboard
-                        label.Size = UDim2.new(1, 0, 1, 0)
-                        label.BackgroundTransparency = 1
-                        label.Text = obj.Name
-                        label.TextColor3 = Color3.fromRGB(255, 215, 0)
-                        label.Font = Enum.Font.GothamBold
-                        label.TextSize = 12
-                        billboard.Parent = obj
-                        trackedEggTags[obj] = billboard
+-- ─────────────────────────────────────────
+-- 5. HEALTH HOOK (lazy — only when God/Mega enabled)
+-- ─────────────────────────────────────────
+
+local function installHealthHook()
+    if healthHookInstalled then return end
+    healthHookInstalled = true
+    pcall(function()
+        local mt = getrawmetatable(game)
+        oldNewIndex = hookfunction(mt.__newindex, newcclosure(function(t, k, v)
+            if not checkcaller() and typeof(t) == "Instance" and t:IsA("Humanoid") then
+                local char = game.Players.LocalPlayer.Character
+                if char and t:IsDescendantOf(char) then
+                    if k == "Health" and (godModeEnabled or megaHealthEnabled) then
+                        local safeVal = math.max(1, math.min(v, t.MaxHealth))
+                        return oldNewIndex(t, k, safeVal)
+                    end
+                    if k == "MaxHealth" and megaHealthEnabled and v < 10000 then
+                        return oldNewIndex(t, k, v)
                     end
                 end
             end
-        else
-            if next(trackedEggTags) then
-                for _, tag in pairs(trackedEggTags) do if tag then tag:Destroy() end end
-                trackedEggTags = {}
-            end
-        end
-        task.wait(2)
-    end
-end)
-
--- ─────────────────────────────────────────
--- 7. STAT SCANNER
--- ─────────────────────────────────────────
-
-local function scanAndExtractStats(targetObj)
-    local statData = { Value = 0, Luck = 0, Size = 0, Weight = 0, RarityScore = 0 }
-    if not targetObj then return statData end
-    pcall(function()
-        if targetObj:IsA("Model") then statData.Size = targetObj:GetExtentsSize().Magnitude
-        elseif targetObj:IsA("BasePart") then statData.Size = targetObj.Size.Magnitude end
+            return oldNewIndex(t, k, v)
+        end))
     end)
-    pcall(function()
-        for attrName, val in pairs(targetObj:GetAttributes()) do
-            local nameLower = attrName:lower()
-            local valStr = tostring(val):lower()
-            local numericVal = parseStatValue(val)
-            local weightVal = parseWeightValue(val)
-            if nameLower:find("val") or nameLower:find("price") or nameLower:find("cash")
-                or nameLower:find("money") or nameLower:find("gamevalue") then
-                if numericVal > statData.Value then statData.Value = numericVal end
-            elseif nameLower:find("luck") then
-                if numericVal > statData.Luck then statData.Luck = numericVal end
-            elseif nameLower:find("weight") or nameLower:find("mass") then
-                if weightVal > statData.Weight then statData.Weight = weightVal end
-            elseif nameLower:find("size") then
-                if numericVal > statData.Size then statData.Size = numericVal end
-            elseif nameLower:find("rarity") or valStr:find("legendary") or valStr:find("mythic") or valStr:find("secret") then
-                statData.RarityScore = statData.RarityScore + 100
-            end
-        end
-    end)
-    pcall(function()
-        for _, desc in ipairs(targetObj:GetDescendants()) do
-            if desc:IsA("TextLabel") and (desc.Parent:IsA("BillboardGui") or desc.Parent:IsA("SurfaceGui")) then
-                local text = desc.Text
-                local textLower = text:lower()
-                local parsedVal = parseStatValue(text)
-                local parsedWeight = parseWeightValue(text)
-                if textLower:find("luck") or textLower:find("%%") then
-                    if parsedVal > statData.Luck then statData.Luck = parsedVal end
-                elseif textLower:find("ton") or textLower:find("kg") then
-                    if parsedWeight > statData.Weight then statData.Weight = parsedWeight end
-                else
-                    if parsedVal > 0 and parsedVal > statData.Value then statData.Value = parsedVal end
-                end
-                if textLower:find("secret") or textLower:find("mythic")
-                    or textLower:find("godly") or textLower:find("legendary") then
-                    statData.RarityScore = statData.RarityScore + 500
-                end
-            end
-        end
-    end)
-    return statData
 end
 
 -- ─────────────────────────────────────────
--- 8. STEALTH TELEPORT (patched: NaN guard)
+-- 6. KICK HOOK (lazy — only when God/Mega enabled)
+-- ─────────────────────────────────────────
+
+local kickSpoofReasons = {
+    "Disconnected due to network error",
+    "Lost connection to the server",
+    "Network timeout, please rejoin",
+}
+
+local function installKickHook()
+    if kickHookInstalled then return end
+    kickHookInstalled = true
+    pcall(function()
+        oldKick = hookfunction(player.Kick, newcclosure(function(self, ...)
+            local args = {...}
+            if args[1] then args[1] = kickSpoofReasons[math.random(#kickSpoofReasons)] end
+            return oldKick(self, unpack(args))
+        end))
+    end)
+end
+
+-- ─────────────────────────────────────────
+-- 7. STEALTH TELEPORT (pure function — only runs when called)
 -- ─────────────────────────────────────────
 
 local function stealthTeleport(destCFrame, duration)
@@ -408,356 +185,133 @@ local function stealthTeleport(destCFrame, duration)
 end
 
 -- ─────────────────────────────────────────
--- 9. STEALTH GRAB (patched: interpolated both ways)
+-- 8. MONSTER SCANNER (lazy — only when aimbot ON)
 -- ─────────────────────────────────────────
 
-local function stealthGrab(prompt)
-    if not rootPart or not prompt or not prompt.Parent then return end
-    local originalCF = rootPart.CFrame
-    local ok, pivot = pcall(function() return prompt.Parent:GetPivot() end)
-    if not ok or not pivot then return end
-    local promptPos = pivot.Position
-    local dist = (rootPart.Position - promptPos).Magnitude
-
-    if dist > 10 then
-        stealthTeleport(CFrame.new(promptPos + Vector3.new(0, 3, 0)), 0.04)
-        RunService.Heartbeat:Wait()
-        pcall(function() fireproximityprompt(prompt) end)
-        RunService.Heartbeat:Wait()
-        stealthTeleport(originalCF, 0.04)
-    else
-        pcall(function() fireproximityprompt(prompt) end)
-    end
-end
-
-local function executeAutoGrabRoutine()
-    if not rootPart then return end
-    for _, prompt in ipairs(cachedPrompts) do
-        if isValidGrabPrompt(prompt) then
-            local targetModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
-            local ok, pivot = pcall(function() return targetModel:GetPivot() end)
-            if ok and pivot then
-                local distance = (rootPart.Position - pivot.Position).Magnitude
-                if distance <= 45 then
-                    local stats = scanAndExtractStats(targetModel)
-                    local targetVal  = getgenv().TargetValue or 0
-                    local targetLuck = getgenv().TargetLuck or 0
-                    local targetSize = getgenv().TargetSize or 0
-                    local activeFilters = 0
-                    if targetVal  > 0 then activeFilters = activeFilters + 1 end
-                    if targetLuck > 0 then activeFilters = activeFilters + 1 end
-                    if targetSize > 0 then activeFilters = activeFilters + 1 end
-                    local meetsCriteria = (activeFilters == 0)
-                    if activeFilters > 0 then
-                        local valueMatches = (targetVal  == 0) or (math.abs(stats.Value - targetVal) <= targetVal * 0.25)
-                        local luckMatches  = (targetLuck == 0) or (stats.Luck >= targetLuck)
-                        local sizeMatches  = (targetSize == 0) or (stats.Size >= targetSize or stats.Weight >= targetSize)
-                        meetsCriteria = valueMatches and luckMatches and sizeMatches
+local function startMonsterScanner()
+    if monsterScannerThread then return end
+    monsterScannerThread = task.spawn(function()
+        while aimbotEnabled do
+            local list = {}
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
+                    local nameLower = obj.Name:lower()
+                    local isFriendly = nameLower:find("shop") or nameLower:find("npc") or nameLower:find("dummy")
+                        or nameLower:find("merchant") or nameLower:find("guide") or nameLower:find("bank") or nameLower:find("quest")
+                    if not isFriendly then
+                        local hum = obj:FindFirstChildOfClass("Humanoid")
+                        local hrp = obj:FindFirstChild("HumanoidRootPart") or obj:FindFirstChild("PrimaryPart")
+                        if hum and hrp and hum.Health > 0 then table.insert(list, hrp) end
                     end
-                    if meetsCriteria then stealthGrab(prompt) end
                 end
             end
+            cachedMonsters = list
+            task.wait(1)
         end
-    end
+        monsterScannerThread = nil
+    end)
 end
 
 -- ─────────────────────────────────────────
--- 10. SAFE TP TO HIGHEST VALUE
+-- 9. SUPER SPEED (lazy — only when toggled ON)
 -- ─────────────────────────────────────────
 
-local function SafeTeleportAndGrabHighestValue()
-    if not character or not rootPart then return end
-    local originalCFrame = rootPart.CFrame
-    if not InitialSpawnCFrame then InitialSpawnCFrame = originalCFrame end
-
-    local highestItem, highestPrompt, maxVal = nil, nil, -math.huge
-
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        local nameLower = obj.Name:lower()
-        if nameLower:find("brainrot") or nameLower:find("egg") or obj:IsA("ProximityPrompt") then
-            local targetModel = obj:IsA("ProximityPrompt")
-                and (obj:FindFirstAncestorOfClass("Model") or obj.Parent)
-                or (obj:IsA("Model") and obj or obj:FindFirstAncestorOfClass("Model"))
-            if targetModel and targetModel ~= character and not Players:GetPlayerFromCharacter(targetModel) then
-                local stats = scanAndExtractStats(targetModel)
-                if stats.Value > maxVal then
-                    maxVal = stats.Value
-                    highestItem = targetModel
-                    highestPrompt = obj:IsA("ProximityPrompt") and obj
-                        or targetModel:FindFirstChildWhichIsA("ProximityPrompt", true)
-                end
+local function startSpeedLoop()
+    if speedConnection then return end
+    speedConnection = RunService.Heartbeat:Connect(function(dt)
+        if not humanoid then return end
+        if runSpeedEnabled and not isFlying then
+            local now = os.clock()
+            if now - lastSpeedUpdate > 1 then
+                local jitter = math.random(45, 60) / 10
+                humanoid.WalkSpeed = runSpeedValue + jitter
+                lastSpeedUpdate = now
             end
-        end
-    end
-
-    if not highestItem then
-        for _, obj in ipairs(Workspace:GetDescendants()) do
-            if obj:IsA("Model") and obj ~= character and not Players:GetPlayerFromCharacter(obj) then
-                local stats = scanAndExtractStats(obj)
-                if stats.Value > maxVal then
-                    maxVal = stats.Value
-                    highestItem = obj
-                    highestPrompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
-                end
-            end
-        end
-    end
-    if not highestItem then return end
-
-    local targetPart = highestItem:IsA("Model")
-        and (highestItem.PrimaryPart or highestItem:FindFirstChild("HumanoidRootPart") or highestItem:FindFirstChildWhichIsA("BasePart"))
-        or highestItem
-    if not targetPart then return end
-
-    local destinationCFrame = targetPart:IsA("BasePart") and targetPart.CFrame or highestItem:GetPivot()
-
-    stealthTeleport(destinationCFrame + Vector3.new(0, 3, 0), 0.06)
-    RunService.Heartbeat:Wait()
-
-    if highestPrompt then pcall(function() fireproximityprompt(highestPrompt) end) end
-    if highestItem:IsA("Model") then
-        for _, part in ipairs(highestItem:GetDescendants()) do
-            if part:IsA("BasePart") then
-                pcall(function()
-                    firetouchinterest(rootPart, part, 0)
-                    firetouchinterest(rootPart, part, 1)
-                end)
-            end
-        end
-    elseif highestItem:IsA("BasePart") then
-        pcall(function()
-            firetouchinterest(rootPart, highestItem, 0)
-            firetouchinterest(rootPart, highestItem, 1)
-        end)
-    end
-
-    stealthTeleport(InitialSpawnCFrame, 0.06)
-end
-
--- ─────────────────────────────────────────
--- 11. FLIGHT (BodyVelocity + subtle gravity)
--- ─────────────────────────────────────────
-
-local function setFlying(state)
-    if not rootPart or not humanoid then return end
-    isFlying = state
-    if isFlying then
-        if not bodyVelocity then
-            bodyVelocity = Instance.new("BodyVelocity")
-            bodyVelocity.Name = "FlightBV"
-            bodyVelocity.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-            bodyVelocity.Velocity = Vector3.zero
-            bodyVelocity.Parent = rootPart
-        end
-        humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-    else
-        if bodyVelocity then
-            bodyVelocity.Velocity = Vector3.zero
-            bodyVelocity:Destroy()
-            bodyVelocity = nil
-        end
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    end
-end
-
-local function handleJumpTap()
-    if not flyToggleEnabled then return end
-    local currentTime = os.clock()
-    local timeSinceLastTap = currentTime - lastJumpTapTime
-    if timeSinceLastTap <= DOUBLE_TAP_WINDOW then
-        if isFlying then setFlying(false)
-        elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
-            or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
-            setFlying(true)
-        end
-        lastJumpTapTime = 0
-    else
-        lastJumpTapTime = currentTime
-    end
-end
-
-UserInputService.JumpRequest:Connect(function()
-    local currentTime = os.clock()
-    if (currentTime - lastJumpReqTime) > 0.1 then handleJumpTap() end
-    lastJumpReqTime = currentTime
-end)
-
--- ─────────────────────────────────────────
--- 12. NOCLIP
--- ─────────────────────────────────────────
-
-RunService.Stepped:Connect(function()
-    if getgenv().NoclipActive and character then
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") and part.CanCollide then
-                part.CanCollide = false
-            end
-        end
-    end
-end)
-
--- ─────────────────────────────────────────
--- 13. SUPER SPEED (patched: once-per-second jitter)
--- ─────────────────────────────────────────
-
-RunService.Heartbeat:Connect(function(dt)
-    if runSpeedEnabled and humanoid and not isFlying then
-        local now = os.clock()
-        if now - lastSpeedUpdate > 1 then
-            local jitter = math.random(45, 60) / 10
-            humanoid.WalkSpeed = runSpeedValue + jitter
-            lastSpeedUpdate = now
-        end
-    elseif not runSpeedEnabled and humanoid then
-        if humanoid.WalkSpeed ~= defaultWalkSpeed then
-            humanoid.WalkSpeed = defaultWalkSpeed
-        end
-    end
-end)
-
--- ─────────────────────────────────────────
--- 14. RAPID FIRE (85% reduction, never 0)
--- ─────────────────────────────────────────
-
-local function applyRapidFire(tool)
-    for _, v in ipairs(tool:GetDescendants()) do
-        if (v:IsA("NumberValue") or v:IsA("IntValue")) then
-            local n = v.Name:lower()
-            if n:find("cooldown") or n:find("delay") or n:find("fire") or n:find("rate")
-                or n:find("speed") or n:find("mine") or n:find("dig") or n:find("swing")
-                or n:find("hit") or n:find("power") then
-                if not originalToolValues[v] then originalToolValues[v] = v.Value end
-                if n:find("power") or n:find("speed") then
-                    v.Value = originalToolValues[v] * 5
-                else
-                    v.Value = math.max(0.05, originalToolValues[v] * 0.15)
-                end
-            end
-        end
-    end
-end
-
-local function monitorTool(tool)
-    if tool:IsA("Tool") then
-        if rapidFireEnabled then applyRapidFire(tool) end
-        tool.DescendantAdded:Connect(function(v)
-            if rapidFireEnabled and (v:IsA("NumberValue") or v:IsA("IntValue")) then
-                applyRapidFire(tool)
-            end
-        end)
-    end
-end
-
--- ─────────────────────────────────────────
--- 15. CHARACTER SETUP (patched: jump connection leak fixed)
--- ─────────────────────────────────────────
-
-local function setupCharacter(char)
-    character = char
-    rootPart  = char:WaitForChild("HumanoidRootPart")
-    humanoid  = char:WaitForChild("Humanoid")
-    rootPart.Anchored = false
-
-    if humanoid then
-        defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
-        defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
-    end
-
-    if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
-    if jumpConnection then jumpConnection:Disconnect() jumpConnection = nil end
-    if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
-    if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
-
-    char.ChildAdded:Connect(function(child) monitorTool(child) end)
-    for _, child in ipairs(char:GetChildren()) do monitorTool(child) end
-
-    jumpConnection = humanoid.Jumping:Connect(function(isActive)
-        if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
-            local currentVel = rootPart.AssemblyLinearVelocity
-            rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
         end
     end)
-
-    task.defer(function()
-        if rootPart then
-            pristineRootSize = Vector3.new(2, 2, 1)
-            originalRootSize = pristineRootSize
-        end
-        if megaHealthEnabled and humanoid then
-            humanoid.MaxHealth = 10000
-            humanoid.Health    = 10000
-        end
-    end)
-
-    if not InitialSpawnCFrame then
-        task.delay(0.8, function()
-            if rootPart and not InitialSpawnCFrame then InitialSpawnCFrame = rootPart.CFrame end
-        end)
-    end
-    if flyToggleEnabled then setFlying(true) end
 end
 
-setupCharacter(player.Character or player.CharacterAdded:Wait())
-player.CharacterAdded:Connect(function(newChar)
-    flyToggleEnabled = false
-    isFlying = false
-    if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
-    setupCharacter(newChar)
-end)
-
-local backpack = player:FindFirstChildOfClass("Backpack")
-if backpack then backpack.ChildAdded:Connect(function(child) monitorTool(child) end) end
+local function stopSpeedLoop()
+    if speedConnection then
+        speedConnection:Disconnect()
+        speedConnection = nil
+        if humanoid then humanoid.WalkSpeed = defaultWalkSpeed end
+    end
+end
 
 -- ─────────────────────────────────────────
--- 16. MAIN RENDER LOOP
+-- 10. NOCLIP (lazy — only when toggled ON)
 -- ─────────────────────────────────────────
 
-RunService.RenderStepped:Connect(function(dt)
+local function startNoclipLoop()
+    if noclipConnection then return end
+    noclipConnection = RunService.Stepped:Connect(function()
+        if character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+end
+
+local function stopNoclipLoop()
+    if noclipConnection then
+        noclipConnection:Disconnect()
+        noclipConnection = nil
+        if character then
+            for _, part in ipairs(character:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end
+end
+
+-- ─────────────────────────────────────────
+-- 11. MAIN RENDER LOOP (lazy — only starts when any feature ON)
+-- ─────────────────────────────────────────
+
+local function mainRenderStep(dt)
     if not camera or not camera.Parent then camera = workspace.CurrentCamera return end
 
-    -- God Mode: only prevent death state
     if godModeEnabled and humanoid then
         pcall(function()
             humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
         end)
     end
 
-    -- Flight
     if isFlying and bodyVelocity and humanoid and rootPart then
         if humanoid.FloorMaterial ~= Enum.Material.Air then
-            setFlying(false)
-        elseif controls then
-            local moveVector = controls:GetMoveVector()
-            if moveVector.Magnitude > 0 then
-                local camCFrame = camera.CFrame
-                local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
-                bodyVelocity.Velocity = flightDir.Unit * FLY_SPEED + Vector3.new(0, -2, 0)
-            else
-                bodyVelocity.Velocity = Vector3.new(0, -2, 0)
+            -- flight toggle ON but landed — do not auto re-fly
+        else
+            local ctrl = getControls()
+            if ctrl then
+                local moveVector = ctrl:GetMoveVector()
+                if moveVector.Magnitude > 0 then
+                    local camCFrame = camera.CFrame
+                    local flightDir = (camCFrame.RightVector * moveVector.X) - (camCFrame.LookVector * moveVector.Z)
+                    bodyVelocity.Velocity = flightDir.Unit * FLY_SPEED + Vector3.new(0, -2, 0)
+                else
+                    bodyVelocity.Velocity = Vector3.new(0, -2, 0)
+                end
             end
         end
     end
 
-    -- Jump
     if jumpEnabled and humanoid then
         pcall(function()
             humanoid.UseJumpPower = true
             humanoid.JumpPower    = jumpPowerValue
         end)
-    elseif not jumpEnabled and humanoid then
-        pcall(function()
-            if humanoid.JumpPower ~= defaultJumpPower then humanoid.JumpPower = defaultJumpPower end
-        end)
     end
 
-    -- Rapid Healing (2% per frame)
     if rapidHealingEnabled and humanoid and humanoid.Health < humanoid.MaxHealth and humanoid.Health > 0 then
         humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + (humanoid.MaxHealth * 0.02))
     end
 
-    -- No Fall Damage
     if noFallDamageEnabled and rootPart and humanoid then
         if humanoid:GetState() == Enum.HumanoidStateType.Freefall
             or humanoid:GetState() == Enum.HumanoidStateType.FallingDown then
@@ -769,7 +323,6 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Anti-Knockback
     if antiMeleeEnabled and rootPart and humanoid then
         local currentVel = rootPart.AssemblyLinearVelocity
         if humanoid.MoveDirection.Magnitude == 0 and not isFlying and not runSpeedEnabled then
@@ -779,7 +332,6 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Hitbox Ext: size only, no CanCollide/Transparency
     if hitboxEnabled then
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= player and p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
@@ -790,21 +342,12 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Slim Hitbox
     if slimHitboxEnabled and rootPart then
         rootPart.Size = Vector3.new(1.3, 2, 0.7)
     elseif not slimHitboxEnabled and rootPart and originalRootSize and rootPart.Size ~= originalRootSize then
         rootPart.Size = originalRootSize
     end
 
-    -- Third-Person Cam: CFrame only, no CameraType change
-    if thirdPersonCamEnabled and rootPart then
-        local head = character and character:FindFirstChild("Head") or rootPart        local currentCamRot = camera.CFrame.Rotation
-        local focusPos = head.Position + Vector3.new(0, 1, 0)
-        camera.CFrame = CFrame.new(focusPos) * currentCamRot * CFrame.new(0, 3.5, -8)
-    end
-
-    -- Aimbot: slow lerp for human-like movement
     if aimbotEnabled and rootPart then
         local nearestTarget, shortestDist = nil, math.huge
         for _, p in ipairs(Players:GetPlayers()) do
@@ -839,37 +382,174 @@ RunService.RenderStepped:Connect(function(dt)
             camera.CFrame = camera.CFrame:Lerp(goalCFrame, math.clamp(dt * 8, 0.05, 0.3))
         end
     end
-end)
+end
+
+local function ensureMainLoopRunning()
+    if mainRenderConnection then return end
+    mainRenderConnection = RunService.RenderStepped:Connect(mainRenderStep)
+end
+
+local function stopMainLoopIfIdle()
+    if not isAnyFeatureActive() and mainRenderConnection then
+        mainRenderConnection:Disconnect()
+        mainRenderConnection = nil
+    end
+end
 
 -- ─────────────────────────────────────────
--- 17. AUTO TP TO PROMPT (replaces Prompt Extender)
+-- 12. RAPID FIRE (lazy — only on tool equip when ON)
 -- ─────────────────────────────────────────
 
-task.spawn(function()
-    while true do
-        if autoPromptTpEnabled and rootPart then
-            for _, prompt in ipairs(cachedPrompts) do
-                if prompt and prompt.Parent and prompt.Enabled then
-                    local targetModel = prompt:FindFirstAncestorOfClass("Model") or prompt.Parent
-                    local ok, pivot = pcall(function() return targetModel:GetPivot() end)
-                    if ok and pivot then
-                        local dist = (rootPart.Position - pivot.Position).Magnitude
-                        if dist <= 30 and dist > 8 then
-                            stealthTeleport(CFrame.new(pivot.Position + Vector3.new(0, 3, 0)), 0.04)
-                            RunService.Heartbeat:Wait()
-                            pcall(function() fireproximityprompt(prompt) end)
-                            break
-                        end
-                    end
+local function applyRapidFire(tool)
+    for _, v in ipairs(tool:GetDescendants()) do
+        if (v:IsA("NumberValue") or v:IsA("IntValue")) then
+            local n = v.Name:lower()
+            if n:find("cooldown") or n:find("delay") or n:find("fire") or n:find("rate")
+                or n:find("speed") or n:find("mine") or n:find("dig") or n:find("swing")
+                or n:find("hit") or n:find("power") then
+                if not originalToolValues[v] then originalToolValues[v] = v.Value end
+                if n:find("power") or n:find("speed") then
+                    v.Value = originalToolValues[v] * 5
+                else
+                    v.Value = math.max(0.05, originalToolValues[v] * 0.15)
                 end
             end
         end
-        task.wait(0.2)
+    end
+end
+
+local function monitorTool(tool)
+    if not rapidFireEnabled then return end
+    if tool:IsA("Tool") then
+        applyRapidFire(tool)
+    end
+end
+
+-- ─────────────────────────────────────────
+-- 13. FLIGHT
+-- ─────────────────────────────────────────
+
+local function setFlying(state)
+    if not rootPart or not humanoid then return end
+    isFlying = state
+    if isFlying then
+        if not bodyVelocity then
+            bodyVelocity = Instance.new("BodyVelocity")
+            bodyVelocity.Name = "FlightBV"
+            bodyVelocity.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+            bodyVelocity.Velocity = Vector3.zero
+            bodyVelocity.Parent = rootPart
+        end
+        humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        ensureMainLoopRunning()
+    else
+        if bodyVelocity then
+            bodyVelocity.Velocity = Vector3.zero
+            bodyVelocity:Destroy()
+            bodyVelocity = nil
+        end
+        if humanoid.FloorMaterial ~= Enum.Material.Air then
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end
+        stopMainLoopIfIdle()
+    end
+end
+
+local function handleJumpTap()
+    if not flyToggleEnabled then return end
+    local currentTime = os.clock()
+    local timeSinceLastTap = currentTime - lastJumpTapTime
+    if timeSinceLastTap <= DOUBLE_TAP_WINDOW then
+        if isFlying then setFlying(false)
+        elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
+            or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
+            setFlying(true)
+        end
+        lastJumpTapTime = 0
+    else
+        lastJumpTapTime = currentTime
+    end
+end
+
+UserInputService.JumpRequest:Connect(function()
+    if not flyToggleEnabled then return end
+    local currentTime = os.clock()
+    if (currentTime - lastJumpReqTime) > 0.1 then handleJumpTap() end
+    lastJumpReqTime = currentTime
+end)
+
+-- ─────────────────────────────────────────
+-- 14. CHARACTER SETUP
+-- ─────────────────────────────────────────
+
+local function setupCharacter(char)
+    character = char
+    rootPart  = char:WaitForChild("HumanoidRootPart")
+    humanoid  = char:WaitForChild("Humanoid")
+    rootPart.Anchored = false
+
+    if humanoid then
+        defaultJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
+        defaultWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
+    end
+
+    if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
+    if jumpConnection then jumpConnection:Disconnect() jumpConnection = nil end
+
+    jumpConnection = humanoid.Jumping:Connect(function(isActive)
+        if jumpEnabled and isActive and rootPart and humanoid.FloorMaterial ~= Enum.Material.Air then
+            local currentVel = rootPart.AssemblyLinearVelocity
+            rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, jumpPowerValue, currentVel.Z)
+        end
+    end)
+
+    task.defer(function()
+        if rootPart then
+            pristineRootSize = Vector3.new(2, 2, 1)
+            originalRootSize = pristineRootSize
+        end
+        if megaHealthEnabled and humanoid then
+            humanoid.MaxHealth = 10000
+            humanoid.Health    = 10000
+        end
+    end)
+
+    if not InitialSpawnCFrame then
+        task.delay(0.8, function()
+            if rootPart and not InitialSpawnCFrame then InitialSpawnCFrame = rootPart.CFrame end
+        end)
+    end
+end
+
+setupCharacter(player.Character or player.CharacterAdded:Wait())
+player.CharacterAdded:Connect(function(newChar)
+    flyToggleEnabled = false
+    isFlying = false
+    if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
+    setupCharacter(newChar)
+    if isAnyFeatureActive() then ensureMainLoopRunning() end
+end)
+
+local backpack = player:FindFirstChildOfClass("Backpack")
+if backpack then backpack.ChildAdded:Connect(function(child) monitorTool(child) end) end
+
+-- ─────────────────────────────────────────
+-- 15. ANTI-AFK (gated by toggle)
+-- ─────────────────────────────────────────
+
+player.Idled:Connect(function()
+    if antiAfkEnabled then
+        pcall(function()
+            local randPos = Vector2.new(math.random(-50, 50), math.random(-50, 50))
+            VirtualUser:Button2Down(randPos, camera.CFrame)
+            task.wait(math.random(50, 200) / 1000)
+            VirtualUser:Button2Up(randPos, camera.CFrame)
+        end)
     end
 end)
 
 -- ─────────────────────────────────────────
--- 18. PANIC MODE (RightShift)
+-- 16. PANIC MODE (RightShift)
 -- ─────────────────────────────────────────
 
 UserInputService.InputBegan:Connect(function(input, gpe)
@@ -877,7 +557,6 @@ UserInputService.InputBegan:Connect(function(input, gpe)
     if input.KeyCode == Enum.KeyCode.RightShift then
         panicActive = not panicActive
         if panicActive then
-            -- Restore everything to default
             if humanoid then
                 humanoid.WalkSpeed = defaultWalkSpeed
                 humanoid.JumpPower = defaultJumpPower
@@ -894,16 +573,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
                 if valObj and valObj.Parent then valObj.Value = origVal end
             end
             originalToolValues = {}
-            for promptObj, orig in pairs(originalPromptValues) do
-                if promptObj and promptObj.Parent then
-                    promptObj.MaxActivationDistance = orig.MaxActivationDistance
-                    promptObj.RequiresLineOfSight = orig.RequiresLineOfSight
-                    promptObj.HoldDuration = orig.HoldDuration
-                end
-            end
-            originalPromptValues = {}
 
-            -- Disable all toggles
             flyToggleEnabled = false
             isFlying = false
             if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
@@ -916,16 +586,15 @@ UserInputService.InputBegan:Connect(function(input, gpe)
             hitboxEnabled = false
             slimHitboxEnabled = false
             aimbotEnabled = false
-            thirdPersonCamEnabled = false
             rapidFireEnabled = false
-            eggEspEnabled = false
-            autoPromptTpEnabled = false
             antiMeleeEnabled = false
-            getgenv().GodModeActive = false
-            getgenv().MegaHealthActive = false
-            getgenv().SlimHitboxActive = false
-            getgenv().NoclipActive = false
-            getgenv().AutoGrabActive = false
+
+            if noclipConnection then stopNoclipLoop() end
+            if speedConnection then stopSpeedLoop() end
+            if mainRenderConnection then
+                mainRenderConnection:Disconnect()
+                mainRenderConnection = nil
+            end
 
             print("[PANIC] All features disabled, values restored.")
         end
@@ -933,7 +602,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
 end)
 
 -- ─────────────────────────────────────────
--- 19. UI
+-- 17. UI
 -- ─────────────────────────────────────────
 
 local screenGui = Instance.new("ScreenGui", protectedParent)
@@ -962,7 +631,7 @@ local titleLabel = Instance.new("TextLabel", topBar)
 titleLabel.Size = UDim2.new(1, -50, 1, 0)
 titleLabel.Position = UDim2.new(0, 12, 0, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text = "GR33D Scripts V5.1 (Stealth)"
+titleLabel.Text = "GR33D Scripts V5.4"
 titleLabel.TextColor3 = Color3.fromRGB(245, 245, 250)
 titleLabel.Font = Enum.Font.GothamBold
 titleLabel.TextSize = 13
@@ -983,7 +652,7 @@ toggleContainer.Size = UDim2.new(1, 0, 1, -42)
 toggleContainer.Position = UDim2.new(0, 0, 0, 42)
 toggleContainer.BackgroundTransparency = 1
 toggleContainer.BorderSizePixel = 0
-toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 850)
+toggleContainer.CanvasSize = UDim2.new(0, 0, 0, 700)
 toggleContainer.ScrollBarThickness = 4
 
 local dragging, dragStart, startPos = false, nil, nil
@@ -1146,116 +815,152 @@ local function createActionButtonInGroup(parent, name, yPos, color, callback)
     btn.BackgroundColor3 = color
     btn.Text = name
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 10
+    btn.Font = Enum.Font.GothamBold    btn.TextSize = 10
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
     btn.MouseButton1Click:Connect(callback)
     return btn
 end
 
 -- ─────────────────────────────────────────
--- 20. UI WIRING
+-- 18. UI WIRING
 -- ─────────────────────────────────────────
 
 local movementContent, nextLeftY = createCollapsibleGroup(leftGroupFrame, "Movement & Utility", 0, 282)
 
 createToggleInGroup(movementContent, "Flight Mode", 0, function(state)
     flyToggleEnabled = state
-    if not state then setFlying(false) end
+    if state then
+        ensureMainLoopRunning()
+    else
+        setFlying(false)
+        stopMainLoopIfIdle()
+    end
 end)
 
 createToggleInGroup(movementContent, "God Mode", 28, function(state)
     godModeEnabled = state
-    getgenv().GodModeActive = state
-    if humanoid then
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, not state)
-        if state then humanoid.Health = humanoid.MaxHealth end
+    if state then
+        installHealthHook()
+        installKickHook()
+        ensureMainLoopRunning()
+        if humanoid then
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+            humanoid.Health = humanoid.MaxHealth
+        end
+    else
+        if humanoid then
+            humanoid:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+        end
+        stopMainLoopIfIdle()
     end
 end)
 
 createToggleInGroup(movementContent, "Mega Health HP", 56, function(state)
     megaHealthEnabled = state
-    getgenv().MegaHealthActive = state
-    if humanoid then
-        humanoid.MaxHealth = state and 10000 or 100
-        humanoid.Health    = humanoid.MaxHealth
+    if state then
+        installHealthHook()
+        installKickHook()
+        ensureMainLoopRunning()
+        if humanoid then
+            humanoid.MaxHealth = 10000
+            humanoid.Health    = 10000
+        end
+    else
+        if humanoid then
+            humanoid.MaxHealth = 100
+            humanoid.Health = math.min(humanoid.Health, 100)
+        end
+        stopMainLoopIfIdle()
     end
 end)
 
-createToggleInGroup(movementContent, "Rapid Healing", 84, function(state) rapidHealingEnabled = state end)
-createToggleInGroup(movementContent, "No Fall Dmg", 112, function(state) noFallDamageEnabled = state end)
+createToggleInGroup(movementContent, "Rapid Healing", 84, function(state)
+    rapidHealingEnabled = state
+    if state then ensureMainLoopRunning() else stopMainLoopIfIdle() end
+end)
+
+createToggleInGroup(movementContent, "No Fall Dmg", 112, function(state)
+    noFallDamageEnabled = state
+    if state then ensureMainLoopRunning() else stopMainLoopIfIdle() end
+end)
 
 createToggleInGroup(movementContent, "Noclip Bypass", 140, function(state)
-    getgenv().NoclipActive = state
-    player.DevCameraOcclusionMode = state and Enum.DevCameraOcclusionMode.Invisicam or Enum.DevCameraOcclusionMode.Zoom
-    if not state and character then
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-                part.CanCollide = true
-            end
-        end
+    if state then
+        startNoclipLoop()
+        player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam
+    else
+        stopNoclipLoop()
+        player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Zoom
     end
 end)
 
-createToggleInGroup(movementContent, "Super Speed", 168, function(state) runSpeedEnabled = state end)
+createToggleInGroup(movementContent, "Super Speed", 168, function(state)
+    runSpeedEnabled = state
+    if state then
+        startSpeedLoop()
+        ensureMainLoopRunning()
+    else
+        stopSpeedLoop()
+        stopMainLoopIfIdle()
+    end
+end)
 createInputInGroup(movementContent, "Speed Val", 196, "50", function(v) runSpeedValue = tonumber(v) or 50 end)
 
 createToggleInGroup(movementContent, "Custom Jump", 224, function(state)
     jumpEnabled = state
-    if not state and humanoid then
-        pcall(function() humanoid.JumpPower = defaultJumpPower end)
+    if state then
+        ensureMainLoopRunning()
+    else
+        if humanoid then
+            pcall(function() humanoid.JumpPower = defaultJumpPower end)
+        end
+        stopMainLoopIfIdle()
     end
 end)
 createInputInGroup(movementContent, "Jump Val", 252, "50", function(v) jumpPowerValue = tonumber(v) or 50 end)
 
-local grabContent, nextLeftY2 = createCollapsibleGroup(leftGroupFrame, "Safe Auto-Grab", nextLeftY + 8, 114)
-
-createToggleInGroup(grabContent, "Auto Grab Nearby", 0, function(state)
-    getgenv().AutoGrabActive = state
-    if state and not autoGrabLoopRunning then
-        autoGrabLoopRunning = true
-        task.spawn(function()
-            while getgenv().AutoGrabActive do
-                executeAutoGrabRoutine()
-                task.wait(0.1)
-            end
-            autoGrabLoopRunning = false
-        end)
-    end
-end)
-
-createInputInGroup(grabContent, "Target Val", 28, "0", function(v) getgenv().TargetValue = parseStatValue(v) end)
-createInputInGroup(grabContent, "Target Luck", 56, "0", function(v) getgenv().TargetLuck = parseStatValue(v) end)
-createInputInGroup(grabContent, "Target Size", 84, "0", function(v) getgenv().TargetSize = parseStatValue(v) end)
-
-local scanContent, _ = createCollapsibleGroup(leftGroupFrame, "Server Scan TP", nextLeftY2 + 8, 30)
-createActionButtonInGroup(scanContent, "TP: Highest Value", 0, Color3.fromRGB(39, 174, 96), function()
-    SafeTeleportAndGrabHighestValue()
-end)
-
-local combatContent, nextRightY = createCollapsibleGroup(rightGroupFrame, "Combat & Tools", 0, 316)
+local combatContent, nextRightY = createCollapsibleGroup(rightGroupFrame, "Combat & Tools", 0, 260)
 
 createToggleInGroup(combatContent, "Hitbox Ext", 0, function(state)
     hitboxEnabled = state
-    if not state then
+    if state then
+        ensureMainLoopRunning()
+    else
         for hrp, origSize in pairs(originalHitboxSizes) do
             if hrp and hrp.Parent then hrp.Size = origSize end
         end
         originalHitboxSizes = {}
+        stopMainLoopIfIdle()
     end
 end)
 
 createToggleInGroup(combatContent, "Slim Hitbox", 28, function(state)
     slimHitboxEnabled = state
-    getgenv().SlimHitboxActive = state
-    if not state and rootPart and originalRootSize then rootPart.Size = originalRootSize end
+    if state then
+        ensureMainLoopRunning()
+    else
+        if rootPart and originalRootSize then rootPart.Size = originalRootSize end
+        stopMainLoopIfIdle()
+    end
 end)
 
-createToggleInGroup(combatContent, "Anti-Knockback", 56, function(state) antiMeleeEnabled = state end)
-createToggleInGroup(combatContent, "Aimbot", 84, function(state) aimbotEnabled = state end)
-createToggleInGroup(combatContent, "Third-Person Cam", 112, function(state) thirdPersonCamEnabled = state end)
+createToggleInGroup(combatContent, "Anti-Knockback", 56, function(state)
+    antiMeleeEnabled = state
+    if state then ensureMainLoopRunning() else stopMainLoopIfIdle() end
+end)
 
-createToggleInGroup(combatContent, "Rapid Fire", 140, function(state)
+createToggleInGroup(combatContent, "Aimbot", 84, function(state)
+    aimbotEnabled = state
+    if state then
+        startMonsterScanner()
+        ensureMainLoopRunning()
+    else
+        cachedMonsters = {}
+        stopMainLoopIfIdle()
+    end
+end)
+
+createToggleInGroup(combatContent, "Rapid Fire", 112, function(state)
     rapidFireEnabled = state
     if state and character then
         for _, tool in ipairs(character:GetChildren()) do
@@ -1275,11 +980,11 @@ createToggleInGroup(combatContent, "Rapid Fire", 140, function(state)
     end
 end)
 
-createActionButtonInGroup(combatContent, "TP to Spawn", 168, Color3.fromRGB(41, 128, 185), function()
+createActionButtonInGroup(combatContent, "TP to Spawn", 140, Color3.fromRGB(41, 128, 185), function()
     if InitialSpawnCFrame then stealthTeleport(InitialSpawnCFrame, 0.05) end
 end)
 
-local saveMapButton = createActionButtonInGroup(combatContent, "Save Location", 196, Color3.fromRGB(142, 68, 173), function()
+local saveMapButton = createActionButtonInGroup(combatContent, "Save Location", 168, Color3.fromRGB(142, 68, 173), function()
     if rootPart then
         savedMapCFrame = rootPart.CFrame
         saveMapButton.Text = "Saved!"
@@ -1287,11 +992,11 @@ local saveMapButton = createActionButtonInGroup(combatContent, "Save Location", 
     end
 end)
 
-createActionButtonInGroup(combatContent, "TP to Saved", 224, Color3.fromRGB(39, 174, 96), function()
+createActionButtonInGroup(combatContent, "TP to Saved", 196, Color3.fromRGB(39, 174, 96), function()
     if savedMapCFrame then stealthTeleport(savedMapCFrame, 0.05) end
 end)
 
-createActionButtonInGroup(combatContent, "Server Hop (Low)", 252, Color3.fromRGB(211, 84, 0), function()
+createActionButtonInGroup(combatContent, "Server Hop (Low)", 224, Color3.fromRGB(211, 84, 0), function()
     local success, result = pcall(function()
         local url = "https://games.roblox.com/v1/games/" .. PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
         return HttpService:JSONDecode(game:HttpGet(url))
@@ -1317,24 +1022,11 @@ createActionButtonInGroup(combatContent, "Server Hop (Low)", 252, Color3.fromRGB
     end
 end)
 
-local utilityContent, _ = createCollapsibleGroup(rightGroupFrame, "Utilities & ESP", nextRightY + 8, 84)
-
-createToggleInGroup(utilityContent, "Egg Name ESP", 0, function(state)
-    eggEspEnabled = state
-    if not state then
-        for _, tag in pairs(trackedEggTags) do if tag then tag:Destroy() end end
-        trackedEggTags = {}
-    end
-end)
-
-createToggleInGroup(utilityContent, "Auto TP to Prompt", 28, function(state)
-    autoPromptTpEnabled = state
-end)
-
-createToggleInGroup(utilityContent, "Anti-AFK", 56, function(state) antiAfkEnabled = state end)
+local utilityContent, _ = createCollapsibleGroup(rightGroupFrame, "Utilities", nextRightY + 8, 30)
+createToggleInGroup(utilityContent, "Anti-AFK", 0, function(state) antiAfkEnabled = state end)
 
 -- ─────────────────────────────────────────
--- 21. LOAD MESSAGE
+-- 19. LOAD MESSAGE
 -- ─────────────────────────────────────────
 
-print("[V5.1] Utility loaded. Press RightShift for PANIC MODE.")
+print("[V5.4] UI loaded. ZERO passive footprint. Press RightShift for PANIC MODE.")
