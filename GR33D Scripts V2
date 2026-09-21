@@ -1,6 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V5.9 - ANCHOR-TRICK + LOGGER
--- Logs every action to a .txt file for debugging
+-- GR33D SCRIPTS V6.0 - PHYSICS-ONLY EDITION
+-- No anchor tricks. No CFrame tweens. Pure velocity.
+-- Server tolerance from log: ~40 studs / 100ms = 400 studs/s
+-- Safe cap: 350 studs/s
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -17,7 +19,7 @@ end
 local camera = workspace.CurrentCamera
 
 -- ==========================================
--- LOGGER SYSTEM
+-- LOGGER
 -- ==========================================
 
 local LOG_FILE_NAME = "gr33d_log.txt"
@@ -32,7 +34,6 @@ local function log(category, message)
     local t = string.format("%.3f", os.clock() - logStartTime)
     local line = string.format("[%s][%s] %s", t, category, message)
     table.insert(logBuffer, line)
-    -- Also print to console for live view
     print(line)
 end
 
@@ -42,7 +43,6 @@ end
 
 local function saveLogToFile()
     local text = getLogText()
-    -- Try to write to executor's workspace folder
     if writefile then
         pcall(function()
             writefile(LOG_FILE_NAME, text)
@@ -52,29 +52,7 @@ local function saveLogToFile()
     return text
 end
 
--- Logger UI button
-local function createLogSaveButton(parent, yPos)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.9, 0, 0, 30)
-    btn.Position = UDim2.new(0.05, 0, 0, yPos)
-    btn.BackgroundColor3 = Color3.fromRGB(200, 80, 80)
-    btn.Text = "SAVE LOG"
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
-    btn.Parent = parent
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = btn
-    btn.MouseButton1Click:Connect(function()
-        local text = saveLogToFile()
-        btn.Text = "SAVED (" .. #text .. " chars)"
-        task.delay(2, function() btn.Text = "SAVE LOG" end)
-    end)
-    return btn
-end
-
-log("BOOT", "=== GR33D V5.9 Starting ===")
+log("BOOT", "=== GR33D V6.0 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "JobId: " .. tostring(game.JobId))
 log("BOOT", "Player: " .. player.Name)
@@ -84,16 +62,17 @@ log("BOOT", "Executor: " .. tostring(identifyexecutor and identifyexecutor() or 
 -- CONFIG
 -- ==========================================
 
-local FLY_SPEED          = 50
-local MAX_RUN_SPEED      = 300
-local DEFAULT_RUN_SPEED  = 50
-local MAX_JUMP_POWER     = 200
-local DEFAULT_JUMP_POWER = 50
-local DOUBLE_TAP_WINDOW  = 0.35
+local FLY_SPEED               = 50
+local MAX_RUN_SPEED           = 300
+local DEFAULT_RUN_SPEED       = 50
+local MAX_JUMP_POWER          = 200
+local DEFAULT_JUMP_POWER      = 50
+local DOUBLE_TAP_WINDOW       = 0.35
 
-local ANCHOR_DURATION    = 0.02
-local MAX_SAFE_FALL      = 50
-local TP_MAX_HOP         = 400
+-- Physics-safe limits (from log analysis)
+local MAX_SERVER_SAFE_SPEED   = 350   -- server tolerance ~400
+local MAX_SAFE_JUMP_VELOCITY  = 140   -- server tolerance ~200
+local MAX_SAFE_FALL           = 50    -- fall damage threshold
 
 -- ==========================================
 -- STATE
@@ -121,12 +100,13 @@ local savedMapCFrame      = nil
 local character, rootPart, humanoid
 local attachment, linearVelocity
 
+-- Invisibility
 local originalTransparency      = {}
 local invisibilityHookInstalled = false
 local oldNewIndex               = nil
 
-local isAnchorBusy = false
-local isJumping    = false
+-- Operation locks
+local isTPBusy = false
 
 -- Rubberband detection
 local lastKnownPosition = Vector3.zero
@@ -161,11 +141,11 @@ local function installInvisibilityHook()
                 local char = player.Character
                 if char and t:IsDescendantOf(char) and invisibleEnabled then
                     if k == "Transparency" and v < 1 then
-                        log("INVIS", "Blocked server Transparency write: " .. tostring(v))
+                        log("INVIS", "Blocked server Transparency write")
                         return
                     end
                     if k == "LocalTransparencyModifier" and v < 1 then
-                        log("INVIS", "Blocked server LTM write: " .. tostring(v))
+                        log("INVIS", "Blocked server LTM write")
                         return
                     end
                 end
@@ -212,91 +192,85 @@ local function watchCharacterForInvisibility(char)
 end
 
 -- ==========================================
--- ANCHOR-TRICK TELEPORT
+-- TELEPORT (velocity launch — server-valid)
 -- ==========================================
 
-local function anchorTween(targetCFrame, duration)
+local function launchTeleport(targetCFrame)
     if not rootPart or not humanoid then return end
-    if isAnchorBusy then
-        log("TP", "anchorTween skipped - isAnchorBusy")
+    if not targetCFrame then return end
+    if isTPBusy then
+        log("TP", "Skipped: isTPBusy")
         return
     end
-    isAnchorBusy = true
+    isTPBusy = true
 
-    local beforePos = rootPart.Position
-    log("TP", string.format("anchorTween start: from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f) dur=%.3f",
-        beforePos.X, beforePos.Y, beforePos.Z,
-        targetCFrame.Position.X, targetCFrame.Position.Y, targetCFrame.Position.Z,
-        duration or 0.05))
-
-    if humanoid.Sit then humanoid.Sit = false end
-    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    rootPart.Anchored = true
-    log("TP", "Anchored=true")
-
-    local tween = TweenService:Create(
-        rootPart,
-        TweenInfo.new(duration or 0.05, Enum.EasingStyle.Linear),
-        { CFrame = targetCFrame }
-    )
-    tween:Play()
-    tween.Completed:Wait()
-
-    rootPart.CFrame = targetCFrame
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    rootPart.Anchored = false
-    humanoid:ChangeState(Enum.HumanoidStateType.Running)
-    log("TP", string.format("anchorTween complete: at (%.1f, %.1f, %.1f)",
-        rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
-
-    isAnchorBusy = false
-end
-
-local function doTeleport(targetCFrame)
-    if not character or not rootPart or not humanoid then return end
-    if not targetCFrame then return end
-
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
     local startPos  = rootPart.Position
+    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
     local distance  = (targetPos - startPos).Magnitude
 
-    log("TP", "doTeleport distance=" .. string.format("%.1f", distance))
+    log("TP", string.format("launchTeleport dist=%.1f from (%.1f, %.1f, %.1f) to (%.1f, %.1f, %.1f)",
+        distance,
+        startPos.X, startPos.Y, startPos.Z,
+        targetPos.X, targetPos.Y, targetPos.Z))
 
-    local tweenDuration = math.clamp(distance / 5000, 0.03, 0.15)
-    local finalCF = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
+    if distance < 5 then
+        log("TP", "Already at target")
+        isTPBusy = false
+        return
+    end
 
-    anchorTween(finalCF, tweenDuration)
+    -- Travel time based on server-safe speed
+    local travelTime = distance / MAX_SERVER_SAFE_SPEED
+
+    -- Gravity counter — prevents falling during flight
+    local attach = Instance.new("Attachment")
+    attach.Parent = rootPart
+    local counter = Instance.new("VectorForce")
+    counter.Attachment0 = attach
+    counter.RelativeTo = Enum.ActuatorRelativeTo.World
+    counter.ApplyAtCenterOfMass = true
+    counter.Force = Vector3.new(0, rootPart.AssemblyMass * workspace.Gravity, 0)
+    counter.Parent = rootPart
+
+    -- Initial launch
+    local dir = (targetPos - startPos).Unit
+    rootPart.AssemblyLinearVelocity = dir * MAX_SERVER_SAFE_SPEED
+
+    -- Steer toward target each frame
+    local startTime = os.clock()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not rootPart or not rootPart.Parent then
+            if conn then conn:Disconnect() end
+            if counter and counter.Parent then counter:Destroy() end
+            if attach and attach.Parent then attach:Destroy() end
+            isTPBusy = false
+            return
+        end
+
+        local distToTarget = (targetPos - rootPart.Position).Magnitude
+        local elapsed = os.clock() - startTime
+
+        if distToTarget < 15 or elapsed > travelTime + 1 then
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            if counter and counter.Parent then counter:Destroy() end
+            if attach and attach.Parent then attach:Destroy() end
+            if conn then conn:Disconnect() end
+            log("TP", string.format("Complete: at (%.1f, %.1f, %.1f) in %.3fs",
+                rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z, elapsed))
+            isTPBusy = false
+            return
+        end
+
+        -- Steer
+        local steeringDir = (targetPos - rootPart.Position).Unit
+        rootPart.AssemblyLinearVelocity = steeringDir * MAX_SERVER_SAFE_SPEED
+    end)
 end
 
 local function longDistanceTeleport(targetCFrame)
     if not rootPart or not targetCFrame then return end
-    local startPos  = rootPart.Position
-    local endPos    = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local totalDist = (endPos - startPos).Magnitude
-
-    log("TP", string.format("longDistanceTeleport totalDist=%.1f", totalDist))
-
-    if totalDist < TP_MAX_HOP then
-        doTeleport(targetCFrame)
-        return
-    end
-
-    local numHops = math.ceil(totalDist / TP_MAX_HOP)
-    log("TP", "Chaining " .. numHops .. " hops of " .. TP_MAX_HOP .. " studs")
-    for i = 1, numHops do
-        if not rootPart or not rootPart.Parent then break end
-        local alpha  = i / numHops
-        local hopPos = startPos:Lerp(endPos, alpha)
-        local hopCF  = CFrame.new(hopPos) * (targetCFrame - targetCFrame.Position)
-        log("TP", "Hop " .. i .. "/" .. numHops)
-        anchorTween(hopCF, 0.04)
-        RunService.Heartbeat:Wait()
-    end
+    launchTeleport(targetCFrame)
 end
 
 local function getEntrySpawn()
@@ -304,95 +278,59 @@ local function getEntrySpawn()
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
             entrySpawnCFrame = obj.CFrame
-            log("TP", "Found spawn location at " .. tostring(obj.Position))
+            log("TP", "Found spawn at " .. tostring(obj.Position))
             return entrySpawnCFrame
         end
     end
-    log("TP", "No SpawnLocation found, using current position")
+    log("TP", "No SpawnLocation — using current position")
     return rootPart and rootPart.CFrame or CFrame.new(0, 5, 0)
 end
 
 -- ==========================================
--- ANCHOR-TRICK SPEED
+-- SPEED (velocity only — no anchor, no CFrame)
 -- ==========================================
 
-local function anchorTrickStep(dt)
-    if not runSpeedEnabled or not rootPart or not humanoid or isFlying then return end
-    if isAnchorBusy or isJumping then return end
+local function speedStep()
+    if not runSpeedEnabled or not humanoid or not rootPart or isFlying then return end
 
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude < 0.01 then return end
 
-    local speed = math.min(runSpeedValue, MAX_RUN_SPEED)
-    local currentPos = rootPart.Position
-    local delta = Vector3.new(
-        moveDir.X * speed * dt,
-        0,
-        moveDir.Z * speed * dt
-    )
-    local targetPos = currentPos + delta
+    local speed = math.min(runSpeedValue, MAX_SERVER_SAFE_SPEED)
+    local currentVel = rootPart.AssemblyLinearVelocity
 
-    isAnchorBusy = true
-    rootPart.Anchored = true
-    rootPart.CFrame = CFrame.new(targetPos, targetPos + moveDir)
     rootPart.AssemblyLinearVelocity = Vector3.new(
         moveDir.X * speed,
-        rootPart.AssemblyLinearVelocity.Y,
+        currentVel.Y,
         moveDir.Z * speed
     )
-    rootPart.Anchored = false
-    isAnchorBusy = false
 end
 
 -- ==========================================
--- ANCHOR-TRICK JUMP
+-- JUMP (impulse velocity only)
 -- ==========================================
 
-local function anchorTrickJump()
+local function impulseJump()
     if not jumpEnabled or not rootPart or not humanoid then return end
-    if isAnchorBusy or isJumping then
-        log("JUMP", "Skipped: busy (isAnchorBusy=" .. tostring(isAnchorBusy) .. " isJumping=" .. tostring(isJumping) .. ")")
-        return
-    end
     if humanoid.FloorMaterial == Enum.Material.Air then
         log("JUMP", "Skipped: not on ground")
         return
     end
-
     if os.clock() - lastJumpFrame < 0.3 then
         log("JUMP", "Skipped: cooldown")
         return
     end
     lastJumpFrame = os.clock()
 
-    isJumping = true
-    local jumpHeight = math.min(jumpPowerValue, MAX_JUMP_POWER) * 0.05
-    local startPos = rootPart.Position
-    local apexPos = startPos + Vector3.new(0, jumpHeight, 0)
+    local safeVelocity = math.min(jumpPowerValue, MAX_SAFE_JUMP_VELOCITY)
 
-    log("JUMP", string.format("anchorTrickJump: height=%.1f from Y=%.1f to Y=%.1f",
-        jumpHeight, startPos.Y, apexPos.Y))
-
-    isAnchorBusy = true
-    rootPart.Anchored = true
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    local tween = TweenService:Create(
-        rootPart,
-        TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        { CFrame = CFrame.new(apexPos) * (rootPart.CFrame - rootPart.CFrame.Position) }
+    rootPart.AssemblyLinearVelocity = Vector3.new(
+        rootPart.AssemblyLinearVelocity.X,
+        safeVelocity,
+        rootPart.AssemblyLinearVelocity.Z
     )
-    tween:Play()
-    tween.Completed:Wait()
 
-    rootPart.CFrame = CFrame.new(apexPos) * (rootPart.CFrame - rootPart.CFrame.Position)
-    rootPart.Anchored = false
-    humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-    log("JUMP", "Jump complete, unanchored, state=Freefall")
-
-    isAnchorBusy = false
-    isJumping = false
+    log("JUMP", string.format("impulse velocity=%.1f", safeVelocity))
 end
 
 -- ==========================================
@@ -416,7 +354,7 @@ local function setFlying(state)
 end
 
 -- ==========================================
--- UI CREATION
+-- UI
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
@@ -599,24 +537,24 @@ end
 
 createToggleRow("Flight Mode", 5, function(state)
     flyToggleEnabled = state
-    log("UI", "Flight toggle: " .. tostring(state))
+    log("UI", "Flight: " .. tostring(state))
     if not state then setFlying(false) end
 end)
 
 createToggleRow("Invisibility (God Mode)", 40, function(state)
     godModeEnabled = state
-    log("UI", "Invisibility toggle: " .. tostring(state))
+    log("UI", "Invisibility: " .. tostring(state))
     applyInvisibility(state)
 end)
 
 createToggleRow("No Fall Damage", 75, function(state)
     noFallDamageEnabled = state
-    log("UI", "NoFallDamage toggle: " .. tostring(state))
+    log("UI", "NoFallDamage: " .. tostring(state))
 end)
 
 createToggleRow("Noclip Bypass", 110, function(state)
     noclipEnabled = state
-    log("UI", "Noclip toggle: " .. tostring(state))
+    log("UI", "Noclip: " .. tostring(state))
     if state then
         player.DevCameraOcclusionMode = Enum.DevCameraOcclusionMode.Invisicam
     else
@@ -626,26 +564,26 @@ end)
 
 createToggleRow("Super Run Speed", 145, function(state)
     runSpeedEnabled = state
-    log("UI", "Speed toggle: " .. tostring(state))
+    log("UI", "Speed: " .. tostring(state))
 end)
 
 createInputRow("Run Speed (max 300)", 180, DEFAULT_RUN_SPEED, function(value)
     if value > MAX_RUN_SPEED then value = MAX_RUN_SPEED end
     if value < 1 then value = 1 end
     runSpeedValue = value
-    log("UI", "RunSpeed value: " .. tostring(value))
+    log("UI", "RunSpeed: " .. tostring(value))
 end)
 
 createToggleRow("Custom Jump", 215, function(state)
     jumpEnabled = state
-    log("UI", "Jump toggle: " .. tostring(state))
+    log("UI", "Jump: " .. tostring(state))
 end)
 
 createInputRow("Jump Power (max 200)", 250, DEFAULT_JUMP_POWER, function(value)
     if value > MAX_JUMP_POWER then value = MAX_JUMP_POWER end
     if value < 1 then value = 1 end
     jumpPowerValue = value
-    log("UI", "JumpPower value: " .. tostring(value))
+    log("UI", "JumpPower: " .. tostring(value))
 end)
 
 createActionButton("TP to Spawn", 290, Color3.fromRGB(41, 128, 185), function()
@@ -656,7 +594,7 @@ end)
 local saveMapButton = createActionButton("Save Location", 327, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
-    log("UI", string.format("Saved location: (%.1f, %.1f, %.1f)",
+    log("UI", string.format("Saved: (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     saveMapButton.Text = "Saved!"
     task.delay(1.5, function() saveMapButton.Text = "Save Location" end)
@@ -667,14 +605,18 @@ local tpMapButton = createActionButton("TP to Saved", 364, Color3.fromRGB(39, 17
     if savedMapCFrame then
         longDistanceTeleport(savedMapCFrame)
     else
-        log("UI", "No saved location!")
+        log("UI", "No saved location")
         tpMapButton.Text = "No Location Saved"
         task.delay(1.5, function() tpMapButton.Text = "TP to Saved" end)
     end
 end)
 
 -- LOG SAVE BUTTON
-createLogSaveButton(toggleContainer, 401)
+local logButton = createActionButton("SAVE LOG", 401, Color3.fromRGB(200, 80, 80), function()
+    local text = saveLogToFile()
+    logButton.Text = "SAVED (" .. #text .. " chars)"
+    task.delay(2, function() logButton.Text = "SAVE LOG" end)
+end)
 
 minimizeButton.MouseButton1Click:Connect(function()
     isMinimized = not isMinimized
@@ -725,7 +667,7 @@ UserInputService.JumpRequest:Connect(function()
     if (currentTime - lastJumpReqTime) > 0.1 then
         handleJumpTap()
         if jumpEnabled and not flyToggleEnabled then
-            anchorTrickJump()
+            impulseJump()
         end
     end
     lastJumpReqTime = currentTime
@@ -748,11 +690,10 @@ local function detectRubberband()
     end
 
     local delta = (currentPos - lastKnownPosition).Magnitude
-    -- If position jumped backward by a large amount, it's a rubberband
     local timeDelta = now - lastPositionCheck
-    local expectedMax = 350 * timeDelta  -- 350 studs/s max reasonable
+    local expectedMax = MAX_SERVER_SAFE_SPEED * timeDelta + 50
 
-    if delta > expectedMax + 50 then
+    if delta > expectedMax then
         rubberbandEvents = rubberbandEvents + 1
         log("RUBBERBAND", string.format("Detected! Moved %.1f studs in %.3fs (max expected %.1f) at (%.1f, %.1f, %.1f)",
             delta, timeDelta, expectedMax,
@@ -770,11 +711,6 @@ end
 RunService.Stepped:Connect(function()
     if not character or not rootPart then return end
 
-    if rootPart.Anchored and not isAnchorBusy then
-        log("STATE", "Server/engine anchored us unexpectedly - unanchoring")
-        rootPart.Anchored = false
-    end
-
     if noclipEnabled then
         for _, part in ipairs(character:GetDescendants()) do
             if part:IsA("BasePart") then
@@ -786,7 +722,7 @@ RunService.Stepped:Connect(function()
     end
 
     if rootPart.Position.Y < -50 then
-        log("STATE", "Fell through world - teleporting to spawn")
+        log("STATE", "Fell through world")
         longDistanceTeleport(getEntrySpawn())
     end
 end)
@@ -797,10 +733,10 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    if runSpeedEnabled and not isFlying then
-        anchorTrickStep(dt)
-    end
+    -- SPEED
+    speedStep()
 
+    -- FLIGHT
     if isFlying and linearVelocity and humanoid and rootPart then
         if humanoid.FloorMaterial ~= Enum.Material.Air then
             setFlying(false)
@@ -816,9 +752,10 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
+    -- SAFE FALL
     if humanoid and rootPart then
         local state = humanoid:GetState()
-        if (noFallDamageEnabled or isJumping) and
+        if (noFallDamageEnabled) and
             (state == Enum.HumanoidStateType.Freefall
             or state == Enum.HumanoidStateType.FallingDown) then
             local currentVel = rootPart.AssemblyLinearVelocity
@@ -832,7 +769,6 @@ RunService.RenderStepped:Connect(function(dt)
         end
     end
 
-    -- Rubberband check
     detectRubberband()
 end)
 
@@ -882,12 +818,11 @@ player.CharacterAdded:Connect(function(newChar)
     log("CHAR", "Respawn detected")
     flyToggleEnabled = false
     isFlying = false
-    isAnchorBusy = false
-    isJumping = false
+    isTPBusy = false
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(newChar)
 end)
 
-log("BOOT", "=== GR33D V5.9 Ready ===")
+log("BOOT", "=== GR33D V6.0 Ready ===")
 print("Loaded. Use SAVE LOG button to export log.")
