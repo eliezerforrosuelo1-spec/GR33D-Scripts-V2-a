@@ -1,8 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V8.2
--- UI: right side, mobile-safe
--- Speed: WalkSpeed 231.4 + egg carry detection
--- TP: 3 writes in one frame + no-fall-damage after
+-- GR33D SCRIPTS V8.6
+-- TP: single instant jump (no warmup)
+-- Speed: continuous tween cycle (matches cheat)
+-- UI: right side
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V8.2 Starting ===")
+log("BOOT", "=== GR33D V8.6 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -54,14 +54,12 @@ log("BOOT", "Player: " .. player.Name)
 local DEFAULT_SPEED          = 15
 local MAX_SPEED              = 15
 local WALKSPEED_BOOST        = 231.4
-local SPEED_STEP             = 0.35
-local TP_WARMUP_1            = 30
-local TP_WARMUP_2            = 15
+local SPEED_TWEEN_DURATION   = 0.4      -- seconds per tween cycle
+local SPEED_TWEEN_DISTANCE   = 250      -- studs per cycle
 local MAX_JUMP_IMPULSE       = 107
 local DEFAULT_JUMP           = 100
 local MAX_SAFE_FALL          = 50
 local DOUBLE_TAP_WINDOW      = 0.35
-local CARRY_SPEED_REDUCTION  = 0.4     -- reduce to 40% speed when carrying egg
 
 -- Prompt Extender
 local PROMPT_MAX_DISTANCE    = 50
@@ -81,7 +79,6 @@ local runSpeedEnabled     = false
 local jumpEnabled         = false
 local promptExtenderEnabled = false
 local isMinimized         = false
-local isCarryingEgg       = false
 
 local runSpeedValue       = DEFAULT_SPEED
 local jumpPowerValue      = DEFAULT_JUMP
@@ -102,6 +99,9 @@ local oldNewIndex               = nil
 
 local isTPBusy = false
 local trackedPrompts = {}
+
+local activeSpeedTween = nil
+local speedTweenRunning = false
 
 -- ==========================================
 -- INVISIBILITY
@@ -221,7 +221,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TELEPORT (3 CFrame writes in one frame + no-fall-damage)
+-- TELEPORT (single instant jump — no warmup)
 -- ==========================================
 
 local function doTeleport(targetCFrame)
@@ -230,8 +230,7 @@ local function doTeleport(targetCFrame)
     isTPBusy = true
 
     local targetPos = targetCFrame.Position + Vector3.new(0, 2.5, 0)
-    local startPos = rootPart.Position
-    local distance = (targetPos - startPos).Magnitude
+    local distance = (targetPos - rootPart.Position).Magnitude
 
     log("TP", string.format("doTeleport dist=%.1f", distance))
 
@@ -240,38 +239,28 @@ local function doTeleport(targetCFrame)
         return
     end
 
-    -- Save current no-fall state, enable for safe landing
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- Zero velocity first
+    -- Zero velocity
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    -- All 3 CFrame writes in ONE frame
-    local dir1 = (targetPos - startPos).Unit
-    local warmup1Pos = startPos + dir1 * math.min(TP_WARMUP_1, distance * 0.3)
-    rootPart.CFrame = CFrame.new(warmup1Pos)
-
-    local dir2 = (targetPos - warmup1Pos).Unit
-    local warmup2Pos = warmup1Pos + dir2 * math.min(TP_WARMUP_2, (targetPos - warmup1Pos).Magnitude * 0.3)
-    rootPart.CFrame = CFrame.new(warmup2Pos)
-
+    -- Single instant CFrame write
     rootPart.CFrame = CFrame.new(targetPos)
 
-    -- Zero velocity after
+    -- Zero velocity again
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
 
-    -- Restore no-fall state after 1s
+    -- Restore no-fall after 1s
     task.delay(1, function()
         noFallDamageEnabled = wasNoFall
     end)
 
-    task.wait(0.1)
     isTPBusy = false
 end
 
@@ -286,78 +275,68 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- EGG CARRY DETECTION (reduces speed during steal)
+-- SPEED (tween cycle — matches cheat)
 -- ==========================================
 
-player:GetAttributeChangedSignal("Carrying"):Connect(function()
-    local val = player:GetAttribute("Carrying")
-    isCarryingEgg = (val ~= nil and val ~= false)
-    log("CARRY", "Attribute Carrying: " .. tostring(val))
-end)
-
--- Watch for egg items in character (when carrying)
-local function watchForCarryItems(char)
-    char.ChildAdded:Connect(function(child)
-        local n = child.Name:lower()
-        if n:find("egg") or n:find("carry") or n:find("steal") or n:find("hold") then
-            isCarryingEgg = true
-            log("CARRY", "Detected: " .. child.Name)
-            -- Reset when removed
-            child.AncestryChanged:Connect(function()
-                if not child:IsDescendantOf(char) then
-                    isCarryingEgg = false
-                    log("CARRY", "Released")
-                end
-            end)
-        end
-    end)
+local function stopSpeedTween()
+    if activeSpeedTween then
+        pcall(function() activeSpeedTween:Cancel() end)
+        activeSpeedTween = nil
+    end
+    speedTweenRunning = false
 end
 
--- Watch UI for carry indicators
-protectedParent.DescendantAdded:Connect(function(obj)
-    if obj:IsA("TextLabel") then
-        local t = (obj.Text or ""):lower()
-        if t:find("carrying") or t:find("holding") or t:find("steal") then
-            isCarryingEgg = true
-            log("CARRY", "UI: " .. obj.Text)
-        end
-    end
-end)
-
--- ==========================================
--- SPEED (WalkSpeed 231.4 + carry detection)
--- ==========================================
-
-RunService.RenderStepped:Connect(function(dt)
-    if not runSpeedEnabled or not rootPart or not humanoid then return end
-
-    if humanoid.WalkSpeed ~= WALKSPEED_BOOST then
-        humanoid.WalkSpeed = WALKSPEED_BOOST
-    end
-
+local function doSpeedCycle()
+    if not runSpeedEnabled or speedTweenRunning then return end
+    if not rootPart or not humanoid then return end
     if isFlying or isTPBusy then return end
 
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude < 0.01 then return end
 
-    local speedMult = runSpeedValue / 100
-    -- Reduce speed when carrying egg to prevent rubberband
-    if isCarryingEgg then
-        speedMult = speedMult * CARRY_SPEED_REDUCTION
+    speedTweenRunning = true
+
+    local startPos = rootPart.Position
+    local distance = SPEED_TWEEN_DISTANCE * (runSpeedValue / 100)
+    local targetPos = startPos + moveDir.Unit * distance
+
+    local tweenInfo = TweenInfo.new(
+        SPEED_TWEEN_DURATION,
+        Enum.EasingStyle.Quad,
+        Enum.EasingDirection.Out
+    )
+
+    activeSpeedTween = TweenService:Create(rootPart, tweenInfo, {
+        CFrame = CFrame.new(targetPos, targetPos + moveDir.Unit)
+    })
+    activeSpeedTween:Play()
+
+    activeSpeedTween.Completed:Connect(function()
+        speedTweenRunning = false
+        activeSpeedTween = nil
+    end)
+end
+
+RunService.Heartbeat:Connect(function()
+    if not runSpeedEnabled or not rootPart or not humanoid then return end
+    if isFlying or isTPBusy then return end
+
+    -- Set WalkSpeed boost (server accepts per log)
+    if humanoid.WalkSpeed ~= WALKSPEED_BOOST then
+        humanoid.WalkSpeed = WALKSPEED_BOOST
     end
 
-    local step = moveDir.Unit * (SPEED_STEP * speedMult * (dt * 60))
-
-    local newPos = rootPart.Position + step
-    rootPart.CFrame = CFrame.new(newPos, newPos + moveDir.Unit)
+    -- Start new speed cycle
+    if not speedTweenRunning then
+        doSpeedCycle()
+    end
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("WalkSpeed=%.1f + step=%.2f%s | pos=(%.1f, %.1f, %.1f)",
-            humanoid.WalkSpeed, step.Magnitude,
-            isCarryingEgg and " [CARRY]" or "",
-            newPos.X, newPos.Y, newPos.Z))
+        log("SPEED", string.format("WalkSpeed=%.1f tween=%s | pos=(%.1f, %.1f, %.1f)",
+            humanoid.WalkSpeed, tostring(speedTweenRunning),
+            rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     end
 end)
 
@@ -437,7 +416,7 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (RIGHT SIDE, MOBILE-SAFE)
+-- UI (right side)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
@@ -625,10 +604,6 @@ local function createButton(name, y, color, cb)
     return b
 end
 
--- ==========================================
--- UI BINDING
--- ==========================================
-
 createToggle("Flight Mode", 5, function(s)
     flyToggleEnabled = s
     log("UI", "Flight: " .. tostring(s))
@@ -637,7 +612,6 @@ end)
 
 createToggle("Invisibility", 35, function(s) applyInvisibility(s) end)
 createToggle("No Fall Damage", 65, function(s) noFallDamageEnabled = s end)
-
 createToggle("Noclip", 95, function(s)
     noclipEnabled = s
     log("UI", "Noclip: " .. tostring(s))
@@ -646,7 +620,10 @@ end)
 createToggle("Super Speed", 125, function(s)
     runSpeedEnabled = s
     log("UI", "Speed: " .. tostring(s))
-    if not s and humanoid then humanoid.WalkSpeed = 16 end
+    if not s then
+        stopSpeedTween()
+        if humanoid then humanoid.WalkSpeed = 16 end
+    end
 end)
 
 createInput("Speed (max 15)", 155, DEFAULT_SPEED, function(v)
@@ -759,7 +736,6 @@ local function setupCharacter(char)
     linearVelocity.VectorVelocity = Vector3.zero
 
     watchCharacterForInvisibility(char)
-    watchForCarryItems(char)
     if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
 
@@ -789,10 +765,11 @@ player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
     isTPBusy = false
-    isCarryingEgg = false
+    if activeSpeedTween then pcall(function() activeSpeedTween:Cancel() end) activeSpeedTween = nil end
+    speedTweenRunning = false
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V8.2 loaded. UI right side. Speed + carry detection.")
+print("V8.6 loaded. Instant TP. Tween speed.")
