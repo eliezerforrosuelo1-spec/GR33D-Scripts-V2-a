@@ -1,15 +1,16 @@
 -- ==========================================
--- GR33D SCRIPTS V10.0 (UPDATED - SPEED, JUMP & TP)
+-- GR33D SCRIPTS V10.0 (UPDATED - INSTANT/BALANCED TP & ANTI-RUBBERBAND)
 -- Speed: Delta-time CFrame movement (No rubberbanding)
 -- Jump: State-forced Impulse (High Jump support)
 -- Fly: Camera-relative via PlayerModule controls
--- TP: Ground Raycast + Faster Step-TP (Distance: 25, Wait: 0.015)
+-- TP: Instant Anchored Sync / Controlled Speed Tween + Anti-Rubberband
 -- UI: Right side
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -69,6 +70,10 @@ local PROMPT_MAX_DISTANCE  = 50
 local PROMPT_HOLD_DURATION = 0
 local PROMPT_REQUIRES_LOS  = false
 
+-- Teleport Settings
+local TP_BALANCED_SPEED    = 150     -- Studs/sec for Risky Games
+local TP_BYPASS_ANCHOR     = 0.15    -- Seconds to anchor during instant TP to force server ACK
+
 -- ==========================================
 -- STATE
 -- ==========================================
@@ -81,6 +86,7 @@ local noclipEnabled         = false
 local runSpeedEnabled       = false
 local jumpEnabled           = false
 local promptExtenderEnabled = false
+local tpRiskyModeEnabled    = false   -- false = Instant TP Mode | true = Balanced Mode
 local isMinimized           = false
 
 local runSpeedValue         = DEFAULT_SPEED
@@ -116,6 +122,14 @@ pcall(function()
         end
     end
 end)
+
+-- Helper function to wipe momentum and prevent physics rubberbanding
+local function clearVelocity(part)
+    if part and part.Parent then
+        part.AssemblyLinearVelocity = Vector3.zero
+        part.AssemblyAngularVelocity = Vector3.zero
+    end
+end
 
 -- ==========================================
 -- INVISIBILITY
@@ -319,7 +333,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- ADVANCED TELEPORT SYSTEM
+-- ADVANCED TELEPORT SYSTEM (ANTI-RUBBERBAND)
 -- ==========================================
 
 local function getSafeGroundPosition(targetCFrame)
@@ -334,10 +348,10 @@ local function getSafeGroundPosition(targetCFrame)
     if rayResult then
         return CFrame.new(rayResult.Position + Vector3.new(0, 3.5, 0)) * targetCFrame.Rotation
     end
-    return targetCFrame + Vector3.new(0, 3, 0)
+    return targetCFrame + Vector3.new(0, 3.5, 0)
 end
 
-local function absoluteTeleport(targetCFrame, useInterpolation)
+local function absoluteTeleport(targetCFrame)
     if not character or not rootPart or not humanoid then return end
     if isTPBusy then return end
     isTPBusy = true
@@ -346,49 +360,78 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
     local startCFrame = rootPart.CFrame
     local distance = (safeCFrame.Position - startCFrame.Position).Magnitude
 
-    log("TP", string.format("Starting TP | Distance: %.1f studs | Step-TP: %s", distance, tostring(useInterpolation)))
+    log("TP", string.format("Starting TP | Distance: %.1f studs | RiskyMode: %s", distance, tostring(tpRiskyModeEnabled)))
 
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
     humanoid.Sit = false
-    rootPart.Anchored = true
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
+    clearVelocity(rootPart)
 
-    if not useInterpolation or distance < 20 then
+    if not tpRiskyModeEnabled then
+        ---------------------------------------------------
+        -- 1. INSTANT MODE (Non-Risky Games / Strict Sync)
+        ---------------------------------------------------
+        rootPart.Anchored = true
         character:PivotTo(safeCFrame)
-        task.wait(0.1)
-    else
-        local stepDistance = 25
-        local steps = math.max(math.floor(distance / stepDistance), 6)
         
-        for i = 1, steps do
-            if not rootPart or not rootPart.Parent then break end
-            local alpha = i / steps
-            local nextCFrame = startCFrame:Lerp(safeCFrame, alpha)
-            character:PivotTo(nextCFrame)
-            task.wait(0.015)
-        end
-    end
-
-    character:PivotTo(safeCFrame)
-    task.wait(0.3)
-
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    rootPart.Anchored = false
-
-    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-
-    task.spawn(function()
-        for _ = 1, 8 do
-            if rootPart and rootPart.Parent then
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                rootPart.AssemblyAngularVelocity = Vector3.zero
+        -- Brief anchor holds coordinates while server updates position table
+        task.wait(TP_BYPASS_ANCHOR)
+        clearVelocity(rootPart)
+        rootPart.Anchored = false
+        
+        -- Post-teleport physics lock loop to catch server rubberband requests
+        task.spawn(function()
+            for _ = 1, 10 do
+                if rootPart and rootPart.Parent then
+                    clearVelocity(rootPart)
+                end
+                task.wait(0.03)
             end
-            task.wait(0.05)
+            if humanoid and humanoid.Parent then
+                humanoid:ChangeState(Enum.HumanoidStateType.Running)
+            end
+            log("TP", string.format("Arrived and synchronized at (%.1f, %.1f, %.1f)",
+                rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
+            
+            task.delay(0.2, function()
+                noFallDamageEnabled = wasNoFall
+            end)
+            isTPBusy = false
+        end)
+    else
+        ---------------------------------------------------
+        -- 2. BALANCED MODE (Risky Games / Anti-Cheat Bypass)
+        ---------------------------------------------------
+        if distance < 5 then
+            character:PivotTo(safeCFrame)
+            isTPBusy = false
+            return
         end
+
+        local travelTime = math.max(0.1, distance / TP_BALANCED_SPEED)
+        local tweenInfo = TweenInfo.new(
+            travelTime,
+            Enum.EasingStyle.Linear,
+            Enum.EasingDirection.Out
+        )
+
+        local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = safeCFrame})
+
+        -- Continuously kill physics forces throughout tween duration
+        local hbConnection
+        hbConnection = RunService.Heartbeat:Connect(function()
+            clearVelocity(rootPart)
+        end)
+
+        tween:Play()
+        tween.Completed:Wait()
+        hbConnection:Disconnect()
+
+        -- Final position lock
+        character:PivotTo(safeCFrame)
+        task.wait(0.05)
+        clearVelocity(rootPart)
 
         if humanoid and humanoid.Parent then
             humanoid:ChangeState(Enum.HumanoidStateType.Running)
@@ -397,12 +440,11 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
         log("TP", string.format("Arrived and synchronized at (%.1f, %.1f, %.1f)",
             rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
 
-        task.delay(0.5, function()
+        task.delay(0.2, function()
             noFallDamageEnabled = wasNoFall
+            isTPBusy = false
         end)
-
-        isTPBusy = false
-    end)
+    end
 end
 
 -- ==========================================
@@ -548,7 +590,7 @@ container.Size = UDim2.new(1, 0, 1, -40)
 container.Position = UDim2.new(0, 0, 0, 40)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 720)
+container.CanvasSize = UDim2.new(0, 0, 0, 520)
 container.ScrollBarThickness = 3
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
 
@@ -694,12 +736,24 @@ createToggle("Prompt Extender", 275, function(s)
     if s then enablePromptExtenderAll() else disablePromptExtenderAll() end
 end)
 
-createButton("TP to Spawn", 305, Color3.fromRGB(41, 128, 185), function()
-    log("UI", "TP to Spawn Executed")
-    absoluteTeleport(getEntrySpawn(), true)
+createToggle("Risky TP Mode (Balanced)", 305, function(s)
+    tpRiskyModeEnabled = s
+    log("UI", "Risky TP Mode changed to: " .. tostring(s))
 end)
 
-local saveBtn = createButton("Save Location", 335, Color3.fromRGB(142, 68, 173), function()
+createInput("TP Speed (Balanced)", 335, TP_BALANCED_SPEED, function(v, box)
+    if v < 10 then v = 10 end
+    if v > 1000 then v = 1000 end
+    TP_BALANCED_SPEED = v
+    if box then box.Text = tostring(v) end
+end)
+
+createButton("TP to Spawn", 365, Color3.fromRGB(41, 128, 185), function()
+    log("UI", "TP to Spawn Executed")
+    absoluteTeleport(getEntrySpawn())
+end)
+
+local saveBtn = createButton("Save Location", 395, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", string.format("Saved Location: (%.1f, %.1f, %.1f)", 
@@ -708,16 +762,16 @@ local saveBtn = createButton("Save Location", 335, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 365, Color3.fromRGB(39, 174, 96), function()
+createButton("TP to Saved", 425, Color3.fromRGB(39, 174, 96), function()
     if savedMapCFrame then
         log("UI", "TP to Saved Executed")
-        absoluteTeleport(savedMapCFrame, true)
+        absoluteTeleport(savedMapCFrame)
     else
         log("UI", "TP to Saved Failed: No location saved")
     end
 end)
 
-createButton("SAVE LOG", 395, Color3.fromRGB(200, 80, 80), function()
+createButton("SAVE LOG", 455, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
