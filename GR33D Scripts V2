@@ -1,14 +1,14 @@
 -- ==========================================
--- GR33D SCRIPTS V8.7
--- TP: single instant jump + noclip-safe
--- Speed: velocity injection (matches cheat)
+-- GR33D SCRIPTS V8.9
+-- Speed: fixed-step accel 850, cap 140, linear decel
+-- TP: exact CFrame write, no offset, no CanCollide toggle
+-- Spawn: RespawnLocation -> nearest SpawnLocation -> fallback
 -- UI: right side
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
 local RunService       = game:GetService("RunService")
 local Players          = game:GetService("Players")
-local TweenService     = game:GetService("TweenService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V8.7 Starting ===")
+log("BOOT", "=== GR33D V8.9 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -51,48 +51,49 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
-local DEFAULT_SPEED          = 15
-local MAX_SPEED              = 15
+-- Speed — matches cheat log (change=30.7 per frame @ 36ms)
+local MAX_SPEED_INPUT   = 100         -- slider max
+local SPEED_MAX_BASE    = 140         -- input 100 -> 140 studs/s (peak mag=139.8)
+local DEFAULT_SPEED     = 100
 
--- Speed (velocity injection — matches cheat)
-local SPEED_ACCEL            = 220      -- studs/s^2 ramp-up
-local SPEED_MAX              = 240      -- hard cap (studs/s)
-local SPEED_DECAY            = 0.86     -- per-frame multiplier when no input
+local SPEED_ACCEL       = 850         -- studs/s^2 ramp-up
+local SPEED_DECEL       = 850         -- studs/s^2 ramp-down (linear)
+local SPEED_MAX         = 140         -- current cap (updated by slider)
 
 -- Jump
-local MAX_JUMP_IMPULSE       = 107
-local DEFAULT_JUMP           = 100
-local MAX_SAFE_FALL          = 50
-local DOUBLE_TAP_WINDOW      = 0.35
+local MAX_JUMP_IMPULSE  = 107
+local DEFAULT_JUMP      = 100
+local MAX_SAFE_FALL     = 50
+local DOUBLE_TAP_WINDOW = 0.35
 
 -- Prompt Extender
-local PROMPT_MAX_DISTANCE    = 50
-local PROMPT_HOLD_DURATION   = 0
-local PROMPT_REQUIRES_LOS    = false
+local PROMPT_MAX_DISTANCE  = 50
+local PROMPT_HOLD_DURATION = 0
+local PROMPT_REQUIRES_LOS  = false
 
 -- ==========================================
 -- STATE
 -- ==========================================
 
-local flyToggleEnabled       = false
-local isFlying               = false
-local invisibleEnabled       = false
-local noFallDamageEnabled    = false
-local noclipEnabled          = false
-local runSpeedEnabled        = false
-local jumpEnabled            = false
-local promptExtenderEnabled  = false
-local isMinimized            = false
+local flyToggleEnabled      = false
+local isFlying              = false
+local invisibleEnabled      = false
+local noFallDamageEnabled   = false
+local noclipEnabled         = false
+local runSpeedEnabled       = false
+local jumpEnabled           = false
+local promptExtenderEnabled = false
+local isMinimized           = false
 
-local runSpeedValue          = DEFAULT_SPEED
-local jumpPowerValue         = DEFAULT_JUMP
+local runSpeedValue         = DEFAULT_SPEED
+local jumpPowerValue        = DEFAULT_JUMP
 
-local lastJumpTapTime        = 0
-local lastJumpReqTime        = 0
-local lastSpeedLogTime       = 0
-local realSpawnCFrame        = nil
-local firstSpawnCaptured     = false
-local savedMapCFrame         = nil
+local lastJumpTapTime       = 0
+local lastJumpReqTime       = 0
+local lastSpeedLogTime      = 0
+local realSpawnCFrame       = nil
+local firstSpawnCaptured    = false
+local savedMapCFrame        = nil
 
 local character, rootPart, humanoid
 local attachment, linearVelocity
@@ -103,11 +104,18 @@ local invisibilityHookInstalled = false
 local invisConnection           = nil
 local oldNewIndex               = nil
 
-local isTPBusy               = false
-local trackedPrompts         = {}
+local isTPBusy              = false
+local trackedPrompts        = {}
 
--- Speed vector (velocity injection)
-local speedVec               = Vector3.zero
+local speedVec              = Vector3.zero
+
+local validStates = {
+    [Enum.HumanoidStateType.Running]          = true,
+    [Enum.HumanoidStateType.RunningNoPhysics] = true,
+    [Enum.HumanoidStateType.Jumping]          = true,
+    [Enum.HumanoidStateType.Freefall]         = true,
+    [Enum.HumanoidStateType.Landed]           = true,
+}
 
 -- ==========================================
 -- INVISIBILITY
@@ -175,13 +183,11 @@ end
 local function applyPromptExtender(prompt)
     if not prompt or not prompt:IsA("ProximityPrompt") then return end
     if trackedPrompts[prompt] then return end
-
     trackedPrompts[prompt] = {
         MaxActivationDistance = prompt.MaxActivationDistance,
         HoldDuration          = prompt.HoldDuration,
         RequiresLineOfSight   = prompt.RequiresLineOfSight,
     }
-
     pcall(function()
         prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
         prompt.HoldDuration          = PROMPT_HOLD_DURATION
@@ -228,13 +234,12 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- NOCLIP (with proper restore)
+-- NOCLIP
 -- ==========================================
 
 local function applyNoclip(state)
     noclipEnabled = state
     if not character then return end
-
     if state then
         for _, part in ipairs(character:GetDescendants()) do
             if part:IsA("BasePart") then
@@ -267,16 +272,15 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- SPEED (velocity injection — matches cheat)
+-- SPEED (fixed-step accel — matches cheat log)
+-- change=30.7 per frame @ 36ms -> 850 studs/s^2
 -- ==========================================
 
 local function resetSpeedVector()
     speedVec = Vector3.zero
     if rootPart then
         rootPart.AssemblyLinearVelocity = Vector3.new(
-            0,
-            rootPart.AssemblyLinearVelocity.Y,
-            0
+            0, rootPart.AssemblyLinearVelocity.Y, 0
         )
     end
 end
@@ -284,10 +288,24 @@ end
 RunService.Heartbeat:Connect(function(dt)
     if not rootPart or not humanoid then return end
 
-    -- Always decay when not actively speeding
+    if not validStates[humanoid:GetState()] then
+        speedVec = Vector3.zero
+        return
+    end
+    if humanoid.Sit then
+        speedVec = Vector3.zero
+        return
+    end
+
     if not runSpeedEnabled or isFlying or isTPBusy then
+        -- Linear deceleration when disabled
         if speedVec.Magnitude > 0.1 then
-            speedVec = speedVec * SPEED_DECAY
+            local step = SPEED_DECEL * dt
+            if speedVec.Magnitude <= step then
+                speedVec = Vector3.zero
+            else
+                speedVec = speedVec - speedVec.Unit * step
+            end
             rootPart.AssemblyLinearVelocity = Vector3.new(
                 speedVec.X,
                 rootPart.AssemblyLinearVelocity.Y,
@@ -299,30 +317,39 @@ RunService.Heartbeat:Connect(function(dt)
 
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude > 0.01 then
-        -- Accelerate toward the move direction
-        speedVec = speedVec + moveDir.Unit * SPEED_ACCEL * dt
-        if speedVec.Magnitude > SPEED_MAX then
-            speedVec = speedVec.Unit * SPEED_MAX
+        -- Accelerate toward moveDir at SPEED_ACCEL
+        local desired = moveDir.Unit * SPEED_MAX
+        local delta   = desired - speedVec
+        local step    = SPEED_ACCEL * dt
+
+        if delta.Magnitude <= step then
+            speedVec = desired
+        else
+            speedVec = speedVec + delta.Unit * step
         end
     else
-        -- Decay when no input
-        speedVec = speedVec * SPEED_DECAY
-        if speedVec.Magnitude < 0.5 then speedVec = Vector3.zero end
+        -- Linear deceleration when no input
+        local step = SPEED_DECEL * dt
+        if speedVec.Magnitude <= step then
+            speedVec = Vector3.zero
+        else
+            speedVec = speedVec - speedVec.Unit * step
+        end
     end
 
-    -- Apply horizontal velocity, preserve Y (gravity / jump)
-    rootPart.AssemblyLinearVelocity = Vector3.new(
-        speedVec.X,
+    local yVel = math.clamp(
         rootPart.AssemblyLinearVelocity.Y,
-        speedVec.Z
+        -MAX_SAFE_FALL,
+        MAX_SAFE_FALL
     )
 
-    -- Don't let the game's default WalkSpeed fight us
+    rootPart.AssemblyLinearVelocity = Vector3.new(speedVec.X, yVel, speedVec.Z)
+
+    -- Don't let default WalkSpeed fight us
     if humanoid.WalkSpeed ~= 16 then
         humanoid.WalkSpeed = 16
     end
 
-    -- Periodic log
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
@@ -351,7 +378,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- TELEPORT (instant, noclip-safe — matches cheat)
+-- TELEPORT (exact CFrame write — matches cheat)
 -- ==========================================
 
 local function doTeleport(targetCFrame)
@@ -359,7 +386,7 @@ local function doTeleport(targetCFrame)
     if isTPBusy then return end
     isTPBusy = true
 
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3.0, 0)
+    local targetPos = targetCFrame.Position
     local distance  = (targetPos - rootPart.Position).Magnitude
 
     log("TP", string.format("doTeleport dist=%.1f", distance))
@@ -369,50 +396,69 @@ local function doTeleport(targetCFrame)
         return
     end
 
-    -- Save state
-    local wasNoFall  = noFallDamageEnabled
-    local wasCollide = rootPart.CanCollide
+    -- Preserve fall-damage guard for 1s so we don't die on landing
+    local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- 1. Disable collision so we don't get stuck in geometry
-    rootPart.CanCollide = false
-
-    -- 2. Zero velocity BEFORE
+    -- Zero velocity BEFORE
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    -- 3. Single instant CFrame write (preserve target rotation)
-    rootPart.CFrame = CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position)
+    -- Exact CFrame write — no +Y offset, no CanCollide toggle
+    rootPart.CFrame = targetCFrame
 
-    -- 4. Zero velocity AFTER (write may have imparted some)
+    -- Zero velocity AFTER
     rootPart.AssemblyLinearVelocity  = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    -- 5. Cancel any in-flight speed vector
+    -- Clear speed vector so the ramp starts fresh
     speedVec = Vector3.zero
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
 
-    -- 6. Restore collision + nofall after landing
     task.delay(1.0, function()
-        if rootPart and rootPart.Parent then
-            rootPart.CanCollide = wasCollide
-        end
         noFallDamageEnabled = wasNoFall
     end)
 
     isTPBusy = false
 end
 
+-- ==========================================
+-- SPAWN LOOKUP (RespawnLocation -> nearest -> fallback)
+-- ==========================================
+
 local function getEntrySpawn()
-    if realSpawnCFrame then return realSpawnCFrame end
+    -- 1. If the game set a RespawnLocation on the player, use it
+    if player.RespawnLocation then
+        return player.RespawnLocation.CFrame
+    end
+
+    -- 2. Collect all enabled SpawnLocations
+    local spawns = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
-            return obj.CFrame
+            table.insert(spawns, obj)
         end
     end
-    return rootPart and rootPart.CFrame or CFrame.new(0, 5, 0)
+
+    if #spawns == 0 then
+        return realSpawnCFrame or (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
+    end
+
+    -- 3. Pick the nearest one to the player's current position
+    if rootPart then
+        local nearest, bestDist = spawns[1], math.huge
+        for _, sp in ipairs(spawns) do
+            local d = (sp.Position - rootPart.Position).Magnitude
+            if d < bestDist then
+                nearest, bestDist = sp, d
+            end
+        end
+        return nearest.CFrame
+    end
+
+    return spawns[1].CFrame
 end
 
 -- ==========================================
@@ -458,7 +504,7 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (right side)
+-- UI
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
@@ -673,14 +719,14 @@ createToggle("Super Speed", 125, function(s)
     end
 end)
 
-createInput("Speed (max 15)", 155, DEFAULT_SPEED, function(v, box)
-    if v > MAX_SPEED then v = MAX_SPEED end
+createInput("Speed (max 100)", 155, DEFAULT_SPEED, function(v, box)
+    if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
     if v < 1 then v = 1 end
     runSpeedValue = v
-    -- Map 1..15 -> 16..240 studs/s
-    SPEED_MAX = 16 + (v - 1) * ((240 - 16) / 14)
+    -- Map 1..100 to 1.4..140 studs/s
+    SPEED_MAX = (v / MAX_SPEED_INPUT) * SPEED_MAX_BASE
     if box then box.Text = tostring(v) end
-    log("UI", "Speed value: " .. tostring(v) .. " -> max " .. string.format("%.0f", SPEED_MAX))
+    log("UI", string.format("Speed input=%d -> max=%.1f studs/s", v, SPEED_MAX))
 end)
 
 createToggle("Custom Jump", 185, function(s)
@@ -771,11 +817,9 @@ local function setupCharacter(char)
 
     log("CHAR", "Setup: " .. char.Name)
 
-    -- Clear old state
     originalCollision = {}
     speedVec = Vector3.zero
 
-    -- Flight attachments
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
 
@@ -789,17 +833,16 @@ local function setupCharacter(char)
     linearVelocity.MaxForce = 0
     linearVelocity.VectorVelocity = Vector3.zero
 
-    -- Capture spawn IMMEDIATELY (before player input)
+    -- Capture fallback CFrame once (never used if a SpawnLocation exists)
     if not firstSpawnCaptured and rootPart then
         realSpawnCFrame = rootPart.CFrame
         firstSpawnCaptured = true
-        log("SPAWN", string.format("Captured real spawn: (%.1f, %.1f, %.1f)",
+        log("SPAWN", string.format("Fallback spawn captured: (%.1f, %.1f, %.1f)",
             realSpawnCFrame.Position.X,
             realSpawnCFrame.Position.Y,
             realSpawnCFrame.Position.Z))
     end
 
-    -- Reapply states
     if noclipEnabled then applyNoclip(true) end
     watchCharacterForInvisibility(char)
     if invisibleEnabled then applyInvisibility(true) end
@@ -809,7 +852,6 @@ local function setupCharacter(char)
         task.defer(function() enablePromptExtenderAll() end)
     end
 
-    -- Clear refs on death
     humanoid.Died:Connect(function()
         character = nil
         rootPart = nil
@@ -833,4 +875,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V8.7 loaded. Velocity-injection speed. Instant TP with noclip-safe.")
+print("V8.9 loaded. Fixed-step speed (850 accel, cap 140). Exact CFrame TP.")
