@@ -1,8 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V9.2
--- Speed: LinearVelocity constraint (overpowers server)
--- TP: velocity mode default, CFrame option
--- Spawn: RespawnLocation -> captured fallback -> nearest
+-- GR33D SCRIPTS V10.0
+-- Speed: reads live treadmill WalkSpeed, adds bonus
+-- Fly: camera-relative via PlayerModule controls
+-- TP: anchored pivot + velocity zero (server-accepted)
 -- UI: right side
 -- ==========================================
 
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V9.2 Starting ===")
+log("BOOT", "=== GR33D V10.0 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -51,26 +51,23 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
--- Speed bonus (added on top of whatever the game sets)
-local MAX_SPEED_INPUT   = 80
-local DEFAULT_SPEED     = 60
+-- Speed: additive bonus on top of treadmill's live WalkSpeed
+local MAX_SPEED_INPUT   = 200
+local DEFAULT_SPEED     = 100
 
-local SPEED_ACCEL       = 850       -- studs/s^2 ramp
-local SPEED_DECEL       = 850       -- studs/s^2 decay
+-- Fly
+local FLY_SPEED         = 120       -- studs/s
+local DOUBLE_TAP_WINDOW = 0.35
 
 -- Jump
 local MAX_JUMP_IMPULSE  = 107
 local DEFAULT_JUMP      = 100
 local MAX_SAFE_FALL     = 50
-local DOUBLE_TAP_WINDOW = 0.35
 
 -- Prompt Extender
 local PROMPT_MAX_DISTANCE  = 50
 local PROMPT_HOLD_DURATION = 0
 local PROMPT_REQUIRES_LOS  = false
-
--- TP mode: true = velocity-based (safe), false = CFrame + Physics
-local USE_VELOCITY_TP   = true
 
 -- ==========================================
 -- STATE
@@ -108,7 +105,28 @@ local oldNewIndex               = nil
 local isTPBusy              = false
 local trackedPrompts        = {}
 
-local speedVec              = Vector3.zero
+-- Speed tracking (treadmill-aware)
+local lastBaseSpeed         = 16
+local lastBoostedWS         = 16
+local wasSpeedEnabled       = false
+
+-- Fly controls module
+local controls              = nil
+pcall(function()
+    local playerScripts = player:WaitForChild("PlayerScripts", 5)
+    if playerScripts then
+        local playerModuleScript = playerScripts:WaitForChild("PlayerModule", 5)
+        if playerModuleScript then
+            local PlayerModule = require(playerModuleScript)
+            controls = PlayerModule:GetControls()
+        end
+    end
+end)
+if controls then
+    log("FLY", "PlayerModule controls loaded")
+else
+    log("FLY", "WARNING: PlayerModule controls not available")
+end
 
 -- ==========================================
 -- INVISIBILITY
@@ -265,72 +283,62 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- SPEED (via LinearVelocity constraint)
--- This overpowers the server's authority over
--- AssemblyLinearVelocity. Same trick as fly.
+-- SPEED (treadmill-aware, WalkSpeed add)
+-- Reads live WalkSpeed -> treadmill base
+-- Writes base + bonus back to WalkSpeed
 -- ==========================================
 
 RunService.Stepped:Connect(function(_, dt)
-    if not rootPart or not humanoid or not linearVelocity then return end
+    if not humanoid or not rootPart then return end
 
     local st = humanoid:GetState()
     if st == Enum.HumanoidStateType.Dead
         or st == Enum.HumanoidStateType.Ragdoll
         or st == Enum.HumanoidStateType.Climbing
         or st == Enum.HumanoidStateType.Swimming then
-        speedVec = Vector3.zero
-        linearVelocity.MaxForce = 0
-        linearVelocity.VectorVelocity = Vector3.zero
         return
     end
-    if humanoid.Sit then
-        speedVec = Vector3.zero
-        linearVelocity.MaxForce = 0
-        linearVelocity.VectorVelocity = Vector3.zero
-        return
-    end
+    if humanoid.Sit then return end
 
-    -- Speed OFF: clear LinearVelocity contribution
     if not runSpeedEnabled or isFlying or isTPBusy then
-        speedVec = Vector3.zero
-        linearVelocity.MaxForce = 0
-        linearVelocity.VectorVelocity = Vector3.zero
+        if wasSpeedEnabled then
+            -- Just toggled off -> restore base
+            humanoid.WalkSpeed = lastBaseSpeed
+            wasSpeedEnabled = false
+        end
         return
     end
 
-    -- Ramp our bonus toward (moveDir * bonus)
+    wasSpeedEnabled = true
+
+    -- Detect treadmill update: if current WalkSpeed != what we last wrote,
+    -- the treadmill changed it. Adopt that as the new base.
+    local currentWS = humanoid.WalkSpeed
+    if math.abs(currentWS - lastBoostedWS) > 0.5 then
+        lastBaseSpeed = currentWS
+    end
+
+    -- Write base + bonus back to WalkSpeed
+    local boostedWS = lastBaseSpeed + runSpeedValue
+    humanoid.WalkSpeed = boostedWS
+    lastBoostedWS = boostedWS
+
+    -- Optional: small velocity push via Lerp for extra oomph
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude > 0.01 then
-        local desired = moveDir.Unit * runSpeedValue  -- bonus only
-        local delta   = desired - speedVec
-        local step    = SPEED_ACCEL * dt
-
-        if delta.Magnitude <= step then
-            speedVec = desired
-        else
-            speedVec = speedVec + delta.Unit * step
-        end
-    else
-        local step = SPEED_DECEL * dt
-        if speedVec.Magnitude <= step then
-            speedVec = Vector3.zero
-        else
-            speedVec = speedVec - speedVec.Unit * step
-        end
+        local desiredVel = moveDir.Unit * boostedWS
+        local currentVel = rootPart.AssemblyLinearVelocity
+        local newVel = currentVel:Lerp(desiredVel, 0.35)
+        newVel = Vector3.new(newVel.X, currentVel.Y, newVel.Z)
+        rootPart.AssemblyLinearVelocity = newVel
     end
-
-    -- Apply via LinearVelocity (continuous force, server can't override easily)
-    linearVelocity.MaxForce = 100000
-    linearVelocity.VectorVelocity = speedVec
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
         log("SPEED", string.format(
-            "bonus=%.1f base_ws=%.1f est_total=%.1f | pos=(%.1f, %.1f, %.1f)",
-            speedVec.Magnitude,
-            humanoid.WalkSpeed,
-            humanoid.WalkSpeed + speedVec.Magnitude,
+            "base=%.1f bonus=%.1f final_ws=%.1f | pos=(%.1f, %.1f, %.1f)",
+            lastBaseSpeed, runSpeedValue, humanoid.WalkSpeed,
             rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     end
 end)
@@ -354,57 +362,18 @@ local function applyJump()
 end
 
 -- ==========================================
--- TELEPORT
+-- TELEPORT (anchored pivot — server-accepted)
 -- ==========================================
 
-local function doTeleportCFrame(targetCFrame)
-    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-
-    rootPart.AssemblyLinearVelocity  = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    rootPart.CFrame = targetCFrame
-
-    rootPart.AssemblyLinearVelocity  = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    task.defer(function()
-        if humanoid and humanoid.Parent then
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    end)
-end
-
-local function doTeleportVelocity(targetCFrame)
-    local targetPos = targetCFrame.Position
-    local MAX_TP_SPEED = 700
-    local startTime = os.clock()
-    local timeout   = 20
-
-    while (targetPos - rootPart.Position).Magnitude > 5 do
-        if os.clock() - startTime > timeout then break end
-        if not rootPart or not rootPart.Parent then break end
-        task.wait()
-        local remaining = targetPos - rootPart.Position
-        if remaining.Magnitude > 5 then
-            local aim = remaining + Vector3.new(0, 2, 0)
-            rootPart.AssemblyLinearVelocity = aim.Unit * MAX_TP_SPEED
-        end
-    end
-
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-end
-
-local function doTeleport(targetCFrame)
-    if not rootPart or not humanoid or not targetCFrame then return end
+local function absoluteTeleport(targetCFrame)
+    if not character or not rootPart or not humanoid then return end
     if isTPBusy then return end
     isTPBusy = true
 
-    local targetPos = targetCFrame.Position
+    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
     local distance  = (targetPos - rootPart.Position).Magnitude
 
-    log("TP", string.format("doTeleport dist=%.1f mode=%s",
-        distance, USE_VELOCITY_TP and "velocity" or "cframe"))
+    log("TP", string.format("doTeleport dist=%.1f", distance))
 
     if distance < 5 then
         isTPBusy = false
@@ -414,18 +383,27 @@ local function doTeleport(targetCFrame)
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- Ensure speed linear velocity isn't fighting the TP
-    if linearVelocity then
-        linearVelocity.MaxForce = 0
-        linearVelocity.VectorVelocity = Vector3.zero
-    end
-    speedVec = Vector3.zero
+    -- Unseat if seated
+    humanoid.Sit = false
+    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 
-    if USE_VELOCITY_TP then
-        doTeleportVelocity(targetCFrame)
-    else
-        doTeleportCFrame(targetCFrame)
-    end
+    -- Zero velocity, anchor, pivot, unanchor
+    rootPart.AssemblyLinearVelocity  = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+    rootPart.Anchored = true
+
+    character:PivotTo(CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position))
+
+    task.delay(0.04, function()
+        if rootPart and rootPart.Parent then
+            rootPart.AssemblyLinearVelocity  = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+            rootPart.Anchored = false
+        end
+        if humanoid and humanoid.Parent then
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end
+    end)
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
@@ -448,42 +426,33 @@ local function getEntrySpawn()
     if realSpawnCFrame then
         return realSpawnCFrame
     end
-    local spawns = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
-            table.insert(spawns, obj)
+            return obj.CFrame
         end
     end
-    if #spawns == 0 then
-        return (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
-    end
-    if rootPart then
-        local nearest, bestDist = spawns[1], math.huge
-        for _, sp in ipairs(spawns) do
-            local d = (sp.Position - rootPart.Position).Magnitude
-            if d < bestDist then nearest, bestDist = sp, d end
-        end
-        return nearest.CFrame
-    end
-    return spawns[1].CFrame
+    return (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
 end
 
 -- ==========================================
--- FLIGHT
+-- FLY (camera-relative via PlayerModule)
 -- ==========================================
 
 local function setFlying(state)
     if not rootPart or not humanoid or not linearVelocity then return end
     isFlying = state
+
     if isFlying then
         linearVelocity.MaxForce = 100000
         humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        log("FLY", "Flight ON")
     else
         linearVelocity.MaxForce = 0
         linearVelocity.VectorVelocity = Vector3.zero
         if humanoid.FloorMaterial ~= Enum.Material.Air then
             humanoid:ChangeState(Enum.HumanoidStateType.Running)
         end
+        log("FLY", "Flight OFF")
     end
 end
 
@@ -493,12 +462,26 @@ RunService.RenderStepped:Connect(function()
         return
     end
 
+    -- Fly: camera-relative movement
     if isFlying and linearVelocity and humanoid and rootPart then
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
+        if humanoid.FloorMaterial ~= Enum.Material.Air and humanoid.MoveDirection.Magnitude < 0.1 then
+            -- Touch down and not moving -> exit flight
             setFlying(false)
+        elseif controls then
+            local moveVector = controls:GetMoveVector()
+            if moveVector.Magnitude > 0 then
+                local camCFrame = camera.CFrame
+                -- RightVector * X - LookVector * Z (camera-relative)
+                local flightDir = (camCFrame.RightVector * moveVector.X)
+                                - (camCFrame.LookVector * moveVector.Z)
+                linearVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
+            else
+                linearVelocity.VectorVelocity = Vector3.zero
+            end
         end
     end
 
+    -- Fall damage clamp
     if humanoid and rootPart and noFallDamageEnabled then
         local st = humanoid:GetState()
         if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
@@ -523,7 +506,7 @@ screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 210, 0, 420)
+mainFrame.Size = UDim2.new(0, 220, 0, 440)
 mainFrame.AnchorPoint = Vector2.new(1, 0.5)
 mainFrame.Position = UDim2.new(1, -10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
@@ -547,7 +530,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "GR33D v9.2"
+title.Text = "GR33D v10.0"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -596,7 +579,7 @@ container.Size = UDim2.new(1, 0, 1, -40)
 container.Position = UDim2.new(0, 0, 0, 40)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 700)
+container.CanvasSize = UDim2.new(0, 0, 0, 720)
 container.ScrollBarThickness = 3
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
 
@@ -704,10 +687,8 @@ createToggle("Flight Mode", 5, function(s)
     log("UI", "Flight: " .. tostring(s))
     if not s then
         setFlying(false)
-    else
-        if humanoid and rootPart and linearVelocity then
-            setFlying(true)
-        end
+    elseif humanoid and rootPart and linearVelocity then
+        setFlying(true)
     end
 end)
 
@@ -721,16 +702,9 @@ end)
 createToggle("Super Speed", 125, function(s)
     runSpeedEnabled = s
     log("UI", "Speed: " .. tostring(s))
-    if not s then
-        speedVec = Vector3.zero
-        if linearVelocity then
-            linearVelocity.MaxForce = 0
-            linearVelocity.VectorVelocity = Vector3.zero
-        end
-    end
 end)
 
-createInput("Speed + (max 80)", 155, DEFAULT_SPEED, function(v, box)
+createInput("Speed + (max 200)", 155, DEFAULT_SPEED, function(v, box)
     if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
     if v < 0 then v = 0 end
     runSpeedValue = v
@@ -751,7 +725,15 @@ createInput("Jump (max 107)", 215, DEFAULT_JUMP, function(v, box)
     log("UI", "Jump value: " .. tostring(v))
 end)
 
-createToggle("Prompt Extender", 245, function(s)
+createInput("Fly Speed", 245, FLY_SPEED, function(v, box)
+    if v < 10 then v = 10 end
+    if v > 500 then v = 500 end
+    FLY_SPEED = v
+    if box then box.Text = tostring(v) end
+    log("UI", "Fly speed = " .. tostring(v))
+end)
+
+createToggle("Prompt Extender", 275, function(s)
     promptExtenderEnabled = s
     log("UI", "PromptExtender: " .. tostring(s))
     if s then
@@ -761,12 +743,12 @@ createToggle("Prompt Extender", 245, function(s)
     end
 end)
 
-createButton("TP to Spawn", 275, Color3.fromRGB(41, 128, 185), function()
+createButton("TP to Spawn", 305, Color3.fromRGB(41, 128, 185), function()
     log("UI", "TP to Spawn")
-    doTeleport(getEntrySpawn())
+    absoluteTeleport(getEntrySpawn())
 end)
 
-local saveBtn = createButton("Save Location", 305, Color3.fromRGB(142, 68, 173), function()
+local saveBtn = createButton("Save Location", 335, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -774,31 +756,12 @@ local saveBtn = createButton("Save Location", 305, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 335, Color3.fromRGB(39, 174, 96), function()
+createButton("TP to Saved", 365, Color3.fromRGB(39, 174, 96), function()
     log("UI", "TP to Saved")
-    if savedMapCFrame then doTeleport(savedMapCFrame) end
+    if savedMapCFrame then absoluteTeleport(savedMapCFrame) end
 end)
 
--- TP mode toggle
-local tpModeLabel = Instance.new("TextLabel", container)
-tpModeLabel.Size = UDim2.new(1, -8, 0, 16)
-tpModeLabel.Position = UDim2.new(0, 4, 0, 363)
-tpModeLabel.BackgroundTransparency = 1
-tpModeLabel.Text = "TP mode: Velocity (safe)"
-tpModeLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
-tpModeLabel.Font = Enum.Font.GothamMedium
-tpModeLabel.TextSize = 9
-tpModeLabel.TextXAlignment = Enum.TextXAlignment.Left
-
-createButton("Toggle TP Mode", 380, Color3.fromRGB(80, 80, 100), function()
-    USE_VELOCITY_TP = not USE_VELOCITY_TP
-    tpModeLabel.Text = USE_VELOCITY_TP
-        and "TP mode: Velocity (safe)"
-        or  "TP mode: CFrame (fast)"
-    log("UI", "TP mode: " .. (USE_VELOCITY_TP and "velocity" or "cframe"))
-end)
-
-createButton("SAVE LOG", 410, Color3.fromRGB(200, 80, 80), function()
+createButton("SAVE LOG", 395, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
@@ -814,7 +777,7 @@ floatBtn.MouseButton1Click:Connect(function()
 end)
 
 -- ==========================================
--- JUMP INPUT
+-- JUMP INPUT (double-tap for fly)
 -- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
@@ -846,7 +809,8 @@ local function setupCharacter(char)
     log("CHAR", "Setup: " .. char.Name)
 
     originalCollision = {}
-    speedVec = Vector3.zero
+    lastBaseSpeed = humanoid.WalkSpeed
+    lastBoostedWS = humanoid.WalkSpeed
 
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
@@ -895,11 +859,10 @@ player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
     isTPBusy = false
-    speedVec = Vector3.zero
     originalTransparency = {}
     originalCollision = {}
     if linearVelocity then linearVelocity.MaxForce = 0 end
     setupCharacter(c)
 end)
 
-print("V9.2 loaded. LinearVelocity speed (overpowers server).")
+print("V10.0 loaded. Treadmill-aware speed + camera-relative fly.")
