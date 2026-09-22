@@ -1,7 +1,7 @@
 -- ==========================================
--- GR33D SCRIPTS V9.0
--- Speed: ADDITIVE to base walkspeed
--- TP: Physics-state CFrame write (server-accepted)
+-- GR33D SCRIPTS V9.1
+-- Speed: additive, max bonus 100 (no rubber-band)
+-- TP: velocity mode by default (server-accepted)
 -- Spawn: RespawnLocation -> captured fallback -> nearest
 -- UI: right side
 -- ==========================================
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V9.0 Starting ===")
+log("BOOT", "=== GR33D V9.1 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -51,12 +51,16 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
--- Speed is ADDITIVE: final_velocity = base_walkspeed + input_speed
-local MAX_SPEED_INPUT   = 200         -- slider max (additive)
-local DEFAULT_SPEED     = 50          -- default additive amount
+-- Speed is ADDITIVE: final_velocity = base_walkspeed + bonus
+-- Max bonus = 100 -> base 16 + 100 = 116 total (safe, no rubber-band)
+local MAX_SPEED_INPUT   = 100         -- slider max (additive bonus)
+local DEFAULT_SPEED     = 50          -- default additive bonus
 
 local SPEED_ACCEL       = 850         -- studs/s^2 ramp
 local SPEED_DECEL       = 850         -- studs/s^2 decay
+
+-- Absolute safety cap (server tolerance ~150)
+local SPEED_HARD_CAP    = 150
 
 -- Jump
 local MAX_JUMP_IMPULSE  = 107
@@ -71,7 +75,8 @@ local PROMPT_REQUIRES_LOS  = false
 
 -- TP mode: true = velocity-based (safe, slower)
 --          false = CFrame + Physics state (fast, may snap back)
-local USE_VELOCITY_TP   = false
+-- Default = true (velocity) because CFrame mode was snapped back in testing
+local USE_VELOCITY_TP   = true
 
 -- ==========================================
 -- STATE
@@ -87,7 +92,7 @@ local jumpEnabled           = false
 local promptExtenderEnabled = false
 local isMinimized           = false
 
-local runSpeedValue         = DEFAULT_SPEED     -- additive amount
+local runSpeedValue         = DEFAULT_SPEED     -- additive bonus
 local jumpPowerValue        = DEFAULT_JUMP
 
 local lastJumpTapTime       = 0
@@ -266,7 +271,9 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- SPEED (ADDITIVE to base walkspeed)
+-- SPEED (ADDITIVE, clean, no double-apply)
+-- final_velocity = base_contribution + speedVec
+-- speedVec ramps to (moveDir * runSpeedValue)
 -- ==========================================
 
 RunService.Stepped:Connect(function(_, dt)
@@ -285,24 +292,21 @@ RunService.Stepped:Connect(function(_, dt)
         return
     end
 
-    -- When speed is OFF: just clear our vector, don't touch velocity.
-    -- This lets the game's natural movement work normally.
+    -- When speed is OFF: don't touch velocity. Let the game move you.
     if not runSpeedEnabled or isFlying or isTPBusy then
         speedVec = Vector3.zero
         return
     end
 
-    -- Compute target speed: game's current WalkSpeed + our additive amount
-    local baseSpeed = humanoid.WalkSpeed
-    if baseSpeed < 1 then baseSpeed = 16 end       -- fallback if game sets 0
-    local targetSpeed = baseSpeed + runSpeedValue  -- ADDITIVE
+    -- Bonus cap: keep total under SPEED_HARD_CAP
+    local base = humanoid.WalkSpeed
+    if base < 1 then base = 16 end
+    local maxBonus = math.max(0, SPEED_HARD_CAP - base)
+    local bonus    = math.min(runSpeedValue, maxBonus)
 
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude > 0.01 then
-        -- We want the FINAL velocity to be (moveDir * targetSpeed).
-        -- The game is already applying (moveDir * baseSpeed) via its controller.
-        -- So we ADD the extra (moveDir * runSpeedValue) on top.
-        local desired = moveDir.Unit * runSpeedValue  -- only the BONUS
+        local desired = moveDir.Unit * bonus
         local delta   = desired - speedVec
         local step    = SPEED_ACCEL * dt
 
@@ -320,30 +324,30 @@ RunService.Stepped:Connect(function(_, dt)
         end
     end
 
-    -- Write velocity: preserve existing horizontal + add our bonus
+    -- Preserve Y, only override X/Z with (current X/Z + bonus)
     local curVel = rootPart.AssemblyLinearVelocity
     local yVel   = math.clamp(curVel.Y, -MAX_SAFE_FALL, MAX_SAFE_FALL)
 
-    -- The game's controller sets horizontal to (moveDir * baseSpeed).
-    -- We add speedVec on top (which is moveDir * runSpeedValue).
-    -- To avoid double-applying, we compute: base contribution + our bonus.
-    local baseContribution = moveDir.Unit * baseSpeed * (moveDir.Magnitude > 0.01 and 1 or 0)
-    local finalHorizontal  = baseContribution + speedVec
+    -- Clean additive: current horizontal + our ramped bonus
+    local newX = curVel.X + speedVec.X
+    local newZ = curVel.Z + speedVec.Z
 
-    -- Preserve Y, write final
-    rootPart.AssemblyLinearVelocity = Vector3.new(
-        finalHorizontal.X,
-        yVel,
-        finalHorizontal.Z
-    )
+    -- Hard cap on horizontal magnitude to avoid server kick
+    local horiz = Vector3.new(newX, 0, newZ)
+    if horiz.Magnitude > SPEED_HARD_CAP then
+        horiz = horiz.Unit * SPEED_HARD_CAP
+        newX, newZ = horiz.X, horiz.Z
+    end
+
+    rootPart.AssemblyLinearVelocity = Vector3.new(newX, yVel, newZ)
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
         log("SPEED", string.format(
-            "base=%.1f add=%.1f final=%.1f | pos=(%.1f, %.1f, %.1f)",
-            baseSpeed, speedVec.Magnitude,
-            (finalHorizontal + Vector3.new(0, yVel, 0)).Magnitude,
+            "base=%.1f bonus=%.1f total=%.1f | pos=(%.1f, %.1f, %.1f)",
+            base, bonus,
+            Vector3.new(newX, 0, newZ).Magnitude,
             rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     end
 end)
@@ -371,7 +375,7 @@ end
 -- ==========================================
 
 local function doTeleportCFrame(targetCFrame)
-    -- Option B: CFrame write + Physics state (instant, may snap back)
+    -- Option B: CFrame write + Physics state
     humanoid:ChangeState(Enum.HumanoidStateType.Physics)
 
     rootPart.AssemblyLinearVelocity  = Vector3.zero
@@ -390,11 +394,11 @@ local function doTeleportCFrame(targetCFrame)
 end
 
 local function doTeleportVelocity(targetCFrame)
-    -- Option A: velocity-based (server-accepted, slower but reliable)
+    -- Option A: velocity-based (server-accepted, reliable)
     local targetPos = targetCFrame.Position
     local MAX_TP_SPEED = 700
     local startTime = os.clock()
-    local timeout   = 15
+    local timeout   = 20
 
     while (targetPos - rootPart.Position).Magnitude > 5 do
         if os.clock() - startTime > timeout then break end
@@ -402,7 +406,9 @@ local function doTeleportVelocity(targetCFrame)
         task.wait()
         local remaining = targetPos - rootPart.Position
         if remaining.Magnitude > 5 then
-            rootPart.AssemblyLinearVelocity = remaining.Unit * MAX_TP_SPEED
+            -- Aim slightly above the target to avoid ground friction
+            local aim = remaining + Vector3.new(0, 2, 0)
+            rootPart.AssemblyLinearVelocity = aim.Unit * MAX_TP_SPEED
         end
     end
 
@@ -562,7 +568,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "GR33D v9.0"
+title.Text = "GR33D v9.1"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -741,7 +747,7 @@ createToggle("Super Speed", 125, function(s)
     end
 end)
 
-createInput("Speed + (max 200)", 155, DEFAULT_SPEED, function(v, box)
+createInput("Speed + (max 100)", 155, DEFAULT_SPEED, function(v, box)
     if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
     if v < 0 then v = 0 end
     runSpeedValue = v
@@ -795,7 +801,7 @@ local tpModeLabel = Instance.new("TextLabel", container)
 tpModeLabel.Size = UDim2.new(1, -8, 0, 16)
 tpModeLabel.Position = UDim2.new(0, 4, 0, 363)
 tpModeLabel.BackgroundTransparency = 1
-tpModeLabel.Text = "TP mode: CFrame (fast)"
+tpModeLabel.Text = "TP mode: Velocity (safe)"
 tpModeLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
 tpModeLabel.Font = Enum.Font.GothamMedium
 tpModeLabel.TextSize = 9
@@ -804,7 +810,7 @@ tpModeLabel.TextXAlignment = Enum.TextXAlignment.Left
 createButton("Toggle TP Mode", 380, Color3.fromRGB(80, 80, 100), function()
     USE_VELOCITY_TP = not USE_VELOCITY_TP
     tpModeLabel.Text = USE_VELOCITY_TP
-        and "TP mode: Velocity (safe, slow)"
+        and "TP mode: Velocity (safe)"
         or  "TP mode: CFrame (fast)"
     log("UI", "TP mode: " .. (USE_VELOCITY_TP and "velocity" or "cframe"))
 end)
@@ -914,4 +920,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V9.0 loaded. Additive speed. CFrame/velocity TP modes.")
+print("V9.1 loaded. Additive speed (max 100, hard cap 150). Velocity TP default.")
