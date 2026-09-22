@@ -1,7 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V10.0 (COMPLETE & UPDATED)
--- Speed: reads live treadmill WalkSpeed, adds bonus
--- Fly: camera-relative via PlayerModule controls
+-- GR33D SCRIPTS V10.0 (UPDATED - SPEED, JUMP & TP)
+-- Speed: Delta-time CFrame movement (No rubberbanding)
+-- Jump: State-forced Impulse (High Jump support)
+-- Fly: Camera-relative via PlayerModule controls
 -- TP: Ground Raycast + Faster Step-TP (Distance: 25, Wait: 0.015)
 -- UI: Right side
 -- ==========================================
@@ -51,7 +52,7 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
-local MAX_SPEED_INPUT   = 200
+local MAX_SPEED_INPUT   = 1000
 local DEFAULT_SPEED     = 100
 
 -- Fly
@@ -59,7 +60,7 @@ local FLY_SPEED         = 120       -- studs/s
 local DOUBLE_TAP_WINDOW = 0.35
 
 -- Jump
-local MAX_JUMP_IMPULSE  = 107
+local MAX_JUMP_IMPULSE  = 500
 local DEFAULT_JUMP      = 100
 local MAX_SAFE_FALL     = 50
 
@@ -87,7 +88,6 @@ local jumpPowerValue        = DEFAULT_JUMP
 
 local lastJumpTapTime       = 0
 local lastJumpReqTime       = 0
-local lastSpeedLogTime      = 0
 local realSpawnCFrame       = nil
 local firstSpawnCaptured    = false
 local savedMapCFrame        = nil
@@ -103,11 +103,6 @@ local oldNewIndex               = nil
 
 local isTPBusy              = false
 local trackedPrompts        = {}
-
--- Speed tracking (treadmill-aware)
-local lastBaseSpeed         = 16
-local lastBoostedWS         = 16
-local wasSpeedEnabled       = false
 
 -- Fly controls module
 local controls              = nil
@@ -277,11 +272,12 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- SPEED
+-- SPEED (CFrame Offset - Anti-Rubberband)
 -- ==========================================
 
-RunService.Stepped:Connect(function()
+RunService.RenderStepped:Connect(function(dt)
     if not humanoid or not rootPart then return end
+    if not runSpeedEnabled or isFlying or isTPBusy then return end
 
     local st = humanoid:GetState()
     if st == Enum.HumanoidStateType.Dead
@@ -292,37 +288,28 @@ RunService.Stepped:Connect(function()
     end
     if humanoid.Sit then return end
 
-    if not runSpeedEnabled or isFlying or isTPBusy then
-        if wasSpeedEnabled then
-            humanoid.WalkSpeed = lastBaseSpeed
-            wasSpeedEnabled = false
-        end
-        return
-    end
-
-    wasSpeedEnabled = true
-
-    local currentWS = humanoid.WalkSpeed
-    if math.abs(currentWS - lastBoostedWS) > 0.1 and currentWS ~= (lastBaseSpeed + runSpeedValue) then
-        lastBaseSpeed = currentWS
-    end
-
-    local targetSpeed = lastBaseSpeed + runSpeedValue
-    if humanoid.WalkSpeed ~= targetSpeed then
-        humanoid.WalkSpeed = targetSpeed
-        lastBoostedWS = targetSpeed
+    local moveDir = humanoid.MoveDirection
+    if moveDir.Magnitude > 0 then
+        rootPart.CFrame = rootPart.CFrame + (moveDir * (runSpeedValue * dt))
     end
 end)
 
 -- ==========================================
--- JUMP
+-- JUMP (Direct Impulse)
 -- ==========================================
 
 local function applyJump()
     if not jumpEnabled or not rootPart or not humanoid then return end
-    if humanoid.FloorMaterial == Enum.Material.Air then return end
+
+    local state = humanoid:GetState()
+    if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.FallingDown then 
+        return 
+    end
+
     if os.clock() - lastJumpReqTime < 0.15 then return end
     lastJumpReqTime = os.clock()
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
     local impulse = math.min(jumpPowerValue, MAX_JUMP_IMPULSE)
     rootPart.AssemblyLinearVelocity = Vector3.new(
         rootPart.AssemblyLinearVelocity.X,
@@ -332,7 +319,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- ADVANCED TELEPORT SYSTEM (UPDATED SPEED)
+-- ADVANCED TELEPORT SYSTEM
 -- ==========================================
 
 local function getSafeGroundPosition(targetCFrame)
@@ -364,7 +351,6 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- Stand up and anchor immediately to lock network control
     humanoid.Sit = false
     rootPart.Anchored = true
     rootPart.AssemblyLinearVelocity = Vector3.zero
@@ -386,20 +372,15 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
         end
     end
 
-    -- Force exact destination position
     character:PivotTo(safeCFrame)
-    
-    -- Hold anchor briefly so the server registers final position
     task.wait(0.3)
 
-    -- Flush residual momentum before restoring server physics control
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
     rootPart.Anchored = false
 
     humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 
-    -- Multi-frame zero velocity enforcement loop post-unanchor
     task.spawn(function()
         for _ = 1, 8 do
             if rootPart and rootPart.Parent then
@@ -685,7 +666,7 @@ createToggle("Noclip", 95, function(s) applyNoclip(s) end)
 
 createToggle("Super Speed", 125, function(s) runSpeedEnabled = s end)
 
-createInput("Speed + (max 200)", 155, DEFAULT_SPEED, function(v, box)
+createInput("Speed (max 1000)", 155, DEFAULT_SPEED, function(v, box)
     if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
     if v < 0 then v = 0 end
     runSpeedValue = v
@@ -694,7 +675,7 @@ end)
 
 createToggle("Custom Jump", 185, function(s) jumpEnabled = s end)
 
-createInput("Jump (max 107)", 215, DEFAULT_JUMP, function(v, box)
+createInput("Jump (max 500)", 215, DEFAULT_JUMP, function(v, box)
     if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end
     if v < 1 then v = 1 end
     jumpPowerValue = v
@@ -782,8 +763,6 @@ local function setupCharacter(char)
     humanoid = char:WaitForChild("Humanoid")
 
     originalCollision = {}
-    lastBaseSpeed = humanoid.WalkSpeed
-    lastBoostedWS = humanoid.WalkSpeed
 
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
