@@ -1,8 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V8.1
--- Speed: WalkSpeed 231.4 + continuous tween target
--- TP: all 3 CFrame writes in one frame (matches log)
--- UI: V6.6 (working on mobile)
+-- GR33D SCRIPTS V8.2
+-- UI: right side, mobile-safe
+-- Speed: WalkSpeed 231.4 + egg carry detection
+-- TP: 3 writes in one frame + no-fall-damage after
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V8.1 Starting ===")
+log("BOOT", "=== GR33D V8.2 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -54,13 +54,14 @@ log("BOOT", "Player: " .. player.Name)
 local DEFAULT_SPEED          = 15
 local MAX_SPEED              = 15
 local WALKSPEED_BOOST        = 231.4
-local SPEED_STEP             = 0.35    -- studs per frame (multiplied by speed value)
+local SPEED_STEP             = 0.35
 local TP_WARMUP_1            = 30
 local TP_WARMUP_2            = 15
 local MAX_JUMP_IMPULSE       = 107
 local DEFAULT_JUMP           = 100
 local MAX_SAFE_FALL          = 50
 local DOUBLE_TAP_WINDOW      = 0.35
+local CARRY_SPEED_REDUCTION  = 0.4     -- reduce to 40% speed when carrying egg
 
 -- Prompt Extender
 local PROMPT_MAX_DISTANCE    = 50
@@ -80,13 +81,13 @@ local runSpeedEnabled     = false
 local jumpEnabled         = false
 local promptExtenderEnabled = false
 local isMinimized         = false
+local isCarryingEgg       = false
 
 local runSpeedValue       = DEFAULT_SPEED
 local jumpPowerValue      = DEFAULT_JUMP
 
 local lastJumpTapTime     = 0
 local lastJumpReqTime     = 0
-local lastTPTime          = 0
 local lastSpeedLogTime    = 0
 local realSpawnCFrame     = nil
 local firstSpawnCaptured  = false
@@ -220,7 +221,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 -- ==========================================
--- TELEPORT (all 3 CFrame writes in ONE frame — matches log)
+-- TELEPORT (3 CFrame writes in one frame + no-fall-damage)
 -- ==========================================
 
 local function doTeleport(targetCFrame)
@@ -228,7 +229,7 @@ local function doTeleport(targetCFrame)
     if isTPBusy then return end
     isTPBusy = true
 
-    local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
+    local targetPos = targetCFrame.Position + Vector3.new(0, 2.5, 0)
     local startPos = rootPart.Position
     local distance = (targetPos - startPos).Magnitude
 
@@ -239,34 +240,37 @@ local function doTeleport(targetCFrame)
         return
     end
 
+    -- Save current no-fall state, enable for safe landing
+    local wasNoFall = noFallDamageEnabled
+    noFallDamageEnabled = true
+
     -- Zero velocity first
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    -- All 3 CFrame writes happen in ONE frame (no waits between).
-    -- Server sees only the FINAL position at next tick — matches log's 3400-stud single-frame jumps.
-
-    -- Warmup 1: 30 studs toward target
+    -- All 3 CFrame writes in ONE frame
     local dir1 = (targetPos - startPos).Unit
     local warmup1Pos = startPos + dir1 * math.min(TP_WARMUP_1, distance * 0.3)
     rootPart.CFrame = CFrame.new(warmup1Pos)
 
-    -- Warmup 2: 15 more studs
     local dir2 = (targetPos - warmup1Pos).Unit
     local warmup2Pos = warmup1Pos + dir2 * math.min(TP_WARMUP_2, (targetPos - warmup1Pos).Magnitude * 0.3)
     rootPart.CFrame = CFrame.new(warmup2Pos)
 
-    -- Main jump: instant to target
     rootPart.CFrame = CFrame.new(targetPos)
 
-    -- Reset velocity to zero after all writes
+    -- Zero velocity after
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
 
-    -- Small cooldown to prevent spam
+    -- Restore no-fall state after 1s
+    task.delay(1, function()
+        noFallDamageEnabled = wasNoFall
+    end)
+
     task.wait(0.1)
     isTPBusy = false
 end
@@ -282,37 +286,77 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- SPEED (WalkSpeed 231.4 + CFrame per-frame step — matches log)
+-- EGG CARRY DETECTION (reduces speed during steal)
+-- ==========================================
+
+player:GetAttributeChangedSignal("Carrying"):Connect(function()
+    local val = player:GetAttribute("Carrying")
+    isCarryingEgg = (val ~= nil and val ~= false)
+    log("CARRY", "Attribute Carrying: " .. tostring(val))
+end)
+
+-- Watch for egg items in character (when carrying)
+local function watchForCarryItems(char)
+    char.ChildAdded:Connect(function(child)
+        local n = child.Name:lower()
+        if n:find("egg") or n:find("carry") or n:find("steal") or n:find("hold") then
+            isCarryingEgg = true
+            log("CARRY", "Detected: " .. child.Name)
+            -- Reset when removed
+            child.AncestryChanged:Connect(function()
+                if not child:IsDescendantOf(char) then
+                    isCarryingEgg = false
+                    log("CARRY", "Released")
+                end
+            end)
+        end
+    end)
+end
+
+-- Watch UI for carry indicators
+protectedParent.DescendantAdded:Connect(function(obj)
+    if obj:IsA("TextLabel") then
+        local t = (obj.Text or ""):lower()
+        if t:find("carrying") or t:find("holding") or t:find("steal") then
+            isCarryingEgg = true
+            log("CARRY", "UI: " .. obj.Text)
+        end
+    end
+end)
+
+-- ==========================================
+-- SPEED (WalkSpeed 231.4 + carry detection)
 -- ==========================================
 
 RunService.RenderStepped:Connect(function(dt)
     if not runSpeedEnabled or not rootPart or not humanoid then return end
 
-    -- Only set WalkSpeed when speed is enabled
     if humanoid.WalkSpeed ~= WALKSPEED_BOOST then
         humanoid.WalkSpeed = WALKSPEED_BOOST
     end
 
-    -- Skip if flying or TP busy
     if isFlying or isTPBusy then return end
 
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude < 0.01 then return end
 
-    -- Per-frame CFrame step. dt * 60 normalizes to 60fps.
-    -- Matches the log's smooth 4→20 studs/frame pattern.
     local speedMult = runSpeedValue / 100
+    -- Reduce speed when carrying egg to prevent rubberband
+    if isCarryingEgg then
+        speedMult = speedMult * CARRY_SPEED_REDUCTION
+    end
+
     local step = moveDir.Unit * (SPEED_STEP * speedMult * (dt * 60))
 
     local newPos = rootPart.Position + step
     rootPart.CFrame = CFrame.new(newPos, newPos + moveDir.Unit)
 
-    -- Log once per second
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("WalkSpeed=%.1f + step=%.2f | pos=(%.1f, %.1f, %.1f)",
+        log("SPEED", string.format("WalkSpeed=%.1f + step=%.2f%s | pos=(%.1f, %.1f, %.1f)",
             humanoid.WalkSpeed, step.Magnitude,
+            isCarryingEgg and " [CARRY]" or "",
             newPos.X, newPos.Y, newPos.Z))
     end
 end)
@@ -393,7 +437,7 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI (V6.6)
+-- UI (RIGHT SIDE, MOBILE-SAFE)
 -- ==========================================
 
 local screenGui = Instance.new("ScreenGui")
@@ -405,8 +449,9 @@ screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0, 500)
-mainFrame.Position = UDim2.new(0, 20, 0.5, -250)
+mainFrame.Size = UDim2.new(0, 200, 0, 400)
+mainFrame.AnchorPoint = Vector2.new(1, 0.5)
+mainFrame.Position = UDim2.new(1, -10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
@@ -419,32 +464,32 @@ stroke.Thickness = 1.5
 stroke.Parent = mainFrame
 
 local topBar = Instance.new("Frame", mainFrame)
-topBar.Size = UDim2.new(1, 0, 0, 40)
+topBar.Size = UDim2.new(1, 0, 0, 36)
 topBar.Position = UDim2.new(0, 0, 0, 0)
 topBar.BackgroundTransparency = 1
 topBar.Active = true
 
 local title = Instance.new("TextLabel", topBar)
-title.Size = UDim2.new(1, -60, 1, 0)
-title.Position = UDim2.new(0, 12, 0, 0)
+title.Size = UDim2.new(1, -50, 1, 0)
+title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
 title.Text = "Menu"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.TextSize = 13
 title.TextXAlignment = Enum.TextXAlignment.Left
 
 local minBtn = Instance.new("TextButton", topBar)
 minBtn.Name = "MinBtn"
-minBtn.Size = UDim2.new(0, 26, 0, 26)
-minBtn.Position = UDim2.new(1, -34, 0.5, -13)
+minBtn.Size = UDim2.new(0, 22, 0, 22)
+minBtn.Position = UDim2.new(1, -28, 0.5, -11)
 minBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
 minBtn.Text = "-"
 minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 16
+minBtn.TextSize = 14
 minBtn.ZIndex = 5
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 8)
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 
 local dragging, dragStart, startPos = false, nil, nil
 topBar.InputBegan:Connect(function(input)
@@ -473,40 +518,54 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 local container = Instance.new("ScrollingFrame", mainFrame)
-container.Size = UDim2.new(1, 0, 1, -45)
-container.Position = UDim2.new(0, 0, 0, 45)
+container.Size = UDim2.new(1, 0, 1, -40)
+container.Position = UDim2.new(0, 0, 0, 40)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 720)
-container.ScrollBarThickness = 4
+container.CanvasSize = UDim2.new(0, 0, 0, 640)
+container.ScrollBarThickness = 3
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
+
+local floatBtn = Instance.new("TextButton")
+floatBtn.Name = "FloatBtn"
+floatBtn.Size = UDim2.new(0, 36, 0, 36)
+floatBtn.AnchorPoint = Vector2.new(1, 0.5)
+floatBtn.Position = UDim2.new(1, -10, 0.5, 0)
+floatBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+floatBtn.Text = "M"
+floatBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatBtn.Font = Enum.Font.GothamBold
+floatBtn.TextSize = 16
+floatBtn.Visible = false
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
+floatBtn.Parent = screenGui
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, -8, 0, 28)
+    row.Position = UDim2.new(0, 4, 0, y)
     row.BackgroundTransparency = 1
 
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.6, 0, 1, 0)
+    lbl.Size = UDim2.new(0.65, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 11
+    lbl.TextSize = 10
     lbl.TextXAlignment = Enum.TextXAlignment.Left
 
     local sw = Instance.new("TextButton", row)
-    sw.Size = UDim2.new(0, 36, 0, 18)
-    sw.Position = UDim2.new(1, -36, 0.5, -9)
+    sw.Size = UDim2.new(0, 32, 0, 16)
+    sw.Position = UDim2.new(1, -32, 0.5, -8)
     sw.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
     sw.Text = ""
     sw.AutoButtonColor = false
     Instance.new("UICorner", sw).CornerRadius = UDim.new(1, 0)
 
     local knob = Instance.new("Frame", sw)
-    knob.Size = UDim2.new(0, 12, 0, 12)
-    knob.Position = UDim2.new(0, 3, 0.5, -6)
+    knob.Size = UDim2.new(0, 10, 0, 10)
+    knob.Position = UDim2.new(0, 3, 0.5, -5)
     knob.BackgroundColor3 = Color3.fromRGB(200, 200, 210)
     Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
@@ -515,7 +574,7 @@ local function createToggle(name, y, cb)
         a = not a
         sw.BackgroundColor3 = a and Color3.fromRGB(46, 204, 113) or Color3.fromRGB(40, 40, 50)
         knob.BackgroundColor3 = a and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(200, 200, 210)
-        knob:TweenPosition(a and UDim2.new(1, -15, 0.5, -6) or UDim2.new(0, 3, 0.5, -6),
+        knob:TweenPosition(a and UDim2.new(1, -13, 0.5, -5) or UDim2.new(0, 3, 0.5, -5),
             Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
         cb(a)
     end)
@@ -523,28 +582,28 @@ end
 
 local function createInput(name, y, def, cb)
     local row = Instance.new("Frame", container)
-    row.Size = UDim2.new(0.9, 0, 0, 32)
-    row.Position = UDim2.new(0.05, 0, 0, y)
+    row.Size = UDim2.new(1, -8, 0, 28)
+    row.Position = UDim2.new(0, 4, 0, y)
     row.BackgroundTransparency = 1
 
     local lbl = Instance.new("TextLabel", row)
-    lbl.Size = UDim2.new(0.5, 0, 1, 0)
+    lbl.Size = UDim2.new(0.55, 0, 1, 0)
     lbl.BackgroundTransparency = 1
     lbl.Text = name
     lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
     lbl.Font = Enum.Font.GothamMedium
-    lbl.TextSize = 11
+    lbl.TextSize = 10
     lbl.TextXAlignment = Enum.TextXAlignment.Left
 
     local box = Instance.new("TextBox", row)
-    box.Size = UDim2.new(0, 60, 0, 22)
-    box.Position = UDim2.new(1, -60, 0.5, -11)
+    box.Size = UDim2.new(0, 55, 0, 20)
+    box.Position = UDim2.new(1, -55, 0.5, -10)
     box.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
     box.Text = tostring(def)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.Font = Enum.Font.GothamBold
-    box.TextSize = 11
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    box.TextSize = 10
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
 
     box.FocusLost:Connect(function()
         local n = tonumber(box.Text)
@@ -554,14 +613,14 @@ end
 
 local function createButton(name, y, color, cb)
     local b = Instance.new("TextButton", container)
-    b.Size = UDim2.new(0.9, 0, 0, 28)
-    b.Position = UDim2.new(0.05, 0, 0, y)
+    b.Size = UDim2.new(1, -8, 0, 26)
+    b.Position = UDim2.new(0, 4, 0, y)
     b.BackgroundColor3 = color
     b.Text = name
     b.TextColor3 = Color3.fromRGB(255, 255, 255)
     b.Font = Enum.Font.GothamBold
-    b.TextSize = 11
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.TextSize = 10
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
     b.MouseButton1Click:Connect(cb)
     return b
 end
@@ -576,42 +635,40 @@ createToggle("Flight Mode", 5, function(s)
     if not s then setFlying(false) end
 end)
 
-createToggle("Invisibility", 40, function(s) applyInvisibility(s) end)
-createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
+createToggle("Invisibility", 35, function(s) applyInvisibility(s) end)
+createToggle("No Fall Damage", 65, function(s) noFallDamageEnabled = s end)
 
-createToggle("Noclip", 110, function(s)
+createToggle("Noclip", 95, function(s)
     noclipEnabled = s
     log("UI", "Noclip: " .. tostring(s))
 end)
 
-createToggle("Super Speed", 145, function(s)
+createToggle("Super Speed", 125, function(s)
     runSpeedEnabled = s
     log("UI", "Speed: " .. tostring(s))
-    if not s and humanoid then
-        humanoid.WalkSpeed = 16
-    end
+    if not s and humanoid then humanoid.WalkSpeed = 16 end
 end)
 
-createInput("Speed (max 15)", 180, DEFAULT_SPEED, function(v)
+createInput("Speed (max 15)", 155, DEFAULT_SPEED, function(v)
     if v > MAX_SPEED then v = MAX_SPEED end
     if v < 1 then v = 1 end
     runSpeedValue = v
     log("UI", "Speed value: " .. tostring(v))
 end)
 
-createToggle("Custom Jump", 215, function(s)
+createToggle("Custom Jump", 185, function(s)
     jumpEnabled = s
     log("UI", "Jump: " .. tostring(s))
 end)
 
-createInput("Jump (max 107)", 250, DEFAULT_JUMP, function(v)
+createInput("Jump (max 107)", 215, DEFAULT_JUMP, function(v)
     if v > MAX_JUMP_IMPULSE then v = MAX_JUMP_IMPULSE end
     if v < 1 then v = 1 end
     jumpPowerValue = v
     log("UI", "Jump value: " .. tostring(v))
 end)
 
-createToggle("Prompt Extender", 285, function(s)
+createToggle("Prompt Extender", 245, function(s)
     promptExtenderEnabled = s
     log("UI", "PromptExtender: " .. tostring(s))
     if s then
@@ -621,12 +678,12 @@ createToggle("Prompt Extender", 285, function(s)
     end
 end)
 
-createButton("TP to Spawn", 320, Color3.fromRGB(41, 128, 185), function()
+createButton("TP to Spawn", 275, Color3.fromRGB(41, 128, 185), function()
     log("UI", "TP to Spawn")
     doTeleport(getEntrySpawn())
 end)
 
-local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173), function()
+local saveBtn = createButton("Save Location", 305, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
     log("UI", "Saved: " .. tostring(rootPart.Position))
@@ -634,34 +691,29 @@ local saveBtn = createButton("Save Location", 357, Color3.fromRGB(142, 68, 173),
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
 end)
 
-createButton("TP to Saved", 394, Color3.fromRGB(39, 174, 96), function()
+createButton("TP to Saved", 335, Color3.fromRGB(39, 174, 96), function()
     log("UI", "TP to Saved")
     if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
-createButton("SAVE LOG", 431, Color3.fromRGB(200, 80, 80), function()
+createButton("SAVE LOG", 365, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
 
 minBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    if isMinimized then
-        mainFrame.Size = UDim2.new(0, 36, 0, 36)
-        container.Visible = false
-        title.Visible = false
-        minBtn.Size = UDim2.new(1, 0, 1, 0)
-        minBtn.Position = UDim2.new(0, 0, 0, 0)
-        minBtn.Text = "+"
-    else
-        mainFrame.Size = UDim2.new(0, 220, 0, 500)
-        container.Visible = true
-        title.Visible = true
-        minBtn.Size = UDim2.new(0, 26, 0, 26)
-        minBtn.Position = UDim2.new(1, -34, 0.5, -13)
-        minBtn.Text = "-"
-    end
+    mainFrame.Visible = false
+    floatBtn.Visible = true
 end)
+
+floatBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    floatBtn.Visible = false
+end)
+
+-- ==========================================
+-- JUMP INPUT
+-- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
     local now = os.clock()
@@ -707,6 +759,7 @@ local function setupCharacter(char)
     linearVelocity.VectorVelocity = Vector3.zero
 
     watchCharacterForInvisibility(char)
+    watchForCarryItems(char)
     if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
 
@@ -736,9 +789,10 @@ player.CharacterAdded:Connect(function(c)
     log("CHAR", "Respawn")
     isFlying = false
     isTPBusy = false
+    isCarryingEgg = false
     if linearVelocity then linearVelocity.MaxForce = 0 end
     originalTransparency = {}
     setupCharacter(c)
 end)
 
-print("V8.1 loaded. Speed: WalkSpeed 231.4 + per-frame CFrame. TP: 3 writes in one frame.")
+print("V8.2 loaded. UI right side. Speed + carry detection.")
