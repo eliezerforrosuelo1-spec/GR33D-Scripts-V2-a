@@ -2,7 +2,7 @@
 -- GR33D SCRIPTS V10.0 (COMPLETE & UPDATED)
 -- Speed: reads live treadmill WalkSpeed, adds bonus
 -- Fly: camera-relative via PlayerModule controls
--- TP: Ground Raycast + Server-Sync Anchored Step-TP
+-- TP: Ground Raycast + Faster Step-TP (Distance: 25, Wait: 0.015)
 -- UI: Right side
 -- ==========================================
 
@@ -332,7 +332,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- ADVANCED TELEPORT SYSTEM (SERVER-SYNC FIXED)
+-- ADVANCED TELEPORT SYSTEM (UPDATED SPEED)
 -- ==========================================
 
 local function getSafeGroundPosition(targetCFrame)
@@ -374,8 +374,7 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
         character:PivotTo(safeCFrame)
         task.wait(0.1)
     else
-        -- Step size capped at 15 studs per ~35ms step to stay under server movement caps
-        local stepDistance = 15
+        local stepDistance = 25
         local steps = math.max(math.floor(distance / stepDistance), 6)
         
         for i = 1, steps do
@@ -383,14 +382,14 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
             local alpha = i / steps
             local nextCFrame = startCFrame:Lerp(safeCFrame, alpha)
             character:PivotTo(nextCFrame)
-            task.wait(0.035) -- Delays step to allow server network buffer to register each frame
+            task.wait(0.015)
         end
     end
 
     -- Force exact destination position
     character:PivotTo(safeCFrame)
     
-    -- CRITICAL: Hold anchor briefly so the server registers the stationary final position
+    -- Hold anchor briefly so the server registers final position
     task.wait(0.3)
 
     -- Flush residual momentum before restoring server physics control
