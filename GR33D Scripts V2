@@ -1,8 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V8.9
--- Speed: fixed-step accel 850, cap 140, linear decel
--- TP: exact CFrame write, no offset, no CanCollide toggle
--- Spawn: RespawnLocation -> nearest SpawnLocation -> fallback
+-- GR33D SCRIPTS V9.0
+-- Speed: ADDITIVE to base walkspeed
+-- TP: Physics-state CFrame write (server-accepted)
+-- Spawn: RespawnLocation -> captured fallback -> nearest
 -- UI: right side
 -- ==========================================
 
@@ -43,7 +43,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V8.9 Starting ===")
+log("BOOT", "=== GR33D V9.0 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -51,14 +51,12 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
--- Speed — matches cheat log (change=30.7 per frame @ 36ms)
-local MAX_SPEED_INPUT   = 100         -- slider max
-local SPEED_MAX_BASE    = 140         -- input 100 -> 140 studs/s (peak mag=139.8)
-local DEFAULT_SPEED     = 100
+-- Speed is ADDITIVE: final_velocity = base_walkspeed + input_speed
+local MAX_SPEED_INPUT   = 200         -- slider max (additive)
+local DEFAULT_SPEED     = 50          -- default additive amount
 
-local SPEED_ACCEL       = 850         -- studs/s^2 ramp-up
-local SPEED_DECEL       = 850         -- studs/s^2 ramp-down (linear)
-local SPEED_MAX         = 140         -- current cap (updated by slider)
+local SPEED_ACCEL       = 850         -- studs/s^2 ramp
+local SPEED_DECEL       = 850         -- studs/s^2 decay
 
 -- Jump
 local MAX_JUMP_IMPULSE  = 107
@@ -70,6 +68,10 @@ local DOUBLE_TAP_WINDOW = 0.35
 local PROMPT_MAX_DISTANCE  = 50
 local PROMPT_HOLD_DURATION = 0
 local PROMPT_REQUIRES_LOS  = false
+
+-- TP mode: true = velocity-based (safe, slower)
+--          false = CFrame + Physics state (fast, may snap back)
+local USE_VELOCITY_TP   = false
 
 -- ==========================================
 -- STATE
@@ -85,7 +87,7 @@ local jumpEnabled           = false
 local promptExtenderEnabled = false
 local isMinimized           = false
 
-local runSpeedValue         = DEFAULT_SPEED
+local runSpeedValue         = DEFAULT_SPEED     -- additive amount
 local jumpPowerValue        = DEFAULT_JUMP
 
 local lastJumpTapTime       = 0
@@ -108,14 +110,6 @@ local isTPBusy              = false
 local trackedPrompts        = {}
 
 local speedVec              = Vector3.zero
-
-local validStates = {
-    [Enum.HumanoidStateType.Running]          = true,
-    [Enum.HumanoidStateType.RunningNoPhysics] = true,
-    [Enum.HumanoidStateType.Jumping]          = true,
-    [Enum.HumanoidStateType.Freefall]         = true,
-    [Enum.HumanoidStateType.Landed]           = true,
-}
 
 -- ==========================================
 -- INVISIBILITY
@@ -272,23 +266,17 @@ RunService.Stepped:Connect(function()
 end)
 
 -- ==========================================
--- SPEED (fixed-step accel — matches cheat log)
--- change=30.7 per frame @ 36ms -> 850 studs/s^2
+-- SPEED (ADDITIVE to base walkspeed)
 -- ==========================================
 
-local function resetSpeedVector()
-    speedVec = Vector3.zero
-    if rootPart then
-        rootPart.AssemblyLinearVelocity = Vector3.new(
-            0, rootPart.AssemblyLinearVelocity.Y, 0
-        )
-    end
-end
-
-RunService.Heartbeat:Connect(function(dt)
+RunService.Stepped:Connect(function(_, dt)
     if not rootPart or not humanoid then return end
 
-    if not validStates[humanoid:GetState()] then
+    local st = humanoid:GetState()
+    if st == Enum.HumanoidStateType.Dead
+        or st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.Climbing
+        or st == Enum.HumanoidStateType.Swimming then
         speedVec = Vector3.zero
         return
     end
@@ -297,28 +285,24 @@ RunService.Heartbeat:Connect(function(dt)
         return
     end
 
+    -- When speed is OFF: just clear our vector, don't touch velocity.
+    -- This lets the game's natural movement work normally.
     if not runSpeedEnabled or isFlying or isTPBusy then
-        -- Linear deceleration when disabled
-        if speedVec.Magnitude > 0.1 then
-            local step = SPEED_DECEL * dt
-            if speedVec.Magnitude <= step then
-                speedVec = Vector3.zero
-            else
-                speedVec = speedVec - speedVec.Unit * step
-            end
-            rootPart.AssemblyLinearVelocity = Vector3.new(
-                speedVec.X,
-                rootPart.AssemblyLinearVelocity.Y,
-                speedVec.Z
-            )
-        end
+        speedVec = Vector3.zero
         return
     end
 
+    -- Compute target speed: game's current WalkSpeed + our additive amount
+    local baseSpeed = humanoid.WalkSpeed
+    if baseSpeed < 1 then baseSpeed = 16 end       -- fallback if game sets 0
+    local targetSpeed = baseSpeed + runSpeedValue  -- ADDITIVE
+
     local moveDir = humanoid.MoveDirection
     if moveDir.Magnitude > 0.01 then
-        -- Accelerate toward moveDir at SPEED_ACCEL
-        local desired = moveDir.Unit * SPEED_MAX
+        -- We want the FINAL velocity to be (moveDir * targetSpeed).
+        -- The game is already applying (moveDir * baseSpeed) via its controller.
+        -- So we ADD the extra (moveDir * runSpeedValue) on top.
+        local desired = moveDir.Unit * runSpeedValue  -- only the BONUS
         local delta   = desired - speedVec
         local step    = SPEED_ACCEL * dt
 
@@ -328,7 +312,6 @@ RunService.Heartbeat:Connect(function(dt)
             speedVec = speedVec + delta.Unit * step
         end
     else
-        -- Linear deceleration when no input
         local step = SPEED_DECEL * dt
         if speedVec.Magnitude <= step then
             speedVec = Vector3.zero
@@ -337,24 +320,30 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    local yVel = math.clamp(
-        rootPart.AssemblyLinearVelocity.Y,
-        -MAX_SAFE_FALL,
-        MAX_SAFE_FALL
+    -- Write velocity: preserve existing horizontal + add our bonus
+    local curVel = rootPart.AssemblyLinearVelocity
+    local yVel   = math.clamp(curVel.Y, -MAX_SAFE_FALL, MAX_SAFE_FALL)
+
+    -- The game's controller sets horizontal to (moveDir * baseSpeed).
+    -- We add speedVec on top (which is moveDir * runSpeedValue).
+    -- To avoid double-applying, we compute: base contribution + our bonus.
+    local baseContribution = moveDir.Unit * baseSpeed * (moveDir.Magnitude > 0.01 and 1 or 0)
+    local finalHorizontal  = baseContribution + speedVec
+
+    -- Preserve Y, write final
+    rootPart.AssemblyLinearVelocity = Vector3.new(
+        finalHorizontal.X,
+        yVel,
+        finalHorizontal.Z
     )
-
-    rootPart.AssemblyLinearVelocity = Vector3.new(speedVec.X, yVel, speedVec.Z)
-
-    -- Don't let default WalkSpeed fight us
-    if humanoid.WalkSpeed ~= 16 then
-        humanoid.WalkSpeed = 16
-    end
 
     local now = os.clock()
     if now - lastSpeedLogTime > 1 then
         lastSpeedLogTime = now
-        log("SPEED", string.format("vel=%.1f | pos=(%.1f, %.1f, %.1f)",
-            speedVec.Magnitude,
+        log("SPEED", string.format(
+            "base=%.1f add=%.1f final=%.1f | pos=(%.1f, %.1f, %.1f)",
+            baseSpeed, speedVec.Magnitude,
+            (finalHorizontal + Vector3.new(0, yVel, 0)).Magnitude,
             rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     end
 end)
@@ -378,8 +367,47 @@ local function applyJump()
 end
 
 -- ==========================================
--- TELEPORT (exact CFrame write — matches cheat)
+-- TELEPORT
 -- ==========================================
+
+local function doTeleportCFrame(targetCFrame)
+    -- Option B: CFrame write + Physics state (instant, may snap back)
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    rootPart.AssemblyLinearVelocity  = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    rootPart.CFrame = targetCFrame
+
+    rootPart.AssemblyLinearVelocity  = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    task.defer(function()
+        if humanoid and humanoid.Parent then
+            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+        end
+    end)
+end
+
+local function doTeleportVelocity(targetCFrame)
+    -- Option A: velocity-based (server-accepted, slower but reliable)
+    local targetPos = targetCFrame.Position
+    local MAX_TP_SPEED = 700
+    local startTime = os.clock()
+    local timeout   = 15
+
+    while (targetPos - rootPart.Position).Magnitude > 5 do
+        if os.clock() - startTime > timeout then break end
+        if not rootPart or not rootPart.Parent then break end
+        task.wait()
+        local remaining = targetPos - rootPart.Position
+        if remaining.Magnitude > 5 then
+            rootPart.AssemblyLinearVelocity = remaining.Unit * MAX_TP_SPEED
+        end
+    end
+
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+end
 
 local function doTeleport(targetCFrame)
     if not rootPart or not humanoid or not targetCFrame then return end
@@ -389,29 +417,23 @@ local function doTeleport(targetCFrame)
     local targetPos = targetCFrame.Position
     local distance  = (targetPos - rootPart.Position).Magnitude
 
-    log("TP", string.format("doTeleport dist=%.1f", distance))
+    log("TP", string.format("doTeleport dist=%.1f mode=%s",
+        distance, USE_VELOCITY_TP and "velocity" or "cframe"))
 
     if distance < 5 then
         isTPBusy = false
         return
     end
 
-    -- Preserve fall-damage guard for 1s so we don't die on landing
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- Zero velocity BEFORE
-    rootPart.AssemblyLinearVelocity  = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
+    if USE_VELOCITY_TP then
+        doTeleportVelocity(targetCFrame)
+    else
+        doTeleportCFrame(targetCFrame)
+    end
 
-    -- Exact CFrame write — no +Y offset, no CanCollide toggle
-    rootPart.CFrame = targetCFrame
-
-    -- Zero velocity AFTER
-    rootPart.AssemblyLinearVelocity  = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-
-    -- Clear speed vector so the ramp starts fresh
     speedVec = Vector3.zero
 
     log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
@@ -425,39 +447,39 @@ local function doTeleport(targetCFrame)
 end
 
 -- ==========================================
--- SPAWN LOOKUP (RespawnLocation -> nearest -> fallback)
+-- SPAWN LOOKUP
 -- ==========================================
 
 local function getEntrySpawn()
-    -- 1. If the game set a RespawnLocation on the player, use it
+    -- 1. RespawnLocation set by the game
     if player.RespawnLocation then
         return player.RespawnLocation.CFrame
     end
 
-    -- 2. Collect all enabled SpawnLocations
+    -- 2. Captured fallback (the character's initial CFrame)
+    if realSpawnCFrame then
+        return realSpawnCFrame
+    end
+
+    -- 3. Nearest enabled SpawnLocation (last resort)
     local spawns = {}
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
             table.insert(spawns, obj)
         end
     end
-
     if #spawns == 0 then
-        return realSpawnCFrame or (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
+        return (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
     end
 
-    -- 3. Pick the nearest one to the player's current position
     if rootPart then
         local nearest, bestDist = spawns[1], math.huge
         for _, sp in ipairs(spawns) do
             local d = (sp.Position - rootPart.Position).Magnitude
-            if d < bestDist then
-                nearest, bestDist = sp, d
-            end
+            if d < bestDist then nearest, bestDist = sp, d end
         end
         return nearest.CFrame
     end
-
     return spawns[1].CFrame
 end
 
@@ -516,7 +538,7 @@ screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 200, 0, 400)
+mainFrame.Size = UDim2.new(0, 210, 0, 420)
 mainFrame.AnchorPoint = Vector2.new(1, 0.5)
 mainFrame.Position = UDim2.new(1, -10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
@@ -540,7 +562,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "Menu"
+title.Text = "GR33D v9.0"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -589,7 +611,7 @@ container.Size = UDim2.new(1, 0, 1, -40)
 container.Position = UDim2.new(0, 0, 0, 40)
 container.BackgroundTransparency = 1
 container.BorderSizePixel = 0
-container.CanvasSize = UDim2.new(0, 0, 0, 640)
+container.CanvasSize = UDim2.new(0, 0, 0, 700)
 container.ScrollBarThickness = 3
 container.ScrollBarImageColor3 = Color3.fromRGB(60, 60, 75)
 
@@ -715,18 +737,16 @@ createToggle("Super Speed", 125, function(s)
     runSpeedEnabled = s
     log("UI", "Speed: " .. tostring(s))
     if not s then
-        resetSpeedVector()
+        speedVec = Vector3.zero
     end
 end)
 
-createInput("Speed (max 100)", 155, DEFAULT_SPEED, function(v, box)
+createInput("Speed + (max 200)", 155, DEFAULT_SPEED, function(v, box)
     if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
-    if v < 1 then v = 1 end
+    if v < 0 then v = 0 end
     runSpeedValue = v
-    -- Map 1..100 to 1.4..140 studs/s
-    SPEED_MAX = (v / MAX_SPEED_INPUT) * SPEED_MAX_BASE
     if box then box.Text = tostring(v) end
-    log("UI", string.format("Speed input=%d -> max=%.1f studs/s", v, SPEED_MAX))
+    log("UI", string.format("Speed ADD = %d (final = base + %d)", v, v))
 end)
 
 createToggle("Custom Jump", 185, function(s)
@@ -770,7 +790,26 @@ createButton("TP to Saved", 335, Color3.fromRGB(39, 174, 96), function()
     if savedMapCFrame then doTeleport(savedMapCFrame) end
 end)
 
-createButton("SAVE LOG", 365, Color3.fromRGB(200, 80, 80), function()
+-- TP mode toggle (Option A vs Option B)
+local tpModeLabel = Instance.new("TextLabel", container)
+tpModeLabel.Size = UDim2.new(1, -8, 0, 16)
+tpModeLabel.Position = UDim2.new(0, 4, 0, 363)
+tpModeLabel.BackgroundTransparency = 1
+tpModeLabel.Text = "TP mode: CFrame (fast)"
+tpModeLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+tpModeLabel.Font = Enum.Font.GothamMedium
+tpModeLabel.TextSize = 9
+tpModeLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+createButton("Toggle TP Mode", 380, Color3.fromRGB(80, 80, 100), function()
+    USE_VELOCITY_TP = not USE_VELOCITY_TP
+    tpModeLabel.Text = USE_VELOCITY_TP
+        and "TP mode: Velocity (safe, slow)"
+        or  "TP mode: CFrame (fast)"
+    log("UI", "TP mode: " .. (USE_VELOCITY_TP and "velocity" or "cframe"))
+end)
+
+createButton("SAVE LOG", 410, Color3.fromRGB(200, 80, 80), function()
     saveLogToFile()
     log("LOGGER", "Log saved")
 end)
@@ -833,7 +872,7 @@ local function setupCharacter(char)
     linearVelocity.MaxForce = 0
     linearVelocity.VectorVelocity = Vector3.zero
 
-    -- Capture fallback CFrame once (never used if a SpawnLocation exists)
+    -- Capture the fallback spawn on the very first setup only
     if not firstSpawnCaptured and rootPart then
         realSpawnCFrame = rootPart.CFrame
         firstSpawnCaptured = true
@@ -875,4 +914,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V8.9 loaded. Fixed-step speed (850 accel, cap 140). Exact CFrame TP.")
+print("V9.0 loaded. Additive speed. CFrame/velocity TP modes.")
