@@ -1,8 +1,8 @@
 -- ==========================================
--- GR33D SCRIPTS V10.0
+-- GR33D SCRIPTS V10.0 (FIXED)
 -- Speed: reads live treadmill WalkSpeed, adds bonus
 -- Fly: camera-relative via PlayerModule controls
--- TP: anchored pivot + velocity zero (server-accepted)
+-- TP: stabilized pivot + multi-frame velocity reset
 -- UI: right side
 -- ==========================================
 
@@ -51,7 +51,6 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
--- Speed: additive bonus on top of treadmill's live WalkSpeed
 local MAX_SPEED_INPUT   = 200
 local DEFAULT_SPEED     = 100
 
@@ -284,11 +283,9 @@ end)
 
 -- ==========================================
 -- SPEED (treadmill-aware, WalkSpeed add)
--- Reads live WalkSpeed -> treadmill base
--- Writes base + bonus back to WalkSpeed
 -- ==========================================
 
-RunService.Stepped:Connect(function(_, dt)
+RunService.Stepped:Connect(function()
     if not humanoid or not rootPart then return end
 
     local st = humanoid:GetState()
@@ -302,7 +299,6 @@ RunService.Stepped:Connect(function(_, dt)
 
     if not runSpeedEnabled or isFlying or isTPBusy then
         if wasSpeedEnabled then
-            -- Just toggled off -> restore base
             humanoid.WalkSpeed = lastBaseSpeed
             wasSpeedEnabled = false
         end
@@ -311,26 +307,17 @@ RunService.Stepped:Connect(function(_, dt)
 
     wasSpeedEnabled = true
 
-    -- Detect treadmill update: if current WalkSpeed != what we last wrote,
-    -- the treadmill changed it. Adopt that as the new base.
+    -- Detect treadmill base speed changes dynamically
     local currentWS = humanoid.WalkSpeed
-    if math.abs(currentWS - lastBoostedWS) > 0.5 then
+    if math.abs(currentWS - lastBoostedWS) > 0.1 and currentWS ~= (lastBaseSpeed + runSpeedValue) then
         lastBaseSpeed = currentWS
     end
 
-    -- Write base + bonus back to WalkSpeed
-    local boostedWS = lastBaseSpeed + runSpeedValue
-    humanoid.WalkSpeed = boostedWS
-    lastBoostedWS = boostedWS
-
-    -- Optional: small velocity push via Lerp for extra oomph
-    local moveDir = humanoid.MoveDirection
-    if moveDir.Magnitude > 0.01 then
-        local desiredVel = moveDir.Unit * boostedWS
-        local currentVel = rootPart.AssemblyLinearVelocity
-        local newVel = currentVel:Lerp(desiredVel, 0.35)
-        newVel = Vector3.new(newVel.X, currentVel.Y, newVel.Z)
-        rootPart.AssemblyLinearVelocity = newVel
+    -- Write base + bonus back to WalkSpeed cleanly
+    local targetSpeed = lastBaseSpeed + runSpeedValue
+    if humanoid.WalkSpeed ~= targetSpeed then
+        humanoid.WalkSpeed = targetSpeed
+        lastBoostedWS = targetSpeed
     end
 
     local now = os.clock()
@@ -362,7 +349,7 @@ local function applyJump()
 end
 
 -- ==========================================
--- TELEPORT (anchored pivot — server-accepted)
+-- TELEPORT (clean pivot + multi-frame velocity zero)
 -- ==========================================
 
 local function absoluteTeleport(targetCFrame)
@@ -371,48 +358,49 @@ local function absoluteTeleport(targetCFrame)
     isTPBusy = true
 
     local targetPos = targetCFrame.Position + Vector3.new(0, 3, 0)
-    local distance  = (targetPos - rootPart.Position).Magnitude
+    local targetRot = targetCFrame.Rotation
+    local finalCFrame = CFrame.new(targetPos) * targetRot
 
-    log("TP", string.format("doTeleport dist=%.1f", distance))
-
-    if distance < 5 then
-        isTPBusy = false
-        return
-    end
+    log("TP", string.format("doTeleport dist=%.1f", (targetPos - rootPart.Position).Magnitude))
 
     local wasNoFall = noFallDamageEnabled
     noFallDamageEnabled = true
 
-    -- Unseat if seated
+    -- Unseat player safely
     humanoid.Sit = false
     humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 
-    -- Zero velocity, anchor, pivot, unanchor
-    rootPart.AssemblyLinearVelocity  = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    rootPart.Anchored = true
+    -- Disable AutoRotate during TP to eliminate angular spin momentum
+    local oldAutoRotate = humanoid.AutoRotate
+    humanoid.AutoRotate = false
 
-    character:PivotTo(CFrame.new(targetPos) * (targetCFrame - targetCFrame.Position))
+    -- Pivot character
+    character:PivotTo(finalCFrame)
 
-    task.delay(0.04, function()
-        if rootPart and rootPart.Parent then
-            rootPart.AssemblyLinearVelocity  = Vector3.zero
-            rootPart.AssemblyAngularVelocity = Vector3.zero
-            rootPart.Anchored = false
+    -- Multi-frame velocity zeroing loop to prevent physics recoil & spinning
+    task.spawn(function()
+        for _ = 1, 5 do
+            if rootPart and rootPart.Parent then
+                rootPart.AssemblyLinearVelocity = Vector3.zero
+                rootPart.AssemblyAngularVelocity = Vector3.zero
+            end
+            RunService.PostSimulation:Wait()
         end
+
         if humanoid and humanoid.Parent then
+            humanoid.AutoRotate = oldAutoRotate
             humanoid:ChangeState(Enum.HumanoidStateType.Running)
         end
+
+        log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
+            rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
+
+        task.delay(0.5, function()
+            noFallDamageEnabled = wasNoFall
+        end)
+
+        isTPBusy = false
     end)
-
-    log("TP", string.format("Arrived at (%.1f, %.1f, %.1f)",
-        rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
-
-    task.delay(1.0, function()
-        noFallDamageEnabled = wasNoFall
-    end)
-
-    isTPBusy = false
 end
 
 -- ==========================================
@@ -423,13 +411,14 @@ local function getEntrySpawn()
     if player.RespawnLocation then
         return player.RespawnLocation.CFrame
     end
-    if realSpawnCFrame then
-        return realSpawnCFrame
-    end
+    -- Prioritize Workspace SpawnLocation over static bootsnap
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj:IsA("SpawnLocation") and obj.Enabled then
             return obj.CFrame
         end
+    end
+    if realSpawnCFrame then
+        return realSpawnCFrame
     end
     return (rootPart and rootPart.CFrame) or CFrame.new(0, 5, 0)
 end
@@ -465,13 +454,11 @@ RunService.RenderStepped:Connect(function()
     -- Fly: camera-relative movement
     if isFlying and linearVelocity and humanoid and rootPart then
         if humanoid.FloorMaterial ~= Enum.Material.Air and humanoid.MoveDirection.Magnitude < 0.1 then
-            -- Touch down and not moving -> exit flight
             setFlying(false)
         elseif controls then
             local moveVector = controls:GetMoveVector()
             if moveVector.Magnitude > 0 then
                 local camCFrame = camera.CFrame
-                -- RightVector * X - LookVector * Z (camera-relative)
                 local flightDir = (camCFrame.RightVector * moveVector.X)
                                 - (camCFrame.LookVector * moveVector.Z)
                 linearVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
