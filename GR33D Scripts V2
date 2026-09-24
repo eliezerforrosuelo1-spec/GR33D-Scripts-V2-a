@@ -782,12 +782,9 @@ local function makeDraggable(gui, constrainToScreen)
     end
 
     gui.Active = true
+
     gui.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            startInputPos = input.Position
-            startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
-        elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
             startInputPos = input.Position
             startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
@@ -795,13 +792,13 @@ local function makeDraggable(gui, constrainToScreen)
     end)
 
     gui.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        if dragging and input.UserInputType == Enum.UserInputType.Touch then
             updateDrag(input)
         end
     end)
 
     gui.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
             startInputPos = nil
             startGuiPos = nil
@@ -824,7 +821,6 @@ mainFrame.AnchorPoint = Vector2.new(1, 0.5)
 mainFrame.Position = UDim2.new(1, -10, 0.5, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
-mainFrame.Draggable = true
 mainFrame.Parent = screenGui
 makeDraggable(mainFrame, true)
 
@@ -1057,12 +1053,12 @@ createButton("SAVE LOG", 455, Color3.fromRGB(200, 80, 80), function()
     log("LOGGER", "Log saved")
 end)
 
-minBtn.MouseButton1Click:Connect(function()
+minBtn.Activated:Connect(function()
     mainFrame.Visible = false
     floatBtn.Visible = true
 end)
 
-floatBtn.MouseButton1Click:Connect(function()
+floatBtn.Activated:Connect(function()
     mainFrame.Visible = true
     floatBtn.Visible = false
 end)
