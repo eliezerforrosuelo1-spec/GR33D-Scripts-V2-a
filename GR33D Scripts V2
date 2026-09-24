@@ -396,12 +396,12 @@ RunService.RenderStepped:Connect(function(dt)
                 if moveDir.Magnitude > 0 then
                     local steer = Vector3.new(moveDir.X, 0, moveDir.Z)
                     local desiredSpeed = math.max(runSpeedValue, 1)
-                    local targetVel = steer * (desiredSpeed * 12)
-                    speedLinearVelocity.MaxForce = 750000
+                    local targetVel = steer * (desiredSpeed * 15)
+                    speedLinearVelocity.MaxForce = 1000000
                     speedLinearVelocity.VectorVelocity = targetVel
                     rootPart.AssemblyLinearVelocity = Vector3.zero
                     rootPart.AssemblyAngularVelocity = Vector3.zero
-                    rootPart.CFrame = rootPart.CFrame + (steer * math.max(0.4, desiredSpeed * 0.12) * dt * 60)
+                    rootPart.CFrame = rootPart.CFrame + (steer * math.max(1.0, desiredSpeed * 0.18) * dt * 60)
                     pcall(function()
                         humanoid:Move(Vector3.zero, false)
                     end)
@@ -488,8 +488,8 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
         character:PivotTo(safeCFrame)
         task.wait(0.02)
     else
-        local stepDistance = 30
-        local stepWait = 0.01
+        local stepDistance = 25
+        local stepWait = 0.008
         local steps = math.max(math.ceil(distance / stepDistance), 4)
 
         for i = 1, steps do
