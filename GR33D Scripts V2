@@ -52,11 +52,18 @@ log("BOOT", "Player: " .. player.Name)
 -- CONFIG
 -- ==========================================
 
-local MAX_SPEED_INPUT   = 1000
-local DEFAULT_SPEED     = 100
+local MAX_SPEED_INPUT     = 1000
+local DEFAULT_SPEED       = 100
+local MAX_EFFECTIVE_SPEED = 320
+local RAPID_DASH_MIN_STEP = 2.2
+local RAPID_DASH_MAX_STEP = 10
+local RAPID_DASH_DAMPING  = 0.9
 
 -- Fly
-local FLY_SPEED         = 120       -- studs/s
+local DEFAULT_FLY_SPEED = 26
+local MIN_FLY_SPEED     = 5
+local MAX_FLY_SPEED     = 120
+local FLY_SPEED         = DEFAULT_FLY_SPEED
 local DOUBLE_TAP_WINDOW = 0.35
 
 -- Jump
@@ -75,7 +82,6 @@ local PROMPT_REQUIRES_LOS  = false
 
 local flyToggleEnabled      = false
 local isFlying              = false
-local invisibleEnabled      = false
 local noFallDamageEnabled   = false
 local noclipEnabled         = false
 local runSpeedEnabled       = false
@@ -89,6 +95,10 @@ local teleportRiskyMode     = false
 local maxFrameStep          = 10
 local originalWalkSpeed     = 16
 
+local function shouldUseInstantTeleport()
+    return teleportRiskyMode == true
+end
+
 local lastJumpTapTime       = 0
 local lastJumpReqTime       = 0
 local realSpawnCFrame       = nil
@@ -99,11 +109,7 @@ local character, rootPart, humanoid
 local attachment, linearVelocity
 local speedAttachment, speedLinearVelocity
 
-local originalTransparency      = {}
 local originalCollision         = {}
-local invisibilityHookInstalled = false
-local invisConnection           = nil
-local oldNewIndex               = nil
 
 local isTPBusy              = false
 local trackedPrompts        = {}
@@ -118,6 +124,7 @@ local function zeroCharacterMotion()
     rootPart.AssemblyAngularVelocity = Vector3.zero
     if humanoid then
         humanoid.AutoRotate = false
+        humanoid.WalkSpeed = 0
         pcall(function()
             humanoid:Move(Vector3.zero, false)
         end)
@@ -132,6 +139,20 @@ local function neutralizeCharacterPhysics()
         humanoid.PlatformStand = true
         humanoid.AutoRotate = false
         humanoid.WalkSpeed = 0
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+        end)
+    end
+end
+
+local function lockRootToStableState()
+    if not rootPart or not rootPart.Parent then return end
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+    if humanoid then
+        humanoid.WalkSpeed = 0
+        humanoid.AutoRotate = false
+        humanoid.Sit = false
         pcall(function()
             humanoid:Move(Vector3.zero, false)
         end)
@@ -154,14 +175,26 @@ local function freezeCharacterForTeleport()
     zeroCharacterMotion()
 end
 
-local function releaseCharacterAfterTeleport()
+local function releaseCharacterAfterTeleport(restoreSpeedEnabled)
     if not humanoid or not rootPart then return end
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
     rootPart.Anchored = false
     humanoid.PlatformStand = false
     humanoid.AutoRotate = true
-    humanoid.WalkSpeed = originalWalkSpeed
+
+    if speedLinearVelocity then
+        speedLinearVelocity.MaxForce = 0
+        speedLinearVelocity.VectorVelocity = Vector3.zero
+    end
+
+    if character and rootPart then
+        character:PivotTo(rootPart.CFrame)
+    end
+
+    runSpeedEnabled = restoreSpeedEnabled == true
+    humanoid.WalkSpeed = 0
+    humanoid.AutoRotate = true
 end
 
 local function logPhysicsSnapshot(label)
@@ -212,81 +245,34 @@ pcall(function()
 end)
 
 -- ==========================================
--- INVISIBILITY
--- ==========================================
-
-local function installInvisibilityHook()
-    if invisibilityHookInstalled then return end
-    invisibilityHookInstalled = true
-    pcall(function()
-        local mt = getrawmetatable(game)
-        oldNewIndex = hookfunction(mt.__newindex, newcclosure(function(t, k, v)
-            if not checkcaller() and typeof(t) == "Instance" and t:IsA("BasePart") then
-                local char = player.Character
-                if char and t:IsDescendantOf(char) and invisibleEnabled then
-                    if k == "Transparency" and v < 1 then return end
-                    if k == "LocalTransparencyModifier" and v < 1 then return end
-                end
-            end
-            return oldNewIndex(t, k, v)
-        end))
-    end)
-end
-
-local function applyInvisibility(state)
-    invisibleEnabled = state
-    log("INVIS", "Invisibility: " .. tostring(state))
-    if not character then return end
-    if state then
-        installInvisibilityHook()
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") or part:IsA("Decal") then
-                if not originalTransparency[part] then
-                    originalTransparency[part] = part.Transparency
-                end
-                part.Transparency = 1
-                part.LocalTransparencyModifier = 1
-            end
-        end
-    else
-        for part, orig in pairs(originalTransparency) do
-            if part and part.Parent then
-                part.Transparency = orig
-                part.LocalTransparencyModifier = 0
-            end
-        end
-        originalTransparency = {}
-    end
-end
-
-local function watchCharacterForInvisibility(char)
-    if invisConnection then invisConnection:Disconnect() end
-    invisConnection = char.DescendantAdded:Connect(function(desc)
-        if invisibleEnabled and (desc:IsA("BasePart") or desc:IsA("Decal")) then
-            originalTransparency[desc] = desc.Transparency
-            desc.Transparency = 1
-            desc.LocalTransparencyModifier = 1
-        end
-    end)
-end
-
--- ==========================================
 -- PROMPT EXTENDER
 -- ==========================================
 
 local function applyPromptExtender(prompt)
     if not prompt or not prompt:IsA("ProximityPrompt") then return end
-    if trackedPrompts[prompt] then return end
-    trackedPrompts[prompt] = {
-        MaxActivationDistance = prompt.MaxActivationDistance,
-        HoldDuration          = prompt.HoldDuration,
-        RequiresLineOfSight   = prompt.RequiresLineOfSight,
-    }
-    pcall(function()
-        prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
-        prompt.HoldDuration          = PROMPT_HOLD_DURATION
-        prompt.RequiresLineOfSight   = PROMPT_REQUIRES_LOS
-    end)
+
+    local playerRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    local playerPos = playerRoot and playerRoot.Position or Vector3.zero
+    local promptPos = prompt.WorldPosition or prompt.Parent and prompt.Parent.Position or playerPos
+    local dist = (promptPos - playerPos).Magnitude
+
+    if not trackedPrompts[prompt] then
+        trackedPrompts[prompt] = {
+            MaxActivationDistance = prompt.MaxActivationDistance,
+            HoldDuration          = prompt.HoldDuration,
+            RequiresLineOfSight   = prompt.RequiresLineOfSight,
+        }
+    end
+
+    if dist <= PROMPT_MAX_DISTANCE + 10 then
+        pcall(function()
+            prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
+            prompt.HoldDuration = PROMPT_HOLD_DURATION
+            prompt.RequiresLineOfSight = PROMPT_REQUIRES_LOS
+        end)
+    else
+        removePromptExtender(prompt)
+    end
 end
 
 local function removePromptExtender(prompt)
@@ -327,6 +313,15 @@ workspace.DescendantAdded:Connect(function(obj)
     end
 end)
 
+local function refreshPromptExtender()
+    if not promptExtenderEnabled then return end
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            applyPromptExtender(obj)
+        end
+    end
+end
+
 -- ==========================================
 -- NOCLIP
 -- ==========================================
@@ -340,16 +335,24 @@ local function applyNoclip(state)
                 if originalCollision[part] == nil then
                     originalCollision[part] = part.CanCollide
                 end
-                part.CanCollide = false
+                if part.CanCollide then
+                    pcall(function()
+                        part.CanCollide = false
+                    end)
+                end
             end
         end
     else
-        for part, orig in pairs(originalCollision) do
-            if part and part.Parent then
-                part.CanCollide = orig
+        task.defer(function()
+            for part, orig in pairs(originalCollision) do
+                if part and part.Parent then
+                    pcall(function()
+                        part.CanCollide = orig
+                    end)
+                end
             end
-        end
-        originalCollision = {}
+            originalCollision = {}
+        end)
     end
 end
 
@@ -369,14 +372,66 @@ end)
 -- SPEED (CFrame Offset - Anti-Rubberband)
 -- ==========================================
 
+local function restoreNormalMovementState()
+    if not humanoid then return end
+    humanoid.AutoRotate = true
+    humanoid.WalkSpeed = originalWalkSpeed
+    if rootPart then
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+    end
+    if speedLinearVelocity then
+        speedLinearVelocity.MaxForce = 0
+        speedLinearVelocity.VectorVelocity = Vector3.zero
+    end
+end
+
+local function applyRapidDashStep(moveDir, dt)
+    if not rootPart or not humanoid then return end
+    local steer = Vector3.new(moveDir.X, 0, moveDir.Z)
+    if steer.Magnitude <= 0.01 then return end
+
+    local clampedSpeed = math.clamp(runSpeedValue, 0, MAX_SPEED_INPUT)
+    local speedRatio = clampedSpeed / MAX_SPEED_INPUT
+    local effectiveSpeed = 85 + (speedRatio * MAX_EFFECTIVE_SPEED)
+
+    local stepDistance = math.clamp((effectiveSpeed * dt * RAPID_DASH_DAMPING), RAPID_DASH_MIN_STEP, RAPID_DASH_MAX_STEP)
+    local moveVector = steer.Unit * stepDistance
+
+    rootPart.CFrame = rootPart.CFrame + moveVector
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    if speedLinearVelocity then
+        speedLinearVelocity.MaxForce = 0
+        speedLinearVelocity.VectorVelocity = Vector3.zero
+    end
+
+    humanoid.WalkSpeed = 0
+    humanoid.AutoRotate = false
+    pcall(function()
+        humanoid:Move(Vector3.zero, false)
+    end)
+end
+
 RunService.RenderStepped:Connect(function(dt)
     if not humanoid or not rootPart then return end
 
+    if not runSpeedEnabled then
+        if observeCheatMode then
+            startCheatObserver()
+        end
+        return
+    end
+
     if speedLinearVelocity then
-        if not runSpeedEnabled or isFlying or isTPBusy then
+        if isFlying or isTPBusy then
             speedLinearVelocity.MaxForce = 0
             speedLinearVelocity.VectorVelocity = Vector3.zero
-            humanoid.AutoRotate = autoRotateWasEnabled
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+            humanoid.WalkSpeed = 0
+            humanoid.AutoRotate = false
         else
             local st = humanoid:GetState()
             if st == Enum.HumanoidStateType.Dead
@@ -386,7 +441,10 @@ RunService.RenderStepped:Connect(function(dt)
                 or humanoid.Sit then
                 speedLinearVelocity.MaxForce = 0
                 speedLinearVelocity.VectorVelocity = Vector3.zero
-                humanoid.AutoRotate = autoRotateWasEnabled
+                rootPart.AssemblyLinearVelocity = Vector3.zero
+                rootPart.AssemblyAngularVelocity = Vector3.zero
+                humanoid.WalkSpeed = 0
+                humanoid.AutoRotate = false
             else
                 humanoid.WalkSpeed = 0
                 humanoid.AutoRotate = false
@@ -394,23 +452,16 @@ RunService.RenderStepped:Connect(function(dt)
 
                 local moveDir = humanoid.MoveDirection
                 if moveDir.Magnitude > 0 then
-                    local steer = Vector3.new(moveDir.X, 0, moveDir.Z)
-                    local desiredSpeed = math.max(runSpeedValue, 1)
-                    local targetVel = steer * (desiredSpeed * 15)
-                    speedLinearVelocity.MaxForce = 1000000
-                    speedLinearVelocity.VectorVelocity = targetVel
-                    rootPart.AssemblyLinearVelocity = Vector3.zero
-                    rootPart.AssemblyAngularVelocity = Vector3.zero
-                    rootPart.CFrame = rootPart.CFrame + (steer * math.max(1.0, desiredSpeed * 0.18) * dt * 60)
-                    pcall(function()
-                        humanoid:Move(Vector3.zero, false)
-                    end)
+                    applyRapidDashStep(moveDir, dt)
+
                     if observeCheatMode then
                         logPhysicsSnapshot("SPEED_MOVE")
                     end
                 else
                     speedLinearVelocity.MaxForce = 0
                     speedLinearVelocity.VectorVelocity = Vector3.zero
+                    rootPart.AssemblyLinearVelocity = Vector3.zero
+                    rootPart.AssemblyAngularVelocity = Vector3.zero
                 end
             end
         end
@@ -429,8 +480,13 @@ local function applyJump()
     if not jumpEnabled or not rootPart or not humanoid then return end
 
     local state = humanoid:GetState()
-    if state == Enum.HumanoidStateType.Freefall or state == Enum.HumanoidStateType.FallingDown then 
-        return 
+    if state == Enum.HumanoidStateType.Dead
+        or state == Enum.HumanoidStateType.Ragdoll
+        or state == Enum.HumanoidStateType.Freefall
+        or state == Enum.HumanoidStateType.FallingDown
+        or state == Enum.HumanoidStateType.Swimming
+        or state == Enum.HumanoidStateType.Climbing then
+        return
     end
 
     if os.clock() - lastJumpReqTime < 0.15 then return end
@@ -438,10 +494,11 @@ local function applyJump()
 
     humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
     local impulse = math.min(jumpPowerValue, MAX_JUMP_IMPULSE)
+    local vel = rootPart.AssemblyLinearVelocity
     rootPart.AssemblyLinearVelocity = Vector3.new(
-        rootPart.AssemblyLinearVelocity.X,
+        vel.X,
         impulse,
-        rootPart.AssemblyLinearVelocity.Z
+        vel.Z
     )
 end
 
@@ -469,10 +526,17 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
     if isTPBusy then return end
     isTPBusy = true
 
+    local wasRunSpeedEnabled = runSpeedEnabled
+    runSpeedEnabled = false
+    if speedLinearVelocity then
+        speedLinearVelocity.MaxForce = 0
+        speedLinearVelocity.VectorVelocity = Vector3.zero
+    end
+
     local safeCFrame = getSafeGroundPosition(targetCFrame)
     local startCFrame = rootPart.CFrame
     local distance = (safeCFrame.Position - startCFrame.Position).Magnitude
-    local riskyMode = teleportRiskyMode or (useInterpolation == false)
+    local riskyMode = shouldUseInstantTeleport() or (useInterpolation == false)
 
     log("TP", string.format("Starting TP | Mode: %s | Distance: %.1f studs | Risky: %s",
         riskyMode and "Risky" or "Safe", distance, tostring(riskyMode)))
@@ -486,10 +550,12 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
 
     if riskyMode then
         character:PivotTo(safeCFrame)
-        task.wait(0.02)
+        rootPart.AssemblyLinearVelocity = Vector3.zero
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        task.wait(0.03)
     else
-        local stepDistance = 25
-        local stepWait = 0.008
+        local stepDistance = 16
+        local stepWait = 0.012
         local steps = math.max(math.ceil(distance / stepDistance), 4)
 
         for i = 1, steps do
@@ -497,7 +563,9 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
             local alpha = i / steps
             local nextCFrame = startCFrame:Lerp(safeCFrame, alpha)
             character:PivotTo(nextCFrame)
-            zeroCharacterMotion()
+            rootPart.AssemblyLinearVelocity = Vector3.zero
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+            lockRootToStableState()
             task.wait(stepWait)
         end
     end
@@ -506,37 +574,17 @@ local function absoluteTeleport(targetCFrame, useInterpolation)
     rootPart.CFrame = safeCFrame
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
+    lockRootToStableState()
     task.wait(0.04)
 
     if observeCheatMode then
         logPhysicsSnapshot("TP_AFTER")
     end
 
-    task.spawn(function()
-        for _ = 1, 12 do
-            if rootPart and rootPart.Parent then
-                rootPart.CFrame = safeCFrame
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                rootPart.AssemblyAngularVelocity = Vector3.zero
-                if humanoid then
-                    humanoid.WalkSpeed = 0
-                    humanoid.AutoRotate = false
-                    pcall(function()
-                        humanoid:Move(Vector3.zero, false)
-                    end)
-                end
-            end
-            task.wait(0.035)
-        end
-
-        releaseCharacterAfterTeleport()
-        task.delay(0.5, function()
-            noFallDamageEnabled = wasNoFall
-        end)
-
-        task.delay(0.7, function()
-            isTPBusy = false
-        end)
+    releaseCharacterAfterTeleport(wasRunSpeedEnabled)
+    task.delay(0.2, function()
+        noFallDamageEnabled = wasNoFall
+        isTPBusy = false
     end)
 end
 
@@ -578,16 +626,58 @@ local function setFlying(state)
 
     if isFlying then
         linearVelocity.MaxForce = 100000
-        humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        linearVelocity.VectorVelocity = Vector3.zero
+        humanoid.AutoRotate = false
+        if humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+            humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+        end
         log("FLY", "Flight ON")
     else
         linearVelocity.MaxForce = 0
         linearVelocity.VectorVelocity = Vector3.zero
-        if humanoid.FloorMaterial ~= Enum.Material.Air then
-            humanoid:ChangeState(Enum.HumanoidStateType.Running)
+
+        local currentVel = rootPart.AssemblyLinearVelocity
+        rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, 0, currentVel.Z)
+        rootPart.AssemblyAngularVelocity = Vector3.zero
+        humanoid.AutoRotate = true
+
+        if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+            humanoid:ChangeState(Enum.HumanoidStateType.Landed)
         end
         log("FLY", "Flight OFF")
     end
+end
+
+local function safeFeatureGate()
+    if not character or not humanoid or not rootPart then return false end
+    local st = humanoid:GetState()
+    if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll then
+        return false
+    end
+    return true
+end
+
+local function getFlightVelocity()
+    if not camera or not camera.Parent or not controls then
+        return Vector3.zero
+    end
+
+    local moveVector = controls:GetMoveVector()
+    if moveVector.Magnitude <= 0 then
+        return Vector3.zero
+    end
+
+    local camCFrame = camera.CFrame
+    local forward = camCFrame.LookVector
+    local right = camCFrame.RightVector
+    local direction = (forward * moveVector.Y) + (right * moveVector.X)
+
+    if direction.Magnitude <= 0.0001 then
+        return Vector3.zero
+    end
+
+    direction = direction.Unit
+    return Vector3.new(direction.X * FLY_SPEED, 0, direction.Z * FLY_SPEED)
 end
 
 RunService.RenderStepped:Connect(function()
@@ -596,19 +686,19 @@ RunService.RenderStepped:Connect(function()
         return
     end
 
+    if not safeFeatureGate() then
+        if linearVelocity then
+            linearVelocity.MaxForce = 0
+            linearVelocity.VectorVelocity = Vector3.zero
+        end
+        return
+    end
+
     if isFlying and linearVelocity and humanoid and rootPart then
-        if humanoid.FloorMaterial ~= Enum.Material.Air and humanoid.MoveDirection.Magnitude < 0.1 then
+        if humanoid:GetState() == Enum.HumanoidStateType.Dead or humanoid:GetState() == Enum.HumanoidStateType.Ragdoll then
             setFlying(false)
-        elseif controls then
-            local moveVector = controls:GetMoveVector()
-            if moveVector.Magnitude > 0 then
-                local camCFrame = camera.CFrame
-                local flightDir = (camCFrame.RightVector * moveVector.X)
-                                - (camCFrame.LookVector * moveVector.Z)
-                linearVelocity.VectorVelocity = flightDir.Unit * FLY_SPEED
-            else
-                linearVelocity.VectorVelocity = Vector3.zero
-            end
+        else
+            linearVelocity.VectorVelocity = getFlightVelocity()
         end
     end
 
@@ -621,42 +711,101 @@ RunService.RenderStepped:Connect(function()
             end
         end
     end
+
+    if isFlying then
+        local st = humanoid:GetState()
+        local velY = rootPart.AssemblyLinearVelocity.Y
+
+        if (st == Enum.HumanoidStateType.Landed or st == Enum.HumanoidStateType.Running or st == Enum.HumanoidStateType.Walking)
+            and velY <= 0.5 then
+            setFlying(false)
+        end
+    end
+
+    if promptExtenderEnabled then
+        refreshPromptExtender()
+    end
 end)
 
 -- ==========================================
 -- UI
 -- ==========================================
 
-local function makeDraggable(gui)
+local function clampGuiToScreen(gui, sizeX, sizeY)
+    local maxX = math.max(0, (game:GetService("GuiService"):GetGuiInset().X + (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X or 0)) - sizeX)
+    local maxY = math.max(0, (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 0) - sizeY)
+    local x = math.clamp(gui.Position.X.Offset, 0, maxX)
+    local y = math.clamp(gui.Position.Y.Offset, 0, maxY)
+    gui.Position = UDim2.new(gui.Position.X.Scale, x, gui.Position.Y.Scale, y)
+end
+
+local function makeDraggable(gui, constrainToScreen)
     local dragging = false
-    local startPos = nil
+    local startInputPos = nil
     local startGuiPos = nil
 
+    local function getViewportBounds()
+        local viewSize = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(0, 0)
+        return viewSize.X, viewSize.Y
+    end
+
+    local function clampToViewport()
+        if not constrainToScreen then return end
+
+        local viewWidth, viewHeight = getViewportBounds()
+        local sizeX = gui.AbsoluteSize.X
+        local sizeY = gui.AbsoluteSize.Y
+        local maxX = math.max(0, viewWidth - sizeX)
+        local maxY = math.max(0, viewHeight - sizeY)
+
+        local currentX = gui.Position.X.Offset
+        local currentY = gui.Position.Y.Offset
+        gui.Position = UDim2.new(gui.Position.X.Scale, math.clamp(currentX, 0, maxX), gui.Position.Y.Scale, math.clamp(currentY, 0, maxY))
+    end
+
+    local function updateDrag(input)
+        if not dragging or not startInputPos or not startGuiPos then return end
+
+        local delta = input.Position - startInputPos
+        local newX = startGuiPos.X + delta.X
+        local newY = startGuiPos.Y + delta.Y
+
+        if constrainToScreen then
+            local viewWidth, viewHeight = getViewportBounds()
+            local sizeX = gui.AbsoluteSize.X
+            local sizeY = gui.AbsoluteSize.Y
+            newX = math.clamp(newX, 0, math.max(0, viewWidth - sizeX))
+            newY = math.clamp(newY, 0, math.max(0, viewHeight - sizeY))
+        end
+
+        gui.Position = UDim2.fromOffset(newX, newY)
+    end
+
+    gui.Active = true
     gui.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
-            startPos = input.Position
-            startGuiPos = gui.Position
+            startInputPos = input.Position
+            startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
+        elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            startInputPos = input.Position
+            startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
         end
     end)
 
     gui.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-            local delta = input.Position - startPos
-            gui.Position = UDim2.new(
-                startGuiPos.X.Scale,
-                startGuiPos.X.Offset + delta.X,
-                startGuiPos.Y.Scale,
-                startGuiPos.Y.Offset + delta.Y
-            )
+        if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            updateDrag(input)
         end
     end)
 
     gui.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = false
-            startPos = nil
+            startInputPos = nil
             startGuiPos = nil
+            clampToViewport()
         end
     end)
 end
@@ -677,7 +826,7 @@ mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
 mainFrame.Draggable = true
 mainFrame.Parent = screenGui
-makeDraggable(mainFrame)
+makeDraggable(mainFrame, true)
 
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 local stroke = Instance.new("UIStroke", mainFrame)
@@ -711,7 +860,9 @@ minBtn.TextColor3 = Color3.fromRGB(200, 200, 210)
 minBtn.Font = Enum.Font.GothamBold
 minBtn.TextSize = 14
 minBtn.ZIndex = 5
+minBtn.Active = true
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+makeDraggable(minBtn, true)
 
 local container = Instance.new("ScrollingFrame", mainFrame)
 container.Size = UDim2.new(1, 0, 1, -40)
@@ -735,7 +886,8 @@ floatBtn.TextSize = 16
 floatBtn.Visible = false
 Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
 floatBtn.Parent = screenGui
-makeDraggable(floatBtn)
+floatBtn.Active = true
+makeDraggable(floatBtn, true)
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
@@ -823,19 +975,28 @@ local function createButton(name, y, color, cb)
 end
 
 createToggle("Flight Mode", 5, function(s)
-    flyToggleEnabled = s
-    if not s then
+    flyToggleEnabled = s == true
+    if not flyToggleEnabled then
         setFlying(false)
-    elseif humanoid and rootPart and linearVelocity then
-        setFlying(true)
     end
 end)
 
-createToggle("Invisibility", 35, function(s) applyInvisibility(s) end)
-createToggle("No Fall Damage", 65, function(s) noFallDamageEnabled = s end)
-createToggle("Noclip", 95, function(s) applyNoclip(s) end)
+createInput("Fly Speed", 35, DEFAULT_FLY_SPEED, function(v, box)
+    if v < MIN_FLY_SPEED then v = MIN_FLY_SPEED end
+    if v > MAX_FLY_SPEED then v = MAX_FLY_SPEED end
+    FLY_SPEED = v
+    if box then box.Text = tostring(v) end
+end)
 
-createToggle("Super Speed", 125, function(s) runSpeedEnabled = s end)
+createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
+createToggle("Noclip", 105, function(s) applyNoclip(s) end)
+
+createToggle("Super Speed", 125, function(s)
+    runSpeedEnabled = s == true
+    if not runSpeedEnabled then
+        restoreNormalMovementState()
+    end
+end)
 
 createInput("Speed (max 1000)", 155, DEFAULT_SPEED, function(v, box)
     if v > MAX_SPEED_INPUT then v = MAX_SPEED_INPUT end
@@ -853,20 +1014,13 @@ createInput("Jump (max 500)", 215, DEFAULT_JUMP, function(v, box)
     if box then box.Text = tostring(v) end
 end)
 
-createInput("Fly Speed", 245, FLY_SPEED, function(v, box)
-    if v < 10 then v = 10 end
-    if v > 500 then v = 500 end
-    FLY_SPEED = v
-    if box then box.Text = tostring(v) end
-end)
-
-createToggle("Prompt Extender", 275, function(s)
+createToggle("Prompt Extender", 245, function(s)
     promptExtenderEnabled = s
     if s then enablePromptExtenderAll() else disablePromptExtenderAll() end
 end)
 
 local tpRiskyToggle = createToggle("TP Risky Mode", 305, function(s)
-    teleportRiskyMode = s
+    teleportRiskyMode = s == true
     log("UI", "Teleport mode changed to " .. (teleportRiskyMode and "Risky" or "Safe"))
 end)
 
@@ -877,7 +1031,7 @@ end)
 
 createButton("TP to Spawn", 365, Color3.fromRGB(41, 128, 185), function()
     log("UI", "TP to Spawn Executed")
-    absoluteTeleport(getEntrySpawn(), not teleportRiskyMode)
+    absoluteTeleport(getEntrySpawn(), not shouldUseInstantTeleport())
 end)
 
 local saveBtn = createButton("Save Location", 395, Color3.fromRGB(142, 68, 173), function()
@@ -892,7 +1046,7 @@ end)
 createButton("TP to Saved", 425, Color3.fromRGB(39, 174, 96), function()
     if savedMapCFrame then
         log("UI", "TP to Saved Executed")
-        absoluteTeleport(savedMapCFrame, not teleportRiskyMode)
+        absoluteTeleport(savedMapCFrame, not shouldUseInstantTeleport())
     else
         log("UI", "TP to Saved Failed: No location saved")
     end
@@ -919,17 +1073,22 @@ end)
 
 UserInputService.JumpRequest:Connect(function()
     local now = os.clock()
-    if flyToggleEnabled and (now - lastJumpTapTime) <= DOUBLE_TAP_WINDOW then
-        if isFlying then setFlying(false)
-        elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
-            or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
-            setFlying(true)
+    if flyToggleEnabled then
+        if (now - lastJumpTapTime) <= DOUBLE_TAP_WINDOW then
+            if isFlying then
+                setFlying(false)
+            elseif humanoid and (humanoid:GetState() == Enum.HumanoidStateType.Freefall
+                or humanoid:GetState() == Enum.HumanoidStateType.Jumping) then
+                setFlying(true)
+            end
+            lastJumpTapTime = 0
+        else
+            lastJumpTapTime = now
         end
-        lastJumpTapTime = 0
-    else
-        lastJumpTapTime = now
+        return
     end
-    if jumpEnabled and not flyToggleEnabled then
+
+    if jumpEnabled then
         applyJump()
     end
 end)
@@ -946,6 +1105,7 @@ local function setupCharacter(char)
     originalCollision = {}
     originalWalkSpeed = humanoid.WalkSpeed
     autoRotateWasEnabled = humanoid.AutoRotate
+    restoreNormalMovementState()
 
     if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
     if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
@@ -978,8 +1138,6 @@ local function setupCharacter(char)
     end
 
     if noclipEnabled then applyNoclip(true) end
-    watchCharacterForInvisibility(char)
-    if invisibleEnabled then applyInvisibility(true) end
     if flyToggleEnabled then setFlying(true) end
 
     if promptExtenderEnabled then
@@ -990,7 +1148,6 @@ local function setupCharacter(char)
         character = nil
         rootPart = nil
         humanoid = nil
-        if invisConnection then invisConnection:Disconnect() invisConnection = nil end
     end)
 end
 
@@ -1001,7 +1158,7 @@ end)
 player.CharacterAdded:Connect(function(c)
     isFlying = false
     isTPBusy = false
-    originalTransparency = {}
+    runSpeedEnabled = false
     originalCollision = {}
     if linearVelocity then linearVelocity.MaxForce = 0 end
     setupCharacter(c)
