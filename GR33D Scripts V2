@@ -783,8 +783,10 @@ local function makeDraggable(gui, constrainToScreen)
             local viewWidth, viewHeight = getViewportBounds()
             local sizeX = gui.AbsoluteSize.X
             local sizeY = gui.AbsoluteSize.Y
-            newX = math.clamp(newX, 0, math.max(0, viewWidth - sizeX))
-            newY = math.clamp(newY, 0, math.max(0, viewHeight - sizeY))
+            local maxX = math.max(0, viewWidth - sizeX)
+            local maxY = math.max(0, viewHeight - sizeY)
+            newX = math.clamp(newX, 0, maxX)
+            newY = math.clamp(newY, 0, maxY)
         end
 
         gui.Position = UDim2.fromOffset(newX, newY)
