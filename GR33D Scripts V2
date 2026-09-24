@@ -739,6 +739,15 @@ local function clampGuiToScreen(gui, sizeX, sizeY)
     gui.Position = UDim2.new(gui.Position.X.Scale, x, gui.Position.Y.Scale, y)
 end
 
+local function isPointInsideGui(point, gui)
+    local absPos = gui.AbsolutePosition
+    local absSize = gui.AbsoluteSize
+    return point.X >= absPos.X
+        and point.X <= absPos.X + absSize.X
+        and point.Y >= absPos.Y
+        and point.Y <= absPos.Y + absSize.Y
+end
+
 local function makeDraggable(gui, constrainToScreen)
     local dragging = false
     local startInputPos = nil
@@ -763,10 +772,10 @@ local function makeDraggable(gui, constrainToScreen)
         gui.Position = UDim2.new(gui.Position.X.Scale, math.clamp(currentX, 0, maxX), gui.Position.Y.Scale, math.clamp(currentY, 0, maxY))
     end
 
-    local function updateDrag(input)
+    local function updateDrag(position)
         if not dragging or not startInputPos or not startGuiPos then return end
 
-        local delta = input.Position - startInputPos
+        local delta = position - startInputPos
         local newX = startGuiPos.X + delta.X
         local newY = startGuiPos.Y + delta.Y
 
@@ -781,30 +790,37 @@ local function makeDraggable(gui, constrainToScreen)
         gui.Position = UDim2.fromOffset(newX, newY)
     end
 
+    local function handleTouchStart(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not isPointInsideGui(input.Position, gui) then return end
+        dragging = true
+        startInputPos = input.Position
+        startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
+    end
+
+    local function handleTouchMove(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not dragging then return end
+        updateDrag(input.Position)
+    end
+
+    local function handleTouchEnd(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if not dragging then return end
+        dragging = false
+        startInputPos = nil
+        startGuiPos = nil
+        clampToViewport()
+    end
+
     gui.Active = true
-
-    gui.InputBegan:Connect(function(input)
+    UserInputService.TouchStarted:Connect(handleTouchStart)
+    UserInputService.InputChanged:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            startInputPos = input.Position
-            startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
+            handleTouchMove(input)
         end
     end)
-
-    gui.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.Touch then
-            updateDrag(input)
-        end
-    end)
-
-    gui.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-            startInputPos = nil
-            startGuiPos = nil
-            clampToViewport()
-        end
-    end)
+    UserInputService.TouchEnded:Connect(handleTouchEnd)
 end
 
 local screenGui = Instance.new("ScreenGui")
@@ -858,7 +874,6 @@ minBtn.TextSize = 14
 minBtn.ZIndex = 5
 minBtn.Active = true
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
-makeDraggable(minBtn, true)
 
 local container = Instance.new("ScrollingFrame", mainFrame)
 container.Size = UDim2.new(1, 0, 1, -40)
@@ -883,7 +898,6 @@ floatBtn.Visible = false
 Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
 floatBtn.Parent = screenGui
 floatBtn.Active = true
-makeDraggable(floatBtn, true)
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
