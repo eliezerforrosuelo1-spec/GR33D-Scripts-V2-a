@@ -1,10 +1,10 @@
 -- ==========================================
--- GR33D SCRIPTS V10.0 (UPDATED - SPEED, JUMP & TP)
+-- GR33D SCRIPTS V10.1
 -- Speed: Delta-time CFrame movement (No rubberbanding)
 -- Jump: State-forced Impulse (High Jump support)
--- Fly: Camera-relative via PlayerModule controls
--- TP: Ground Raycast + Faster Step-TP (Distance: 25, Wait: 0.015)
--- UI: Right side
+-- Fly: Camera-relative, smooth lerp (fixed)
+-- TP: Ground Raycast + Faster Step-TP
+-- UI: Right side, mobile-draggable with edge clamping
 -- ==========================================
 
 local UserInputService = game:GetService("UserInputService")
@@ -44,7 +44,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V10.0 Starting ===")
+log("BOOT", "=== GR33D V10.1 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -60,10 +60,9 @@ local RAPID_DASH_MAX_STEP = 10
 local RAPID_DASH_DAMPING  = 0.9
 
 -- Fly
-local DEFAULT_FLY_SPEED = 26
-local MIN_FLY_SPEED     = 5
-local MAX_FLY_SPEED     = 120
-local FLY_SPEED         = DEFAULT_FLY_SPEED
+local FLY_SPEED         = 120
+local FLY_ACCEL         = 8          -- how fast you reach FLY_SPEED
+local FLY_DAMPING       = 6          -- how fast you stop when no input
 local DOUBLE_TAP_WINDOW = 0.35
 
 -- Jump
@@ -94,6 +93,8 @@ local jumpPowerValue        = DEFAULT_JUMP
 local teleportRiskyMode     = false
 local maxFrameStep          = 10
 local originalWalkSpeed     = 16
+
+local flyVelocity           = Vector3.zero
 
 local function shouldUseInstantTeleport()
     return teleportRiskyMode == true
@@ -248,12 +249,25 @@ end)
 -- PROMPT EXTENDER
 -- ==========================================
 
+local function removePromptExtender(prompt)
+    local saved = trackedPrompts[prompt]
+    if not saved then return end
+    pcall(function()
+        if prompt and prompt.Parent then
+            prompt.MaxActivationDistance = saved.MaxActivationDistance
+            prompt.HoldDuration          = saved.HoldDuration
+            prompt.RequiresLineOfSight   = saved.RequiresLineOfSight
+        end
+    end)
+    trackedPrompts[prompt] = nil
+end
+
 local function applyPromptExtender(prompt)
     if not prompt or not prompt:IsA("ProximityPrompt") then return end
 
     local playerRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
     local playerPos = playerRoot and playerRoot.Position or Vector3.zero
-    local promptPos = prompt.WorldPosition or prompt.Parent and prompt.Parent.Position or playerPos
+    local promptPos = prompt.WorldPosition or (prompt.Parent and prompt.Parent.Position) or playerPos
     local dist = (promptPos - playerPos).Magnitude
 
     if not trackedPrompts[prompt] then
@@ -273,19 +287,6 @@ local function applyPromptExtender(prompt)
     else
         removePromptExtender(prompt)
     end
-end
-
-local function removePromptExtender(prompt)
-    local saved = trackedPrompts[prompt]
-    if not saved then return end
-    pcall(function()
-        if prompt and prompt.Parent then
-            prompt.MaxActivationDistance = saved.MaxActivationDistance
-            prompt.HoldDuration          = saved.HoldDuration
-            prompt.RequiresLineOfSight   = saved.RequiresLineOfSight
-        end
-    end)
-    trackedPrompts[prompt] = nil
 end
 
 local function enablePromptExtenderAll()
@@ -513,7 +514,7 @@ local function getSafeGroundPosition(targetCFrame)
     if character then
         raycastParams.FilterDescendantsInstances = {character}
     end
-    
+
     local rayResult = workspace:Raycast(origin, Vector3.new(0, -60, 0), raycastParams)
     if rayResult then
         return CFrame.new(rayResult.Position + Vector3.new(0, 3.5, 0)) * targetCFrame.Rotation
@@ -617,76 +618,95 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- FLY (camera-relative via PlayerModule)
+-- FLY (smooth, no false exits — FIXED)
 -- ==========================================
 
 local function setFlying(state)
     if not rootPart or not humanoid or not linearVelocity then return end
+    if isFlying == state then return end
     isFlying = state
 
     if isFlying then
         linearVelocity.MaxForce = 100000
         linearVelocity.VectorVelocity = Vector3.zero
-        humanoid.AutoRotate = false
-        if humanoid:GetState() ~= Enum.HumanoidStateType.Freefall then
+        flyVelocity = Vector3.zero
+        pcall(function()
             humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
-        end
+        end)
         log("FLY", "Flight ON")
     else
         linearVelocity.MaxForce = 0
         linearVelocity.VectorVelocity = Vector3.zero
+        flyVelocity = Vector3.zero
 
-        local currentVel = rootPart.AssemblyLinearVelocity
-        rootPart.AssemblyLinearVelocity = Vector3.new(currentVel.X, 0, currentVel.Z)
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        humanoid.AutoRotate = true
-
-        if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
-            humanoid:ChangeState(Enum.HumanoidStateType.Landed)
+        -- Gently return to normal movement
+        if rootPart and humanoid then
+            local cur = rootPart.AssemblyLinearVelocity
+            rootPart.AssemblyLinearVelocity = Vector3.new(cur.X * 0.2, 0, cur.Z * 0.2)
+            rootPart.AssemblyAngularVelocity = Vector3.zero
         end
         log("FLY", "Flight OFF")
     end
 end
 
-local function safeFeatureGate()
-    if not character or not humanoid or not rootPart then return false end
+-- Fly update loop (smooth acceleration + damping)
+RunService.RenderStepped:Connect(function(dt)
+    if not isFlying or not rootPart or not humanoid or not linearVelocity then
+        return
+    end
+    if not controls then return end
+
     local st = humanoid:GetState()
     if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll then
-        return false
-    end
-    return true
-end
-
-local function getFlightVelocity()
-    if not camera or not camera.Parent or not controls then
-        return Vector3.zero
+        setFlying(false)
+        return
     end
 
-    local moveVector = controls:GetMoveVector()
-    if moveVector.Magnitude <= 0 then
-        return Vector3.zero
+    local mv = controls:GetMoveVector()
+    local camCF = camera.CFrame
+
+    local targetVel = Vector3.zero
+    if mv.Magnitude > 0 then
+        local flightDir = (camCF.RightVector * mv.X) - (camCF.LookVector * mv.Z)
+        targetVel = flightDir.Unit * FLY_SPEED
     end
 
-    local camCFrame = camera.CFrame
-    local forward = camCFrame.LookVector
-    local right = camCFrame.RightVector
-    local direction = (forward * moveVector.Y) + (right * moveVector.X)
-
-    if direction.Magnitude <= 0.0001 then
-        return Vector3.zero
+    -- Smooth accelerate / decelerate
+    flyVelocity = flyVelocity:Lerp(targetVel, math.clamp(FLY_ACCEL * dt, 0, 1))
+    if targetVel.Magnitude < 0.1 and flyVelocity.Magnitude < 0.5 then
+        flyVelocity = Vector3.zero
     end
 
-    direction = direction.Unit
-    return Vector3.new(direction.X * FLY_SPEED, 0, direction.Z * FLY_SPEED)
-end
+    linearVelocity.VectorVelocity = flyVelocity
+end)
 
+-- Ground / landing exit check (with real hover test via raycast)
+RunService.Heartbeat:Connect(function()
+    if not isFlying or not humanoid or not rootPart then return end
+
+    local st = humanoid:GetState()
+    local vy = rootPart.AssemblyLinearVelocity.Y
+
+    if st == Enum.HumanoidStateType.Landed
+        or (st == Enum.HumanoidStateType.Running and math.abs(vy) < 0.5) then
+        local rp = RaycastParams.new()
+        rp.FilterType = Enum.RaycastFilterType.Exclude
+        if character then rp.FilterDescendantsInstances = {character} end
+        local hit = workspace:Raycast(rootPart.Position, Vector3.new(0, -4, 0), rp)
+        if hit then
+            setFlying(false)
+        end
+    end
+end)
+
+-- Fall damage clamp + prompt refresh (kept from original)
 RunService.RenderStepped:Connect(function()
     if not camera or not camera.Parent then
         camera = workspace.CurrentCamera
         return
     end
 
-    if not safeFeatureGate() then
+    if not character or not humanoid or not rootPart then
         if linearVelocity then
             linearVelocity.MaxForce = 0
             linearVelocity.VectorVelocity = Vector3.zero
@@ -694,31 +714,21 @@ RunService.RenderStepped:Connect(function()
         return
     end
 
-    if isFlying and linearVelocity and humanoid and rootPart then
-        if humanoid:GetState() == Enum.HumanoidStateType.Dead or humanoid:GetState() == Enum.HumanoidStateType.Ragdoll then
-            setFlying(false)
-        else
-            linearVelocity.VectorVelocity = getFlightVelocity()
+    local st = humanoid:GetState()
+    if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll then
+        if linearVelocity then
+            linearVelocity.MaxForce = 0
+            linearVelocity.VectorVelocity = Vector3.zero
         end
+        return
     end
 
     if humanoid and rootPart and noFallDamageEnabled then
-        local st = humanoid:GetState()
         if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
             local v = rootPart.AssemblyLinearVelocity
             if v.Y < -MAX_SAFE_FALL then
                 rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
             end
-        end
-    end
-
-    if isFlying then
-        local st = humanoid:GetState()
-        local velY = rootPart.AssemblyLinearVelocity.Y
-
-        if (st == Enum.HumanoidStateType.Landed or st == Enum.HumanoidStateType.Running or st == Enum.HumanoidStateType.Walking)
-            and velY <= 0.5 then
-            setFlying(false)
         end
     end
 
@@ -728,102 +738,11 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ==========================================
--- UI
+-- UI (mobile-friendly draggable with edge clamp)
 -- ==========================================
 
-local function clampGuiToScreen(gui, sizeX, sizeY)
-    local maxX = math.max(0, (game:GetService("GuiService"):GetGuiInset().X + (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.X or 0)) - sizeX)
-    local maxY = math.max(0, (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize.Y or 0) - sizeY)
-    local x = math.clamp(gui.Position.X.Offset, 0, maxX)
-    local y = math.clamp(gui.Position.Y.Offset, 0, maxY)
-    gui.Position = UDim2.new(gui.Position.X.Scale, x, gui.Position.Y.Scale, y)
-end
-
-local function isPointInsideGui(point, gui)
-    local absPos = gui.AbsolutePosition
-    local absSize = gui.AbsoluteSize
-    return point.X >= absPos.X
-        and point.X <= absPos.X + absSize.X
-        and point.Y >= absPos.Y
-        and point.Y <= absPos.Y + absSize.Y
-end
-
-local function makeDraggable(gui, constrainToScreen)
-    local dragging = false
-    local startInputPos = nil
-    local startGuiPos = nil
-
-    local function getViewportBounds()
-        local viewSize = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(0, 0)
-        return viewSize.X, viewSize.Y
-    end
-
-    local function clampToViewport()
-        if not constrainToScreen then return end
-
-        local viewWidth, viewHeight = getViewportBounds()
-        local sizeX = gui.AbsoluteSize.X
-        local sizeY = gui.AbsoluteSize.Y
-        local maxX = math.max(0, viewWidth - sizeX)
-        local maxY = math.max(0, viewHeight - sizeY)
-
-        local currentX = gui.Position.X.Offset
-        local currentY = gui.Position.Y.Offset
-        gui.Position = UDim2.new(gui.Position.X.Scale, math.clamp(currentX, 0, maxX), gui.Position.Y.Scale, math.clamp(currentY, 0, maxY))
-    end
-
-    local function updateDrag(position)
-        if not dragging or not startInputPos or not startGuiPos then return end
-
-        local delta = position - startInputPos
-        local newX = startGuiPos.X + delta.X
-        local newY = startGuiPos.Y + delta.Y
-
-        if constrainToScreen then
-            local viewWidth, viewHeight = getViewportBounds()
-            local sizeX = gui.AbsoluteSize.X
-            local sizeY = gui.AbsoluteSize.Y
-            local maxX = math.max(0, viewWidth - sizeX)
-            local maxY = math.max(0, viewHeight - sizeY)
-            newX = math.clamp(newX, 0, maxX)
-            newY = math.clamp(newY, 0, maxY)
-        end
-
-        gui.Position = UDim2.fromOffset(newX, newY)
-    end
-
-    local function handleTouchStart(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if not isPointInsideGui(input.Position, gui) then return end
-        dragging = true
-        startInputPos = input.Position
-        startGuiPos = Vector2.new(gui.AbsolutePosition.X, gui.AbsolutePosition.Y)
-    end
-
-    local function handleTouchMove(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if not dragging then return end
-        updateDrag(input.Position)
-    end
-
-    local function handleTouchEnd(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch then return end
-        if not dragging then return end
-        dragging = false
-        startInputPos = nil
-        startGuiPos = nil
-        clampToViewport()
-    end
-
-    gui.Active = true
-    UserInputService.TouchStarted:Connect(handleTouchStart)
-    UserInputService.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch then
-            handleTouchMove(input)
-        end
-    end)
-    UserInputService.TouchEnded:Connect(handleTouchEnd)
-end
+local VIEWPORT_PADDING = 8
+local PANEL_W, PANEL_H = 220, 440
 
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "Panel"
@@ -834,13 +753,13 @@ screenGui.Parent = protectedParent
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Name = "MainFrame"
-mainFrame.Size = UDim2.new(0, 220, 0, 440)
-mainFrame.AnchorPoint = Vector2.new(1, 0.5)
-mainFrame.Position = UDim2.new(1, -10, 0.5, 0)
+mainFrame.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+mainFrame.AnchorPoint = Vector2.new(0, 0)
+mainFrame.Position = UDim2.new(1, -(PANEL_W + 10), 0.5, -(PANEL_H / 2))
 mainFrame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 mainFrame.Active = true
+mainFrame.Draggable = false
 mainFrame.Parent = screenGui
-makeDraggable(mainFrame, true)
 
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
 local stroke = Instance.new("UIStroke", mainFrame)
@@ -858,7 +777,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "GR33D v10.0"
+title.Text = "GR33D v10.1"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -876,6 +795,91 @@ minBtn.TextSize = 14
 minBtn.ZIndex = 5
 minBtn.Active = true
 Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+-- ---------- DRAG HANDLER (mobile + PC) ----------
+
+local function clampPanelPosition()
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local vp = cam.ViewportSize
+    local guiService = game:GetService("GuiService")
+    local inset = guiService:GetGuiInset()
+
+    local pos = mainFrame.Position
+    local x = pos.X.Offset
+    local y = pos.Y.Offset
+
+    local minX = inset.X - (PANEL_W * 0.5)
+    local maxX = inset.X + vp.X - (PANEL_W * 0.5)
+    local minY = inset.Y + VIEWPORT_PADDING
+    local maxY = inset.Y + vp.Y - PANEL_H - VIEWPORT_PADDING
+
+    x = math.clamp(x, minX, maxX)
+    y = math.clamp(y, minY, math.max(minY, maxY))
+
+    mainFrame.Position = UDim2.new(0, x, 0, y)
+end
+
+local dragging   = false
+local dragStart  = nil
+local startPos   = nil
+
+local function beginDrag(input)
+    dragging = true
+    dragStart = input.Position
+    startPos  = mainFrame.Position
+end
+
+local function updateDrag(input)
+    if not dragging or not dragStart or not startPos then return end
+    local delta = input.Position - dragStart
+    mainFrame.Position = UDim2.new(
+        startPos.X.Scale, startPos.X.Offset + delta.X,
+        startPos.Y.Scale, startPos.Y.Offset + delta.Y
+    )
+    clampPanelPosition()
+end
+
+local function endDrag()
+    dragging = false
+    dragStart = nil
+    startPos  = nil
+end
+
+topBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        beginDrag(input)
+    end
+end)
+
+topBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        updateDrag(input)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        updateDrag(input)
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        endDrag()
+    end
+end)
+
+-- Re-clamp on viewport changes (rotation, resize)
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+    clampPanelPosition()
+end)
+
+-- ---------- Container ----------
 
 local container = Instance.new("ScrollingFrame", mainFrame)
 container.Size = UDim2.new(1, 0, 1, -40)
@@ -900,6 +904,35 @@ floatBtn.Visible = false
 Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(0, 8)
 floatBtn.Parent = screenGui
 floatBtn.Active = true
+
+-- Float button drag
+local floatDragging, floatStart, floatStartPos = false, nil, nil
+floatBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        floatDragging = true
+        floatStart = input.Position
+        floatStartPos = floatBtn.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if floatDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - floatStart
+        floatBtn.Position = UDim2.new(
+            floatStartPos.X.Scale, floatStartPos.X.Offset + delta.X,
+            floatStartPos.Y.Scale, floatStartPos.Y.Offset + delta.Y
+        )
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        floatDragging = false
+    end
+end)
+
+-- ---------- UI Helpers ----------
 
 local function createToggle(name, y, cb)
     local row = Instance.new("Frame", container)
@@ -986,22 +1019,21 @@ local function createButton(name, y, color, cb)
     return b
 end
 
+-- ---------- UI Content ----------
+
 createToggle("Flight Mode", 5, function(s)
     flyToggleEnabled = s == true
     if not flyToggleEnabled then
         setFlying(false)
+    else
+        if humanoid and rootPart and linearVelocity then
+            setFlying(true)
+        end
     end
 end)
 
-createInput("Fly Speed", 35, DEFAULT_FLY_SPEED, function(v, box)
-    if v < MIN_FLY_SPEED then v = MIN_FLY_SPEED end
-    if v > MAX_FLY_SPEED then v = MAX_FLY_SPEED end
-    FLY_SPEED = v
-    if box then box.Text = tostring(v) end
-end)
-
-createToggle("No Fall Damage", 75, function(s) noFallDamageEnabled = s end)
-createToggle("Noclip", 105, function(s) applyNoclip(s) end)
+createToggle("No Fall Damage", 35, function(s) noFallDamageEnabled = s end)
+createToggle("Noclip", 95, function(s) applyNoclip(s) end)
 
 createToggle("Super Speed", 125, function(s)
     runSpeedEnabled = s == true
@@ -1026,12 +1058,19 @@ createInput("Jump (max 500)", 215, DEFAULT_JUMP, function(v, box)
     if box then box.Text = tostring(v) end
 end)
 
-createToggle("Prompt Extender", 245, function(s)
+createInput("Fly Speed", 245, FLY_SPEED, function(v, box)
+    if v < 10 then v = 10 end
+    if v > 500 then v = 500 end
+    FLY_SPEED = v
+    if box then box.Text = tostring(v) end
+end)
+
+createToggle("Prompt Extender", 275, function(s)
     promptExtenderEnabled = s
     if s then enablePromptExtenderAll() else disablePromptExtenderAll() end
 end)
 
-local tpRiskyToggle = createToggle("TP Risky Mode", 305, function(s)
+createToggle("TP Risky Mode", 305, function(s)
     teleportRiskyMode = s == true
     log("UI", "Teleport mode changed to " .. (teleportRiskyMode and "Risky" or "Safe"))
 end)
@@ -1049,7 +1088,7 @@ end)
 local saveBtn = createButton("Save Location", 395, Color3.fromRGB(142, 68, 173), function()
     if not rootPart then return end
     savedMapCFrame = rootPart.CFrame
-    log("UI", string.format("Saved Location: (%.1f, %.1f, %.1f)", 
+    log("UI", string.format("Saved Location: (%.1f, %.1f, %.1f)",
         rootPart.Position.X, rootPart.Position.Y, rootPart.Position.Z))
     saveBtn.Text = "Saved!"
     task.delay(1.5, function() saveBtn.Text = "Save Location" end)
@@ -1069,14 +1108,20 @@ createButton("SAVE LOG", 455, Color3.fromRGB(200, 80, 80), function()
     log("LOGGER", "Log saved")
 end)
 
-minBtn.Activated:Connect(function()
+minBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = false
     floatBtn.Visible = true
 end)
 
-floatBtn.Activated:Connect(function()
+floatBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = true
     floatBtn.Visible = false
+end)
+
+-- Initial clamp after a frame so viewport size is ready
+task.defer(function()
+    task.wait(0.1)
+    clampPanelPosition()
 end)
 
 -- ==========================================
@@ -1172,6 +1217,10 @@ player.CharacterAdded:Connect(function(c)
     isTPBusy = false
     runSpeedEnabled = false
     originalCollision = {}
+    flyVelocity = Vector3.zero
     if linearVelocity then linearVelocity.MaxForce = 0 end
+    if speedLinearVelocity then speedLinearVelocity.MaxForce = 0 end
     setupCharacter(c)
 end)
+
+print("V10.1 loaded. Mobile UI + smooth fly fixed.")
