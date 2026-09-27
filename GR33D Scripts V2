@@ -1,15 +1,16 @@
 -- ==========================================
--- GR33D SCRIPTS V10.1
+-- GR33D SCRIPTS V10.2
 -- Speed: Delta-time CFrame movement (No rubberbanding)
 -- Jump: State-forced Impulse (High Jump support)
 -- Fly: Camera-relative, smooth lerp (fixed)
--- TP: Ground Raycast + Faster Step-TP
+-- TP: Ground Raycast + Pathfinding TP-Walk (reduced snapback)
 -- UI: Right side, mobile-draggable with edge clamping
 -- ==========================================
 
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local Players          = game:GetService("Players")
+local UserInputService  = game:GetService("UserInputService")
+local RunService        = game:GetService("RunService")
+local Players           = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
@@ -44,7 +45,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V10.1 Starting ===")
+log("BOOT", "=== GR33D V10.2 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -74,6 +75,13 @@ local MAX_SAFE_FALL     = 50
 local PROMPT_MAX_DISTANCE  = 50
 local PROMPT_HOLD_DURATION = 0
 local PROMPT_REQUIRES_LOS  = false
+
+-- TP Walk
+local TP_WALK_SPEED       = 16
+local TP_WAYPOINT_TIMEOUT = 2.5
+local TP_REPATH_DISTANCE  = 6
+local TP_ARRIVAL_DISTANCE = 4
+local TP_MAX_REPATHS      = 4
 
 -- ==========================================
 -- STATE
@@ -109,6 +117,7 @@ local savedMapCFrame        = nil
 local character, rootPart, humanoid
 local attachment, linearVelocity
 local speedAttachment, speedLinearVelocity
+local setFlying
 
 local originalCollision         = {}
 
@@ -522,68 +531,273 @@ local function getSafeGroundPosition(targetCFrame)
     return targetCFrame + Vector3.new(0, 3, 0)
 end
 
+local function waitForTPMove(targetPosition, timeout)
+    if not humanoid or not rootPart then
+        return false
+    end
+
+    local started = os.clock()
+    local lastDistance = math.huge
+    local lastProgressTime = started
+
+    while os.clock() - started < timeout do
+        if not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
+            return false
+        end
+
+        local delta = targetPosition - rootPart.Position
+        local horizontalDistance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+
+        if horizontalDistance <= TP_ARRIVAL_DISTANCE then
+            return true
+        end
+
+        -- If movement is making progress, refresh the progress timer.
+        if horizontalDistance < lastDistance - 0.15 then
+            lastDistance = horizontalDistance
+            lastProgressTime = os.clock()
+        end
+
+        -- Stop waiting if we have not made meaningful progress for a while.
+        if os.clock() - lastProgressTime > 0.75 then
+            return false
+        end
+
+        task.wait(0.05)
+    end
+
+    return false
+end
+
+local function walkToPosition(destination)
+    if not character or not rootPart or not humanoid then
+        return false
+    end
+
+    local oldWalkSpeed = humanoid.WalkSpeed
+    local oldAutoRotate = humanoid.AutoRotate
+    local oldPlatformStand = humanoid.PlatformStand
+
+    local function restoreMovement()
+        if not humanoid then return end
+        humanoid:Move(Vector3.zero, false)
+        humanoid.PlatformStand = oldPlatformStand
+        humanoid.AutoRotate = oldAutoRotate
+        humanoid.WalkSpeed = oldWalkSpeed
+    end
+
+    humanoid.PlatformStand = false
+    humanoid.AutoRotate = true
+
+    -- Stay at or below the character's normal speed. A boosted WalkSpeed can
+    -- itself trigger server corrections in games that validate movement.
+    local normalSpeed = originalWalkSpeed > 0 and originalWalkSpeed or 16
+    humanoid.WalkSpeed = math.min(TP_WALK_SPEED, normalSpeed)
+
+    rootPart.Anchored = false
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+
+    local repaths = 0
+
+    while repaths <= TP_MAX_REPATHS do
+        if not character or not rootPart or not humanoid or humanoid.Health <= 0 then
+            restoreMovement()
+            return false
+        end
+
+        if (destination.Position - rootPart.Position).Magnitude <= TP_ARRIVAL_DISTANCE then
+            restoreMovement()
+            return true
+        end
+
+        local path = PathfindingService:CreatePath({
+            AgentRadius = 2,
+            AgentHeight = 5,
+            AgentCanJump = true,
+            AgentCanClimb = true,
+            WaypointSpacing = 4,
+            Costs = {
+                Water = 20
+            }
+        })
+
+        local computed = pcall(function()
+            path:ComputeAsync(rootPart.Position, destination.Position)
+        end)
+
+        if not computed or path.Status ~= Enum.PathStatus.Success then
+            log("TP", "Path compute failed; retrying")
+            repaths = repaths + 1
+            task.wait(0.15)
+            continue
+        end
+
+        local waypoints = path:GetWaypoints()
+        local shouldRepath = false
+        local blocked = false
+
+        local blockedConnection = path.Blocked:Connect(function()
+            blocked = true
+        end)
+
+        -- Waypoint 1 is normally the current position, so begin at waypoint 2.
+        for i = 2, #waypoints do
+            if not rootPart or not humanoid or humanoid.Health <= 0 then
+                blockedConnection:Disconnect()
+                restoreMovement()
+                return false
+            end
+
+            if blocked then
+                shouldRepath = true
+                break
+            end
+
+            local waypoint = waypoints[i]
+
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
+            end
+
+            humanoid:MoveTo(waypoint.Position)
+
+            local reached = waitForTPMove(waypoint.Position, TP_WAYPOINT_TIMEOUT)
+            if not reached then
+                shouldRepath = true
+                break
+            end
+
+            -- If the character ended up well away from the intended waypoint,
+            -- accept the correction and compute a fresh route instead of CFraming back.
+            local horizontalErrorVector = waypoint.Position - rootPart.Position
+            local horizontalError = Vector3.new(
+                horizontalErrorVector.X,
+                0,
+                horizontalErrorVector.Z
+            ).Magnitude
+
+            if horizontalError > TP_REPATH_DISTANCE then
+                shouldRepath = true
+                break
+            end
+
+            rootPart.AssemblyAngularVelocity = Vector3.zero
+        end
+
+        blockedConnection:Disconnect()
+
+        local remaining = (destination.Position - rootPart.Position).Magnitude
+        if remaining <= TP_ARRIVAL_DISTANCE then
+            restoreMovement()
+            return true
+        end
+
+        if not shouldRepath then
+            -- The path ended but we are still not close enough. Recompute from
+            -- the server-accepted current position instead of forcing CFrame.
+            shouldRepath = true
+        end
+
+        if shouldRepath then
+            repaths = repaths + 1
+            log("TP", string.format("Repath %d/%d", repaths, TP_MAX_REPATHS))
+            task.wait(0.1)
+        end
+    end
+
+    restoreMovement()
+    return false
+end
+
 local function absoluteTeleport(targetCFrame, useInterpolation)
     if not character or not rootPart or not humanoid then return end
     if isTPBusy then return end
     isTPBusy = true
 
     local wasRunSpeedEnabled = runSpeedEnabled
+    local wasNoFall = noFallDamageEnabled
+    local wasFlying = isFlying
+
     runSpeedEnabled = false
+    noFallDamageEnabled = true
+
     if speedLinearVelocity then
         speedLinearVelocity.MaxForce = 0
         speedLinearVelocity.VectorVelocity = Vector3.zero
     end
 
+    -- Safe TP must not compete with flight forces.
+    if isFlying then
+        setFlying(false)
+    end
+
     local safeCFrame = getSafeGroundPosition(targetCFrame)
-    local startCFrame = rootPart.CFrame
-    local distance = (safeCFrame.Position - startCFrame.Position).Magnitude
+    local distance = (safeCFrame.Position - rootPart.Position).Magnitude
     local riskyMode = shouldUseInstantTeleport() or (useInterpolation == false)
 
-    log("TP", string.format("Starting TP | Mode: %s | Distance: %.1f studs | Risky: %s",
-        riskyMode and "Risky" or "Safe", distance, tostring(riskyMode)))
+    log("TP", string.format(
+        "Starting TP | Mode: %s | Distance: %.1f studs | Risky: %s",
+        riskyMode and "Risky" or "TP-Walk",
+        distance,
+        tostring(riskyMode)
+    ))
+
     if observeCheatMode then
         logPhysicsSnapshot("TP_BEFORE")
     end
 
-    local wasNoFall = noFallDamageEnabled
-    noFallDamageEnabled = true
-    freezeCharacterForTeleport()
-
     if riskyMode then
+        -- Instant mode keeps the old PivotTo behavior.
+        freezeCharacterForTeleport()
         character:PivotTo(safeCFrame)
         rootPart.AssemblyLinearVelocity = Vector3.zero
         rootPart.AssemblyAngularVelocity = Vector3.zero
-        task.wait(0.03)
+        task.wait(0.05)
+        releaseCharacterAfterTeleport(wasRunSpeedEnabled)
     else
-        local stepDistance = 16
-        local stepWait = 0.012
-        local steps = math.max(math.ceil(distance / stepDistance), 4)
+        -- Safe mode uses normal Humanoid movement and PathfindingService.
+        -- No anchoring, repeated PivotTo, or stepped CFrame movement.
+        rootPart.Anchored = false
+        humanoid.PlatformStand = false
+        humanoid.AutoRotate = true
+        rootPart.AssemblyAngularVelocity = Vector3.zero
 
-        for i = 1, steps do
-            if not rootPart or not rootPart.Parent then break end
-            local alpha = i / steps
-            local nextCFrame = startCFrame:Lerp(safeCFrame, alpha)
-            character:PivotTo(nextCFrame)
-            rootPart.AssemblyLinearVelocity = Vector3.zero
+        local success = walkToPosition(safeCFrame)
+
+        if success then
+            log("TP", "TP-Walk completed")
+        else
+            log("TP", "TP-Walk failed or was cancelled")
+        end
+
+        if rootPart then
             rootPart.AssemblyAngularVelocity = Vector3.zero
-            lockRootToStableState()
-            task.wait(stepWait)
+        end
+
+        runSpeedEnabled = wasRunSpeedEnabled
+        if humanoid then
+            if runSpeedEnabled then
+                humanoid.WalkSpeed = 0
+                humanoid.AutoRotate = false
+            else
+                humanoid.WalkSpeed = originalWalkSpeed
+                humanoid.AutoRotate = true
+            end
         end
     end
 
-    character:PivotTo(safeCFrame)
-    rootPart.CFrame = safeCFrame
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    lockRootToStableState()
-    task.wait(0.04)
+    -- Restore flight only if it was active before teleport and the character
+    -- is still valid. This keeps the old user state without applying flight
+    -- forces during path walking.
+    if wasFlying and flyToggleEnabled and rootPart and humanoid and linearVelocity then
+        setFlying(true)
+    end
 
-    if observeCheatMode then
+    if observeCheatMode and rootPart then
         logPhysicsSnapshot("TP_AFTER")
     end
 
-    releaseCharacterAfterTeleport(wasRunSpeedEnabled)
-    task.delay(0.2, function()
+    task.delay(0.15, function()
         noFallDamageEnabled = wasNoFall
         isTPBusy = false
     end)
@@ -621,7 +835,7 @@ end
 -- FLY (smooth, no false exits — FIXED)
 -- ==========================================
 
-local function setFlying(state)
+setFlying = function(state)
     if not rootPart or not humanoid or not linearVelocity then return end
     if isFlying == state then return end
     isFlying = state
@@ -777,7 +991,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "GR33D v10.1"
+title.Text = "GR33D v10.2"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -1223,4 +1437,4 @@ player.CharacterAdded:Connect(function(c)
     setupCharacter(c)
 end)
 
-print("V10.1 loaded. Mobile UI + smooth fly fixed.")
+print("V10.2 loaded. TP-Walk + mobile UI + smooth fly fixed.")
