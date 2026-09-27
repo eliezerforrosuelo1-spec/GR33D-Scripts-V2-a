@@ -1,6 +1,6 @@
 -- ==========================================
--- GR33D SCRIPTS V10.2
--- Speed: Delta-time CFrame movement (No rubberbanding)
+-- GR33D SCRIPTS V10.3
+-- Speed: Frame-stable horizontal dash (reduced physics conflicts)
 -- Jump: State-forced Impulse (High Jump support)
 -- Fly: Camera-relative, smooth lerp (fixed)
 -- TP: Ground Raycast + Pathfinding TP-Walk (reduced snapback)
@@ -14,8 +14,12 @@ local PathfindingService = game:GetService("PathfindingService")
 
 local player = Players.LocalPlayer
 local protectedParent = player:WaitForChild("PlayerGui")
-if protectedParent:FindFirstChild("Panel") then
-    protectedParent.Panel:Destroy()
+
+-- Use a unique GUI name so this script never deletes a game's own generic "Panel" GUI.
+local UI_NAME = "GR33DPanel"
+local existingGui = protectedParent:FindFirstChild(UI_NAME)
+if existingGui then
+    existingGui:Destroy()
 end
 
 local camera = workspace.CurrentCamera
@@ -45,7 +49,7 @@ local function saveLogToFile()
     end
 end
 
-log("BOOT", "=== GR33D V10.2 Starting ===")
+log("BOOT", "=== GR33D V10.3 Starting ===")
 log("BOOT", "PlaceId: " .. tostring(game.PlaceId))
 log("BOOT", "Player: " .. player.Name)
 
@@ -56,7 +60,6 @@ log("BOOT", "Player: " .. player.Name)
 local MAX_SPEED_INPUT     = 1000
 local DEFAULT_SPEED       = 100
 local MAX_EFFECTIVE_SPEED = 320
-local RAPID_DASH_MIN_STEP = 2.2
 local RAPID_DASH_MAX_STEP = 10
 local RAPID_DASH_DAMPING  = 0.9
 
@@ -72,16 +75,21 @@ local DEFAULT_JUMP      = 100
 local MAX_SAFE_FALL     = 50
 
 -- Prompt Extender
-local PROMPT_MAX_DISTANCE  = 50
-local PROMPT_HOLD_DURATION = 0
-local PROMPT_REQUIRES_LOS  = false
+local PROMPT_MAX_DISTANCE   = 50
+local PROMPT_HOLD_DURATION  = 0
+local PROMPT_REQUIRES_LOS   = false
+local PROMPT_REFRESH_PERIOD = 0.35
 
 -- TP Walk
-local TP_WALK_SPEED       = 16
-local TP_WAYPOINT_TIMEOUT = 2.5
-local TP_REPATH_DISTANCE  = 6
-local TP_ARRIVAL_DISTANCE = 4
-local TP_MAX_REPATHS      = 4
+local TP_WALK_SPEED          = 16
+local TP_WAYPOINT_TIMEOUT    = 2.5
+local TP_REPATH_DISTANCE     = 6
+local TP_ARRIVAL_DISTANCE    = 4
+local TP_VERTICAL_TOLERANCE  = 8
+local TP_MAX_REPATHS         = 4
+local TP_GROUND_SCAN_UP      = 8
+local TP_GROUND_SCAN_DOWN    = 24
+local TP_MAX_GROUND_ADJUST   = 10
 
 -- ==========================================
 -- STATE
@@ -94,12 +102,9 @@ local noclipEnabled         = false
 local runSpeedEnabled       = false
 local jumpEnabled           = false
 local promptExtenderEnabled = false
-local isMinimized           = false
-
 local runSpeedValue         = DEFAULT_SPEED
 local jumpPowerValue        = DEFAULT_JUMP
 local teleportRiskyMode     = false
-local maxFrameStep          = 10
 local originalWalkSpeed     = 16
 
 local flyVelocity           = Vector3.zero
@@ -116,64 +121,19 @@ local savedMapCFrame        = nil
 
 local character, rootPart, humanoid
 local attachment, linearVelocity
-local speedAttachment, speedLinearVelocity
 local setFlying
 
-local originalCollision         = {}
+local originalCollision     = {}
+local noclipSuspended       = false
 
 local isTPBusy              = false
+local teleportSerial        = 0
 local trackedPrompts        = {}
+local knownPrompts          = {}
+local lastPromptRefresh     = 0
 local observeCheatMode      = false
 local lastObservedPos       = nil
 local lastObservedTick      = 0
-local autoRotateWasEnabled  = true
-
-local function zeroCharacterMotion()
-    if not rootPart or not rootPart.Parent then return end
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    if humanoid then
-        humanoid.AutoRotate = false
-        humanoid.WalkSpeed = 0
-        pcall(function()
-            humanoid:Move(Vector3.zero, false)
-        end)
-    end
-end
-
-local function neutralizeCharacterPhysics()
-    if not rootPart or not rootPart.Parent then return end
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    if humanoid then
-        humanoid.PlatformStand = true
-        humanoid.AutoRotate = false
-        humanoid.WalkSpeed = 0
-        pcall(function()
-            humanoid:Move(Vector3.zero, false)
-        end)
-    end
-end
-
-local function lockRootToStableState()
-    if not rootPart or not rootPart.Parent then return end
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
-    if humanoid then
-        humanoid.WalkSpeed = 0
-        humanoid.AutoRotate = false
-        humanoid.Sit = false
-        pcall(function()
-            humanoid:Move(Vector3.zero, false)
-        end)
-    end
-end
-
-local function stabilizeRoot(targetCFrame)
-    if not rootPart or not rootPart.Parent then return end
-    rootPart.CFrame = targetCFrame
-    zeroCharacterMotion()
-end
 
 local function freezeCharacterForTeleport()
     if not humanoid or not rootPart then return end
@@ -181,30 +141,30 @@ local function freezeCharacterForTeleport()
     humanoid.PlatformStand = true
     humanoid.AutoRotate = false
     humanoid.WalkSpeed = 0
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
     rootPart.Anchored = true
-    zeroCharacterMotion()
 end
 
-local function releaseCharacterAfterTeleport(restoreSpeedEnabled)
+local function releaseCharacterAfterTeleport()
     if not humanoid or not rootPart then return end
+
     rootPart.AssemblyLinearVelocity = Vector3.zero
     rootPart.AssemblyAngularVelocity = Vector3.zero
     rootPart.Anchored = false
+
     humanoid.PlatformStand = false
-    humanoid.AutoRotate = true
+    humanoid.Sit = false
 
-    if speedLinearVelocity then
-        speedLinearVelocity.MaxForce = 0
-        speedLinearVelocity.VectorVelocity = Vector3.zero
+    -- Restore a usable movement state. V10.2 always set WalkSpeed to 0 here,
+    -- which could freeze the player after a Risky TP when Super Speed was off.
+    if runSpeedEnabled then
+        humanoid.WalkSpeed = 0
+        humanoid.AutoRotate = false
+    else
+        humanoid.WalkSpeed = originalWalkSpeed
+        humanoid.AutoRotate = true
     end
-
-    if character and rootPart then
-        character:PivotTo(rootPart.CFrame)
-    end
-
-    runSpeedEnabled = restoreSpeedEnabled == true
-    humanoid.WalkSpeed = 0
-    humanoid.AutoRotate = true
 end
 
 local function logPhysicsSnapshot(label)
@@ -258,170 +218,279 @@ end)
 -- PROMPT EXTENDER
 -- ==========================================
 
+local function getPromptWorldPosition(prompt)
+    if not prompt or not prompt.Parent then return nil end
+
+    local parent = prompt.Parent
+    if parent:IsA("Attachment") then
+        return parent.WorldPosition
+    elseif parent:IsA("BasePart") then
+        return parent.Position
+    elseif parent:IsA("Model") then
+        local ok, pivot = pcall(function()
+            return parent:GetPivot()
+        end)
+        if ok and pivot then
+            return pivot.Position
+        end
+    end
+
+    return nil
+end
+
 local function removePromptExtender(prompt)
     local saved = trackedPrompts[prompt]
     if not saved then return end
+
     pcall(function()
         if prompt and prompt.Parent then
             prompt.MaxActivationDistance = saved.MaxActivationDistance
-            prompt.HoldDuration          = saved.HoldDuration
-            prompt.RequiresLineOfSight   = saved.RequiresLineOfSight
+            prompt.HoldDuration = saved.HoldDuration
+            prompt.RequiresLineOfSight = saved.RequiresLineOfSight
         end
     end)
+
     trackedPrompts[prompt] = nil
 end
 
 local function applyPromptExtender(prompt)
-    if not prompt or not prompt:IsA("ProximityPrompt") then return end
-
-    local playerRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
-    local playerPos = playerRoot and playerRoot.Position or Vector3.zero
-    local promptPos = prompt.WorldPosition or (prompt.Parent and prompt.Parent.Position) or playerPos
-    local dist = (promptPos - playerPos).Magnitude
-
-    if not trackedPrompts[prompt] then
-        trackedPrompts[prompt] = {
-            MaxActivationDistance = prompt.MaxActivationDistance,
-            HoldDuration          = prompt.HoldDuration,
-            RequiresLineOfSight   = prompt.RequiresLineOfSight,
-        }
+    if not prompt or not prompt:IsA("ProximityPrompt") or not prompt.Parent then
+        return
     end
 
+    knownPrompts[prompt] = true
+
+    local playerRoot = rootPart or (player.Character and player.Character:FindFirstChild("HumanoidRootPart"))
+    if not playerRoot then return end
+
+    local promptPos = getPromptWorldPosition(prompt)
+    if not promptPos then return end
+
+    local dist = (promptPos - playerRoot.Position).Magnitude
+
     if dist <= PROMPT_MAX_DISTANCE + 10 then
+        if not trackedPrompts[prompt] then
+            trackedPrompts[prompt] = {
+                MaxActivationDistance = prompt.MaxActivationDistance,
+                HoldDuration = prompt.HoldDuration,
+                RequiresLineOfSight = prompt.RequiresLineOfSight,
+            }
+        end
+
         pcall(function()
             prompt.MaxActivationDistance = PROMPT_MAX_DISTANCE
             prompt.HoldDuration = PROMPT_HOLD_DURATION
             prompt.RequiresLineOfSight = PROMPT_REQUIRES_LOS
         end)
-    else
+    elseif trackedPrompts[prompt] then
         removePromptExtender(prompt)
+    end
+end
+
+local function indexPrompts()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") then
+            knownPrompts[obj] = true
+        end
     end
 end
 
 local function enablePromptExtenderAll()
+    indexPrompts()
+
     local count = 0
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
-            applyPromptExtender(obj)
+    for prompt in pairs(knownPrompts) do
+        if prompt and prompt.Parent then
+            applyPromptExtender(prompt)
             count = count + 1
+        else
+            knownPrompts[prompt] = nil
+            trackedPrompts[prompt] = nil
         end
     end
-    log("PROMPT", "Extended " .. count .. " prompts")
+
+    log("PROMPT", "Indexed " .. count .. " prompts")
 end
 
 local function disablePromptExtenderAll()
-    for prompt, _ in pairs(trackedPrompts) do
+    local restoreList = {}
+    for prompt in pairs(trackedPrompts) do
+        table.insert(restoreList, prompt)
+    end
+
+    for _, prompt in ipairs(restoreList) do
         removePromptExtender(prompt)
     end
-    trackedPrompts = {}
+
     log("PROMPT", "Disabled")
 end
 
 workspace.DescendantAdded:Connect(function(obj)
-    if promptExtenderEnabled and obj:IsA("ProximityPrompt") then
-        applyPromptExtender(obj)
+    if obj:IsA("ProximityPrompt") then
+        knownPrompts[obj] = true
+        if promptExtenderEnabled then
+            task.defer(function()
+                applyPromptExtender(obj)
+            end)
+        end
     end
 end)
 
-local function refreshPromptExtender()
+workspace.DescendantRemoving:Connect(function(obj)
+    if obj:IsA("ProximityPrompt") then
+        knownPrompts[obj] = nil
+        trackedPrompts[obj] = nil
+    end
+end)
+
+-- Throttle prompt updates. V10.2 called workspace:GetDescendants() every
+-- RenderStepped frame, which can become very expensive in large maps.
+RunService.Heartbeat:Connect(function()
     if not promptExtenderEnabled then return end
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("ProximityPrompt") then
-            applyPromptExtender(obj)
+
+    local now = os.clock()
+    if now - lastPromptRefresh < PROMPT_REFRESH_PERIOD then return end
+    lastPromptRefresh = now
+
+    for prompt in pairs(knownPrompts) do
+        if prompt and prompt.Parent then
+            applyPromptExtender(prompt)
+        else
+            knownPrompts[prompt] = nil
+            trackedPrompts[prompt] = nil
         end
     end
-end
+end)
 
 -- ==========================================
 -- NOCLIP
 -- ==========================================
 
-local function applyNoclip(state)
-    noclipEnabled = state
-    if not character then return end
-    if state then
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") then
-                if originalCollision[part] == nil then
-                    originalCollision[part] = part.CanCollide
-                end
-                if part.CanCollide then
-                    pcall(function()
-                        part.CanCollide = false
-                    end)
-                end
+local function restoreCollisionSnapshot(clearSnapshot)
+    for part, originalCanCollide in pairs(originalCollision) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = originalCanCollide
+            end)
+        end
+    end
+
+    if clearSnapshot then
+        originalCollision = {}
+    end
+end
+
+local function enforceNoclip()
+    if not character or not noclipEnabled or noclipSuspended then return end
+
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if originalCollision[part] == nil then
+                originalCollision[part] = part.CanCollide
+            end
+            if part.CanCollide then
+                part.CanCollide = false
             end
         end
+    end
+end
+
+local function applyNoclip(state)
+    noclipEnabled = state == true
+
+    if noclipEnabled then
+        if not noclipSuspended then
+            enforceNoclip()
+        end
     else
-        task.defer(function()
-            for part, orig in pairs(originalCollision) do
-                if part and part.Parent then
-                    pcall(function()
-                        part.CanCollide = orig
-                    end)
-                end
-            end
-            originalCollision = {}
-        end)
+        restoreCollisionSnapshot(true)
+    end
+end
+
+local function suspendNoclipForTeleport()
+    if noclipSuspended then return end
+    noclipSuspended = true
+
+    -- Temporarily restore collisions so Humanoid path walking can use the floor.
+    -- Keep the snapshot so the user's noclip setting can be restored afterward.
+    restoreCollisionSnapshot(false)
+end
+
+local function resumeNoclipAfterTeleport()
+    noclipSuspended = false
+    if noclipEnabled then
+        enforceNoclip()
+    else
+        restoreCollisionSnapshot(true)
     end
 end
 
 RunService.Stepped:Connect(function()
-    if not character or not noclipEnabled then return end
-    for _, part in ipairs(character:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then
-            if originalCollision[part] == nil then
-                originalCollision[part] = true
-            end
-            part.CanCollide = false
-        end
+    if noclipEnabled and not noclipSuspended then
+        enforceNoclip()
     end
 end)
 
 -- ==========================================
--- SPEED (CFrame Offset - Anti-Rubberband)
+-- SPEED (frame-rate stable horizontal CFrame dash)
 -- ==========================================
 
 local function restoreNormalMovementState()
     if not humanoid then return end
     humanoid.AutoRotate = true
     humanoid.WalkSpeed = originalWalkSpeed
-    if rootPart then
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-    end
-    if speedLinearVelocity then
-        speedLinearVelocity.MaxForce = 0
-        speedLinearVelocity.VectorVelocity = Vector3.zero
-    end
 end
 
 local function applyRapidDashStep(moveDir, dt)
     if not rootPart or not humanoid then return end
+
     local steer = Vector3.new(moveDir.X, 0, moveDir.Z)
     if steer.Magnitude <= 0.01 then return end
 
     local clampedSpeed = math.clamp(runSpeedValue, 0, MAX_SPEED_INPUT)
-    local speedRatio = clampedSpeed / MAX_SPEED_INPUT
-    local effectiveSpeed = 85 + (speedRatio * MAX_EFFECTIVE_SPEED)
+    local effectiveSpeed = math.min(clampedSpeed, MAX_EFFECTIVE_SPEED)
+    if effectiveSpeed <= 0 then return end
 
-    local stepDistance = math.clamp((effectiveSpeed * dt * RAPID_DASH_DAMPING), RAPID_DASH_MIN_STEP, RAPID_DASH_MAX_STEP)
+    -- No minimum step: using a fixed minimum made movement FPS-dependent and
+    -- produced much larger effective speeds on high-refresh displays.
+    local stepDistance = math.clamp(
+        effectiveSpeed * dt * RAPID_DASH_DAMPING,
+        0,
+        RAPID_DASH_MAX_STEP
+    )
+
+    if stepDistance <= 0 then return end
+
     local moveVector = steer.Unit * stepDistance
+    local previousVelocity = rootPart.AssemblyLinearVelocity
+
+    -- When noclip is off, do not CFrame straight through a wall. Crossing solid
+    -- geometry in one frame is a common source of physics/server correction.
+    if not noclipEnabled then
+        local rayParams = RaycastParams.new()
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        if character then
+            rayParams.FilterDescendantsInstances = {character}
+        end
+
+        local hit = workspace:Raycast(rootPart.Position, moveVector, rayParams)
+        if hit then
+            local allowedDistance = math.max(hit.Distance - 1.25, 0)
+            moveVector = steer.Unit * math.min(stepDistance, allowedDistance)
+        end
+    end
+
+    if moveVector.Magnitude <= 0.001 then return end
 
     rootPart.CFrame = rootPart.CFrame + moveVector
-    rootPart.AssemblyLinearVelocity = Vector3.zero
-    rootPart.AssemblyAngularVelocity = Vector3.zero
 
-    if speedLinearVelocity then
-        speedLinearVelocity.MaxForce = 0
-        speedLinearVelocity.VectorVelocity = Vector3.zero
-    end
+    -- Preserve vertical physics so Super Speed does not cancel jumps/gravity or
+    -- create a hover effect. Only discard horizontal residual velocity.
+    rootPart.AssemblyLinearVelocity = Vector3.new(0, previousVelocity.Y, 0)
+    rootPart.AssemblyAngularVelocity = Vector3.zero
 
     humanoid.WalkSpeed = 0
     humanoid.AutoRotate = false
-    pcall(function()
-        humanoid:Move(Vector3.zero, false)
-    end)
 end
 
 RunService.RenderStepped:Connect(function(dt)
@@ -434,51 +503,33 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    if speedLinearVelocity then
-        if isFlying or isTPBusy then
-            speedLinearVelocity.MaxForce = 0
-            speedLinearVelocity.VectorVelocity = Vector3.zero
-            rootPart.AssemblyLinearVelocity = Vector3.zero
-            rootPart.AssemblyAngularVelocity = Vector3.zero
-            humanoid.WalkSpeed = 0
-            humanoid.AutoRotate = false
-        else
-            local st = humanoid:GetState()
-            if st == Enum.HumanoidStateType.Dead
-                or st == Enum.HumanoidStateType.Ragdoll
-                or st == Enum.HumanoidStateType.Climbing
-                or st == Enum.HumanoidStateType.Swimming
-                or humanoid.Sit then
-                speedLinearVelocity.MaxForce = 0
-                speedLinearVelocity.VectorVelocity = Vector3.zero
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                rootPart.AssemblyAngularVelocity = Vector3.zero
-                humanoid.WalkSpeed = 0
-                humanoid.AutoRotate = false
-            else
-                humanoid.WalkSpeed = 0
-                humanoid.AutoRotate = false
-                autoRotateWasEnabled = true
-
-                local moveDir = humanoid.MoveDirection
-                if moveDir.Magnitude > 0 then
-                    applyRapidDashStep(moveDir, dt)
-
-                    if observeCheatMode then
-                        logPhysicsSnapshot("SPEED_MOVE")
-                    end
-                else
-                    speedLinearVelocity.MaxForce = 0
-                    speedLinearVelocity.VectorVelocity = Vector3.zero
-                    rootPart.AssemblyLinearVelocity = Vector3.zero
-                    rootPart.AssemblyAngularVelocity = Vector3.zero
-                end
-            end
-        end
+    -- Never mutate velocity/WalkSpeed while another movement controller owns
+    -- the character. V10.2 zeroed velocity here, which directly fought Fly and TP.
+    if isFlying or isTPBusy then
+        return
     end
 
-    if observeCheatMode and not runSpeedEnabled then
-        startCheatObserver()
+    local st = humanoid:GetState()
+    if st == Enum.HumanoidStateType.Dead
+        or st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.Climbing
+        or st == Enum.HumanoidStateType.Swimming
+        or humanoid.Sit then
+        humanoid.WalkSpeed = originalWalkSpeed
+        humanoid.AutoRotate = true
+        return
+    end
+
+    humanoid.WalkSpeed = 0
+    humanoid.AutoRotate = false
+
+    local moveDir = humanoid.MoveDirection
+    if moveDir.Magnitude > 0.01 then
+        applyRapidDashStep(moveDir, dt)
+
+        if observeCheatMode then
+            logPhysicsSnapshot("SPEED_MOVE")
+        end
     end
 end)
 
@@ -488,6 +539,7 @@ end)
 
 local function applyJump()
     if not jumpEnabled or not rootPart or not humanoid then return end
+    if isTPBusy or isFlying then return end
 
     local state = humanoid:GetState()
     if state == Enum.HumanoidStateType.Dead
@@ -517,48 +569,80 @@ end
 -- ==========================================
 
 local function getSafeGroundPosition(targetCFrame)
-    local origin = targetCFrame.Position + Vector3.new(0, 15, 0)
+    if not targetCFrame then return nil end
+
+    local targetPos = targetCFrame.Position
+    local origin = targetPos + Vector3.new(0, TP_GROUND_SCAN_UP, 0)
+
     local raycastParams = RaycastParams.new()
     raycastParams.FilterType = Enum.RaycastFilterType.Exclude
     if character then
         raycastParams.FilterDescendantsInstances = {character}
     end
 
-    local rayResult = workspace:Raycast(origin, Vector3.new(0, -60, 0), raycastParams)
-    if rayResult then
-        return CFrame.new(rayResult.Position + Vector3.new(0, 3.5, 0)) * targetCFrame.Rotation
+    local rayResult = workspace:Raycast(
+        origin,
+        Vector3.new(0, -(TP_GROUND_SCAN_UP + TP_GROUND_SCAN_DOWN), 0),
+        raycastParams
+    )
+
+    if rayResult and humanoid and rootPart then
+        local rootGroundOffset = humanoid.HipHeight + (rootPart.Size.Y * 0.5)
+        local candidateY = rayResult.Position.Y + rootGroundOffset
+
+        -- Only ground-snap when the nearby surface is reasonably close to the
+        -- requested Y. This avoids snapping a saved indoor position to a roof or
+        -- a different floor far above/below it.
+        if math.abs(candidateY - targetPos.Y) <= TP_MAX_GROUND_ADJUST then
+            local groundedPos = Vector3.new(targetPos.X, candidateY, targetPos.Z)
+            return CFrame.new(groundedPos) * targetCFrame.Rotation
+        end
     end
-    return targetCFrame + Vector3.new(0, 3, 0)
+
+    return targetCFrame
 end
 
-local function waitForTPMove(targetPosition, timeout)
-    if not humanoid or not rootPart then
-        return false
-    end
+local function teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot)
+    return token == teleportSerial
+        and character == expectedCharacter
+        and humanoid == expectedHumanoid
+        and rootPart == expectedRoot
+        and expectedCharacter ~= nil
+        and expectedCharacter.Parent ~= nil
+        and expectedHumanoid ~= nil
+        and expectedHumanoid.Parent ~= nil
+        and expectedHumanoid.Health > 0
+        and expectedRoot ~= nil
+        and expectedRoot.Parent ~= nil
+end
 
+local function waitForTPMove(targetPosition, timeout, token, expectedCharacter, expectedHumanoid, expectedRoot)
     local started = os.clock()
-    local lastDistance = math.huge
     local lastProgressTime = started
+    local lastProgressPosition = expectedRoot.Position
 
     while os.clock() - started < timeout do
-        if not rootPart or not rootPart.Parent or not humanoid or humanoid.Health <= 0 then
+        if not teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot) then
             return false
         end
 
-        local delta = targetPosition - rootPart.Position
+        local currentPosition = expectedRoot.Position
+        local delta = targetPosition - currentPosition
         local horizontalDistance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        local verticalDistance = math.abs(delta.Y)
 
-        if horizontalDistance <= TP_ARRIVAL_DISTANCE then
+        if horizontalDistance <= TP_ARRIVAL_DISTANCE
+            and verticalDistance <= TP_VERTICAL_TOLERANCE then
             return true
         end
 
-        -- If movement is making progress, refresh the progress timer.
-        if horizontalDistance < lastDistance - 0.15 then
-            lastDistance = horizontalDistance
+        -- Count real character displacement as progress, including climbing or
+        -- stair movement where X/Z may barely change while Y changes a lot.
+        if (currentPosition - lastProgressPosition).Magnitude >= 0.2 then
+            lastProgressPosition = currentPosition
             lastProgressTime = os.clock()
         end
 
-        -- Stop waiting if we have not made meaningful progress for a while.
         if os.clock() - lastProgressTime > 0.75 then
             return false
         end
@@ -569,43 +653,45 @@ local function waitForTPMove(targetPosition, timeout)
     return false
 end
 
-local function walkToPosition(destination)
-    if not character or not rootPart or not humanoid then
+local function walkToPosition(destination, token, expectedCharacter, expectedHumanoid, expectedRoot)
+    if not teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot) then
         return false
     end
 
-    local oldWalkSpeed = humanoid.WalkSpeed
-    local oldAutoRotate = humanoid.AutoRotate
-    local oldPlatformStand = humanoid.PlatformStand
+    local oldWalkSpeed = expectedHumanoid.WalkSpeed
+    local oldAutoRotate = expectedHumanoid.AutoRotate
+    local oldPlatformStand = expectedHumanoid.PlatformStand
 
     local function restoreMovement()
-        if not humanoid then return end
-        humanoid:Move(Vector3.zero, false)
-        humanoid.PlatformStand = oldPlatformStand
-        humanoid.AutoRotate = oldAutoRotate
-        humanoid.WalkSpeed = oldWalkSpeed
+        if not expectedHumanoid or not expectedHumanoid.Parent then return end
+        expectedHumanoid:Move(Vector3.zero, false)
+        expectedHumanoid.PlatformStand = oldPlatformStand
+        expectedHumanoid.AutoRotate = oldAutoRotate
+        expectedHumanoid.WalkSpeed = oldWalkSpeed
     end
 
-    humanoid.PlatformStand = false
-    humanoid.AutoRotate = true
+    expectedHumanoid.PlatformStand = false
+    expectedHumanoid.AutoRotate = true
 
-    -- Stay at or below the character's normal speed. A boosted WalkSpeed can
-    -- itself trigger server corrections in games that validate movement.
     local normalSpeed = originalWalkSpeed > 0 and originalWalkSpeed or 16
-    humanoid.WalkSpeed = math.min(TP_WALK_SPEED, normalSpeed)
+    expectedHumanoid.WalkSpeed = math.min(TP_WALK_SPEED, normalSpeed)
 
-    rootPart.Anchored = false
-    rootPart.AssemblyAngularVelocity = Vector3.zero
+    expectedRoot.Anchored = false
+    expectedRoot.AssemblyAngularVelocity = Vector3.zero
 
     local repaths = 0
 
     while repaths <= TP_MAX_REPATHS do
-        if not character or not rootPart or not humanoid or humanoid.Health <= 0 then
+        if not teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot) then
             restoreMovement()
             return false
         end
 
-        if (destination.Position - rootPart.Position).Magnitude <= TP_ARRIVAL_DISTANCE then
+        local destinationDelta = destination.Position - expectedRoot.Position
+        local destinationHorizontal = Vector3.new(destinationDelta.X, 0, destinationDelta.Z).Magnitude
+
+        if destinationHorizontal <= TP_ARRIVAL_DISTANCE
+            and math.abs(destinationDelta.Y) <= TP_VERTICAL_TOLERANCE then
             restoreMovement()
             return true
         end
@@ -621,12 +707,12 @@ local function walkToPosition(destination)
             }
         })
 
-        local computed = pcall(function()
-            path:ComputeAsync(rootPart.Position, destination.Position)
+        local computed, computeError = pcall(function()
+            path:ComputeAsync(expectedRoot.Position, destination.Position)
         end)
 
         if not computed or path.Status ~= Enum.PathStatus.Success then
-            log("TP", "Path compute failed; retrying")
+            log("TP", "Path compute failed: " .. tostring(computeError or path.Status))
             repaths = repaths + 1
             task.wait(0.15)
             continue
@@ -634,21 +720,24 @@ local function walkToPosition(destination)
 
         local waypoints = path:GetWaypoints()
         local shouldRepath = false
-        local blocked = false
+        local blockedWaypointIndex = nil
+        local currentWaypointIndex = 2
 
-        local blockedConnection = path.Blocked:Connect(function()
-            blocked = true
+        local blockedConnection = path.Blocked:Connect(function(blockedIndex)
+            blockedWaypointIndex = blockedIndex
         end)
 
-        -- Waypoint 1 is normally the current position, so begin at waypoint 2.
         for i = 2, #waypoints do
-            if not rootPart or not humanoid or humanoid.Health <= 0 then
+            currentWaypointIndex = i
+
+            if not teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot) then
                 blockedConnection:Disconnect()
                 restoreMovement()
                 return false
             end
 
-            if blocked then
+            -- Ignore stale Blocked notifications for waypoints already passed.
+            if blockedWaypointIndex and blockedWaypointIndex >= currentWaypointIndex then
                 shouldRepath = true
                 break
             end
@@ -656,51 +745,56 @@ local function walkToPosition(destination)
             local waypoint = waypoints[i]
 
             if waypoint.Action == Enum.PathWaypointAction.Jump then
-                humanoid.Jump = true
+                expectedHumanoid.Jump = true
             end
 
-            humanoid:MoveTo(waypoint.Position)
+            expectedHumanoid:MoveTo(waypoint.Position)
 
-            local reached = waitForTPMove(waypoint.Position, TP_WAYPOINT_TIMEOUT)
+            local reached = waitForTPMove(
+                waypoint.Position,
+                TP_WAYPOINT_TIMEOUT,
+                token,
+                expectedCharacter,
+                expectedHumanoid,
+                expectedRoot
+            )
+
             if not reached then
                 shouldRepath = true
                 break
             end
 
-            -- If the character ended up well away from the intended waypoint,
-            -- accept the correction and compute a fresh route instead of CFraming back.
-            local horizontalErrorVector = waypoint.Position - rootPart.Position
-            local horizontalError = Vector3.new(
-                horizontalErrorVector.X,
-                0,
-                horizontalErrorVector.Z
-            ).Magnitude
+            local errorVector = waypoint.Position - expectedRoot.Position
+            local horizontalError = Vector3.new(errorVector.X, 0, errorVector.Z).Magnitude
 
             if horizontalError > TP_REPATH_DISTANCE then
                 shouldRepath = true
                 break
             end
 
-            rootPart.AssemblyAngularVelocity = Vector3.zero
+            expectedRoot.AssemblyAngularVelocity = Vector3.zero
         end
 
         blockedConnection:Disconnect()
 
-        local remaining = (destination.Position - rootPart.Position).Magnitude
-        if remaining <= TP_ARRIVAL_DISTANCE then
+        if not teleportStillValid(token, expectedCharacter, expectedHumanoid, expectedRoot) then
+            restoreMovement()
+            return false
+        end
+
+        local remainingVector = destination.Position - expectedRoot.Position
+        local remainingHorizontal = Vector3.new(remainingVector.X, 0, remainingVector.Z).Magnitude
+
+        if remainingHorizontal <= TP_ARRIVAL_DISTANCE
+            and math.abs(remainingVector.Y) <= TP_VERTICAL_TOLERANCE then
             restoreMovement()
             return true
         end
 
-        if not shouldRepath then
-            -- The path ended but we are still not close enough. Recompute from
-            -- the server-accepted current position instead of forcing CFrame.
-            shouldRepath = true
-        end
+        repaths = repaths + 1
+        log("TP", string.format("Repath %d/%d", repaths, TP_MAX_REPATHS))
 
-        if shouldRepath then
-            repaths = repaths + 1
-            log("TP", string.format("Repath %d/%d", repaths, TP_MAX_REPATHS))
+        if repaths <= TP_MAX_REPATHS then
             task.wait(0.1)
         end
     end
@@ -710,97 +804,119 @@ local function walkToPosition(destination)
 end
 
 local function absoluteTeleport(targetCFrame, useInterpolation)
-    if not character or not rootPart or not humanoid then return end
-    if isTPBusy then return end
-    isTPBusy = true
-
-    local wasRunSpeedEnabled = runSpeedEnabled
-    local wasNoFall = noFallDamageEnabled
-    local wasFlying = isFlying
-
-    runSpeedEnabled = false
-    noFallDamageEnabled = true
-
-    if speedLinearVelocity then
-        speedLinearVelocity.MaxForce = 0
-        speedLinearVelocity.VectorVelocity = Vector3.zero
+    if not character or not rootPart or not humanoid or humanoid.Health <= 0 then return end
+    if isTPBusy then
+        log("TP", "Teleport request ignored: another teleport is already active")
+        return
     end
 
-    -- Safe TP must not compete with flight forces.
-    if isFlying then
+    teleportSerial = teleportSerial + 1
+    local token = teleportSerial
+
+    local tpCharacter = character
+    local tpHumanoid = humanoid
+    local tpRoot = rootPart
+
+    local wasFlying = isFlying
+
+    isTPBusy = true
+    suspendNoclipForTeleport()
+
+    if wasFlying then
         setFlying(false)
     end
 
-    local safeCFrame = getSafeGroundPosition(targetCFrame)
-    local distance = (safeCFrame.Position - rootPart.Position).Magnitude
-    local riskyMode = shouldUseInstantTeleport() or (useInterpolation == false)
+    local success, err = pcall(function()
+        if not teleportStillValid(token, tpCharacter, tpHumanoid, tpRoot) then
+            return
+        end
 
-    log("TP", string.format(
-        "Starting TP | Mode: %s | Distance: %.1f studs | Risky: %s",
-        riskyMode and "Risky" or "TP-Walk",
-        distance,
-        tostring(riskyMode)
-    ))
+        local safeCFrame = getSafeGroundPosition(targetCFrame)
+        if not safeCFrame then
+            error("No valid target CFrame")
+        end
 
-    if observeCheatMode then
-        logPhysicsSnapshot("TP_BEFORE")
+        local distance = (safeCFrame.Position - tpRoot.Position).Magnitude
+        local riskyMode = shouldUseInstantTeleport() or (useInterpolation == false)
+
+        log("TP", string.format(
+            "Starting TP | Mode: %s | Distance: %.1f studs | Risky: %s",
+            riskyMode and "Risky" or "TP-Walk",
+            distance,
+            tostring(riskyMode)
+        ))
+
+        if observeCheatMode then
+            logPhysicsSnapshot("TP_BEFORE")
+        end
+
+        if riskyMode then
+            freezeCharacterForTeleport()
+            tpCharacter:PivotTo(safeCFrame)
+            tpRoot.AssemblyLinearVelocity = Vector3.zero
+            tpRoot.AssemblyAngularVelocity = Vector3.zero
+            task.wait(0.05)
+
+            if teleportStillValid(token, tpCharacter, tpHumanoid, tpRoot) then
+                releaseCharacterAfterTeleport()
+            end
+        else
+            tpRoot.Anchored = false
+            tpHumanoid.PlatformStand = false
+            tpHumanoid.AutoRotate = true
+            tpRoot.AssemblyAngularVelocity = Vector3.zero
+
+            local walked = walkToPosition(
+                safeCFrame,
+                token,
+                tpCharacter,
+                tpHumanoid,
+                tpRoot
+            )
+
+            log("TP", walked and "TP-Walk completed" or "TP-Walk failed or was cancelled")
+        end
+    end)
+
+    if not success then
+        log("TP", "Teleport error: " .. tostring(err))
     end
 
-    if riskyMode then
-        -- Instant mode keeps the old PivotTo behavior.
-        freezeCharacterForTeleport()
-        character:PivotTo(safeCFrame)
-        rootPart.AssemblyLinearVelocity = Vector3.zero
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-        task.wait(0.05)
-        releaseCharacterAfterTeleport(wasRunSpeedEnabled)
-    else
-        -- Safe mode uses normal Humanoid movement and PathfindingService.
-        -- No anchoring, repeated PivotTo, or stepped CFrame movement.
-        rootPart.Anchored = false
-        humanoid.PlatformStand = false
-        humanoid.AutoRotate = true
-        rootPart.AssemblyAngularVelocity = Vector3.zero
-
-        local success = walkToPosition(safeCFrame)
-
-        if success then
-            log("TP", "TP-Walk completed")
-        else
-            log("TP", "TP-Walk failed or was cancelled")
+    -- Finalize only if this is still the same teleport/character. A respawn or
+    -- newer teleport invalidates this cleanup through teleportSerial.
+    if token == teleportSerial and character == tpCharacter then
+        if tpRoot and tpRoot.Parent then
+            tpRoot.Anchored = false
+            tpRoot.AssemblyAngularVelocity = Vector3.zero
         end
 
-        if rootPart then
-            rootPart.AssemblyAngularVelocity = Vector3.zero
-        end
+        if tpHumanoid and tpHumanoid.Parent and tpHumanoid.Health > 0 then
+            tpHumanoid.PlatformStand = false
+            tpHumanoid.Sit = false
 
-        runSpeedEnabled = wasRunSpeedEnabled
-        if humanoid then
             if runSpeedEnabled then
-                humanoid.WalkSpeed = 0
-                humanoid.AutoRotate = false
+                tpHumanoid.WalkSpeed = 0
+                tpHumanoid.AutoRotate = false
             else
-                humanoid.WalkSpeed = originalWalkSpeed
-                humanoid.AutoRotate = true
+                tpHumanoid.WalkSpeed = originalWalkSpeed
+                tpHumanoid.AutoRotate = true
             end
         end
-    end
 
-    -- Restore flight only if it was active before teleport and the character
-    -- is still valid. This keeps the old user state without applying flight
-    -- forces during path walking.
-    if wasFlying and flyToggleEnabled and rootPart and humanoid and linearVelocity then
-        setFlying(true)
-    end
-
-    if observeCheatMode and rootPart then
-        logPhysicsSnapshot("TP_AFTER")
-    end
-
-    task.delay(0.15, function()
-        noFallDamageEnabled = wasNoFall
+        resumeNoclipAfterTeleport()
         isTPBusy = false
-    end)
+
+        if wasFlying and flyToggleEnabled
+            and tpRoot and tpRoot.Parent
+            and tpHumanoid and tpHumanoid.Parent
+            and tpHumanoid.Health > 0 then
+            setFlying(true)
+        end
+
+        if observeCheatMode and rootPart then
+            logPhysicsSnapshot("TP_AFTER")
+        end
+    end
 end
 
 -- ==========================================
@@ -832,43 +948,69 @@ local function getEntrySpawn()
 end
 
 -- ==========================================
--- FLY (smooth, no false exits — FIXED)
+-- FLY (camera-relative, conflict-safe)
 -- ==========================================
 
 setFlying = function(state)
     if not rootPart or not humanoid or not linearVelocity then return end
+    if state and isTPBusy then return end
     if isFlying == state then return end
-    isFlying = state
+
+    isFlying = state == true
 
     if isFlying then
         linearVelocity.MaxForce = 100000
         linearVelocity.VectorVelocity = Vector3.zero
         flyVelocity = Vector3.zero
+
         pcall(function()
             humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
         end)
+
         log("FLY", "Flight ON")
     else
         linearVelocity.MaxForce = 0
         linearVelocity.VectorVelocity = Vector3.zero
         flyVelocity = Vector3.zero
 
-        -- Gently return to normal movement
-        if rootPart and humanoid then
+        if rootPart and rootPart.Parent then
             local cur = rootPart.AssemblyLinearVelocity
-            rootPart.AssemblyLinearVelocity = Vector3.new(cur.X * 0.2, 0, cur.Z * 0.2)
+            rootPart.AssemblyLinearVelocity = Vector3.new(cur.X * 0.2, cur.Y * 0.2, cur.Z * 0.2)
             rootPart.AssemblyAngularVelocity = Vector3.zero
         end
+
         log("FLY", "Flight OFF")
     end
 end
 
--- Fly update loop (smooth acceleration + damping)
+local function getFlightTargetVelocity()
+    if not humanoid then return Vector3.zero end
+
+    local currentCamera = workspace.CurrentCamera
+    if controls and currentCamera then
+        local mv = controls:GetMoveVector()
+        if mv.Magnitude > 0.01 then
+            local camCF = currentCamera.CFrame
+            local flightDir = (camCF.RightVector * mv.X) - (camCF.LookVector * mv.Z)
+            if flightDir.Magnitude > 0.01 then
+                return flightDir.Unit * FLY_SPEED
+            end
+        end
+    end
+
+    -- Fallback for control schemes where PlayerModule/GetControls is unavailable.
+    local moveDir = humanoid.MoveDirection
+    if moveDir.Magnitude > 0.01 then
+        return moveDir.Unit * FLY_SPEED
+    end
+
+    return Vector3.zero
+end
+
 RunService.RenderStepped:Connect(function(dt)
-    if not isFlying or not rootPart or not humanoid or not linearVelocity then
+    if not isFlying or isTPBusy or not rootPart or not humanoid or not linearVelocity then
         return
     end
-    if not controls then return end
 
     local st = humanoid:GetState()
     if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll then
@@ -876,17 +1018,14 @@ RunService.RenderStepped:Connect(function(dt)
         return
     end
 
-    local mv = controls:GetMoveVector()
-    local camCF = camera.CFrame
+    local targetVel = getFlightTargetVelocity()
+    local response = targetVel.Magnitude > 0.1 and FLY_ACCEL or FLY_DAMPING
 
-    local targetVel = Vector3.zero
-    if mv.Magnitude > 0 then
-        local flightDir = (camCF.RightVector * mv.X) - (camCF.LookVector * mv.Z)
-        targetVel = flightDir.Unit * FLY_SPEED
-    end
+    flyVelocity = flyVelocity:Lerp(
+        targetVel,
+        math.clamp(response * dt, 0, 1)
+    )
 
-    -- Smooth accelerate / decelerate
-    flyVelocity = flyVelocity:Lerp(targetVel, math.clamp(FLY_ACCEL * dt, 0, 1))
     if targetVel.Magnitude < 0.1 and flyVelocity.Magnitude < 0.5 then
         flyVelocity = Vector3.zero
     end
@@ -894,60 +1033,27 @@ RunService.RenderStepped:Connect(function(dt)
     linearVelocity.VectorVelocity = flyVelocity
 end)
 
--- Ground / landing exit check (with real hover test via raycast)
-RunService.Heartbeat:Connect(function()
-    if not isFlying or not humanoid or not rootPart then return end
+-- Flight is no longer forcibly disabled by a ground raycast. V10.2 could turn
+-- flight off immediately after enabling it while near the ground. The user
+-- now controls flight through the toggle/double-tap logic only.
 
-    local st = humanoid:GetState()
-    local vy = rootPart.AssemblyLinearVelocity.Y
-
-    if st == Enum.HumanoidStateType.Landed
-        or (st == Enum.HumanoidStateType.Running and math.abs(vy) < 0.5) then
-        local rp = RaycastParams.new()
-        rp.FilterType = Enum.RaycastFilterType.Exclude
-        if character then rp.FilterDescendantsInstances = {character} end
-        local hit = workspace:Raycast(rootPart.Position, Vector3.new(0, -4, 0), rp)
-        if hit then
-            setFlying(false)
-        end
-    end
-end)
-
--- Fall damage clamp + prompt refresh (kept from original)
+-- Fall damage clamp
 RunService.RenderStepped:Connect(function()
-    if not camera or not camera.Parent then
-        camera = workspace.CurrentCamera
-        return
-    end
-
     if not character or not humanoid or not rootPart then
-        if linearVelocity then
-            linearVelocity.MaxForce = 0
-            linearVelocity.VectorVelocity = Vector3.zero
-        end
         return
     end
 
     local st = humanoid:GetState()
     if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Ragdoll then
-        if linearVelocity then
-            linearVelocity.MaxForce = 0
-            linearVelocity.VectorVelocity = Vector3.zero
-        end
         return
     end
 
-    if humanoid and rootPart and noFallDamageEnabled then
-        if st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown then
-            local v = rootPart.AssemblyLinearVelocity
-            if v.Y < -MAX_SAFE_FALL then
-                rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
-            end
+    if (noFallDamageEnabled or isTPBusy)
+        and (st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.FallingDown) then
+        local v = rootPart.AssemblyLinearVelocity
+        if v.Y < -MAX_SAFE_FALL then
+            rootPart.AssemblyLinearVelocity = Vector3.new(v.X, -MAX_SAFE_FALL, v.Z)
         end
-    end
-
-    if promptExtenderEnabled then
-        refreshPromptExtender()
     end
 end)
 
@@ -959,7 +1065,7 @@ local VIEWPORT_PADDING = 8
 local PANEL_W, PANEL_H = 220, 440
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "Panel"
+screenGui.Name = UI_NAME
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = false
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -991,7 +1097,7 @@ local title = Instance.new("TextLabel", topBar)
 title.Size = UDim2.new(1, -50, 1, 0)
 title.Position = UDim2.new(0, 10, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "GR33D v10.2"
+title.Text = "GR33D v10.3"
 title.TextColor3 = Color3.fromRGB(240, 240, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 13
@@ -1015,23 +1121,19 @@ Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
 local function clampPanelPosition()
     local cam = workspace.CurrentCamera
     if not cam then return end
+
     local vp = cam.ViewportSize
-    local guiService = game:GetService("GuiService")
-    local inset = guiService:GetGuiInset()
+    local abs = mainFrame.AbsolutePosition
 
-    local pos = mainFrame.Position
-    local x = pos.X.Offset
-    local y = pos.Y.Offset
+    local minX = VIEWPORT_PADDING
+    local maxX = math.max(minX, vp.X - PANEL_W - VIEWPORT_PADDING)
+    local minY = VIEWPORT_PADDING
+    local maxY = math.max(minY, vp.Y - PANEL_H - VIEWPORT_PADDING)
 
-    local minX = inset.X - (PANEL_W * 0.5)
-    local maxX = inset.X + vp.X - (PANEL_W * 0.5)
-    local minY = inset.Y + VIEWPORT_PADDING
-    local maxY = inset.Y + vp.Y - PANEL_H - VIEWPORT_PADDING
+    local x = math.clamp(abs.X, minX, maxX)
+    local y = math.clamp(abs.Y, minY, maxY)
 
-    x = math.clamp(x, minX, maxX)
-    y = math.clamp(y, minY, math.max(minY, maxY))
-
-    mainFrame.Position = UDim2.new(0, x, 0, y)
+    mainFrame.Position = UDim2.fromOffset(x, y)
 end
 
 local dragging   = false
@@ -1041,7 +1143,12 @@ local startPos   = nil
 local function beginDrag(input)
     dragging = true
     dragStart = input.Position
-    startPos  = mainFrame.Position
+
+    -- Convert the initial scale-based position into absolute offsets before drag
+    -- math so clamping cannot jump when the first drag begins.
+    local abs = mainFrame.AbsolutePosition
+    mainFrame.Position = UDim2.fromOffset(abs.X, abs.Y)
+    startPos = mainFrame.Position
 end
 
 local function updateDrag(input)
@@ -1088,10 +1195,29 @@ UserInputService.InputEnded:Connect(function(input)
     end
 end)
 
--- Re-clamp on viewport changes (rotation, resize)
-workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-    clampPanelPosition()
+-- Re-clamp on viewport changes, including camera replacement.
+local viewportConnection = nil
+
+local function bindViewportCamera()
+    if viewportConnection then
+        viewportConnection:Disconnect()
+        viewportConnection = nil
+    end
+
+    camera = workspace.CurrentCamera
+    if camera then
+        viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            task.defer(clampPanelPosition)
+        end)
+    end
+end
+
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    bindViewportCamera()
+    task.defer(clampPanelPosition)
 end)
+
+bindViewportCamera()
 
 -- ---------- Container ----------
 
@@ -1343,6 +1469,8 @@ end)
 -- ==========================================
 
 UserInputService.JumpRequest:Connect(function()
+    if isTPBusy then return end
+
     local now = os.clock()
     if flyToggleEnabled then
         if (now - lastJumpTapTime) <= DOUBLE_TAP_WINDOW then
@@ -1355,6 +1483,9 @@ UserInputService.JumpRequest:Connect(function()
             lastJumpTapTime = 0
         else
             lastJumpTapTime = now
+            if jumpEnabled and not isFlying then
+                applyJump()
+            end
         end
         return
     end
@@ -1369,72 +1500,109 @@ end)
 -- ==========================================
 
 local function setupCharacter(char)
+    if not char or char ~= player.Character then return end
+    if character == char and rootPart and rootPart.Parent and humanoid and humanoid.Parent then
+        return
+    end
+
     character = char
     rootPart = char:WaitForChild("HumanoidRootPart")
     humanoid = char:WaitForChild("Humanoid")
 
     originalCollision = {}
-    originalWalkSpeed = humanoid.WalkSpeed
-    autoRotateWasEnabled = humanoid.AutoRotate
-    restoreNormalMovementState()
+    noclipSuspended = false
+    originalWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
 
-    if rootPart:FindFirstChild("FlightAttachment") then rootPart.FlightAttachment:Destroy() end
-    if rootPart:FindFirstChild("FlightVelocity") then rootPart.FlightVelocity:Destroy() end
-    if rootPart:FindFirstChild("SpeedAttachment") then rootPart.SpeedAttachment:Destroy() end
-    if rootPart:FindFirstChild("SpeedVelocity") then rootPart.SpeedVelocity:Destroy() end
+    -- Clean up leftovers from previous versions before creating the current mover.
+    local oldFlightAttachment = rootPart:FindFirstChild("FlightAttachment")
+    if oldFlightAttachment then oldFlightAttachment:Destroy() end
 
-    attachment = Instance.new("Attachment", rootPart)
+    local oldFlightVelocity = rootPart:FindFirstChild("FlightVelocity")
+    if oldFlightVelocity then oldFlightVelocity:Destroy() end
+
+    local oldSpeedAttachment = rootPart:FindFirstChild("SpeedAttachment")
+    if oldSpeedAttachment then oldSpeedAttachment:Destroy() end
+
+    local oldSpeedVelocity = rootPart:FindFirstChild("SpeedVelocity")
+    if oldSpeedVelocity then oldSpeedVelocity:Destroy() end
+
+    attachment = Instance.new("Attachment")
     attachment.Name = "FlightAttachment"
+    attachment.Parent = rootPart
 
-    linearVelocity = Instance.new("LinearVelocity", rootPart)
+    linearVelocity = Instance.new("LinearVelocity")
     linearVelocity.Name = "FlightVelocity"
     linearVelocity.Attachment0 = attachment
     linearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
     linearVelocity.MaxForce = 0
     linearVelocity.VectorVelocity = Vector3.zero
+    linearVelocity.Parent = rootPart
 
-    speedAttachment = Instance.new("Attachment", rootPart)
-    speedAttachment.Name = "SpeedAttachment"
-
-    speedLinearVelocity = Instance.new("LinearVelocity", rootPart)
-    speedLinearVelocity.Name = "SpeedVelocity"
-    speedLinearVelocity.Attachment0 = speedAttachment
-    speedLinearVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
-    speedLinearVelocity.MaxForce = 0
-    speedLinearVelocity.VectorVelocity = Vector3.zero
-
-    if not firstSpawnCaptured and rootPart then
+    if not firstSpawnCaptured then
         realSpawnCFrame = rootPart.CFrame
         firstSpawnCaptured = true
     end
 
-    if noclipEnabled then applyNoclip(true) end
-    if flyToggleEnabled then setFlying(true) end
+    if runSpeedEnabled then
+        humanoid.WalkSpeed = 0
+        humanoid.AutoRotate = false
+    else
+        restoreNormalMovementState()
+    end
+
+    if noclipEnabled then
+        enforceNoclip()
+    end
+
+    if flyToggleEnabled then
+        setFlying(true)
+    end
 
     if promptExtenderEnabled then
-        task.defer(function() enablePromptExtenderAll() end)
+        task.defer(enablePromptExtenderAll)
     end
 
     humanoid.Died:Connect(function()
-        character = nil
-        rootPart = nil
-        humanoid = nil
+        -- Invalidate any TP coroutine that still references this character.
+        teleportSerial = teleportSerial + 1
+        isTPBusy = false
+        noclipSuspended = false
+        isFlying = false
+        flyVelocity = Vector3.zero
+
+        if linearVelocity then
+            linearVelocity.MaxForce = 0
+            linearVelocity.VectorVelocity = Vector3.zero
+        end
+
+        if character == char then
+            character = nil
+            rootPart = nil
+            humanoid = nil
+        end
     end)
 end
 
-task.spawn(function()
-    setupCharacter(player.Character or player.CharacterAdded:Wait())
-end)
-
 player.CharacterAdded:Connect(function(c)
-    isFlying = false
+    teleportSerial = teleportSerial + 1
     isTPBusy = false
-    runSpeedEnabled = false
+    isFlying = false
+    noclipSuspended = false
     originalCollision = {}
     flyVelocity = Vector3.zero
-    if linearVelocity then linearVelocity.MaxForce = 0 end
-    if speedLinearVelocity then speedLinearVelocity.MaxForce = 0 end
+
+    -- Keep the user's toggle choices across respawn. In V10.2, Super Speed
+    -- was silently forced off here while its UI toggle could still look enabled.
     setupCharacter(c)
 end)
 
-print("V10.2 loaded. TP-Walk + mobile UI + smooth fly fixed.")
+-- Initialize an already-existing character exactly once. Avoid combining
+-- CharacterAdded:Wait() with CharacterAdded:Connect(), which can initialize the
+-- same first spawn twice when the script starts before the character exists.
+if player.Character then
+    task.defer(function()
+        setupCharacter(player.Character)
+    end)
+end
+
+print("V10.3 loaded. Conflict-safe TP + speed/fly/noclip/prompt fixes.")
